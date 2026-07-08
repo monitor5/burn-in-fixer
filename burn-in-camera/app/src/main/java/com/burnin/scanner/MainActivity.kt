@@ -107,6 +107,7 @@ class MainActivity : Activity() {
                 val screen = reply.getJSONObject("screen")
                 Session.screenWidth = screen.getInt("width")
                 Session.screenHeight = screen.getInt("height")
+                Session.screenRefreshRate = screen.optDouble("refreshRate", 60.0).toFloat()
                 Session.targetName = "${dev.optString("manufacturer")} ${dev.optString("model")}"
                 Session.targetRole = reply.optString("role", Protocol.ROLE_ADJUSTMENT)
                 txtTarget.text =

@@ -3,6 +3,7 @@ package com.burnin.target.net
 import android.content.Context
 import android.graphics.Point
 import android.os.Build
+import android.view.WindowManager
 import com.burnin.target.DeviceRole
 import com.burnin.target.correction.CorrectionStore
 import com.burnin.target.correction.WhiteBalanceStore
@@ -97,7 +98,8 @@ object ControlServer {
                     .put("android", Build.VERSION.RELEASE))
                 reply.put("screen", JSONObject()
                     .put("width", p.x)
-                    .put("height", p.y))
+                    .put("height", p.y)
+                    .put("refreshRate", displayRefreshRate(context).toDouble()))
                 val m = CorrectionStore.meta
                 reply.put("correction", JSONObject()
                     .put("loaded", m != null)
@@ -222,6 +224,14 @@ object ControlServer {
             else -> return err(cmd, "알 수 없는 명령")
         }
         return reply
+    }
+
+    /** 측정 기기가 노출을 주사 주기의 정수배로 맞출 수 있도록 실제 주사율을 알려준다. */
+    private fun displayRefreshRate(context: Context): Float {
+        val wm = context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager ?: return 60f
+        @Suppress("DEPRECATION")
+        val rate = wm.defaultDisplay?.refreshRate ?: 60f
+        return if (rate > 1f) rate else 60f
     }
 
     private fun err(cmd: String, message: String): JSONObject =

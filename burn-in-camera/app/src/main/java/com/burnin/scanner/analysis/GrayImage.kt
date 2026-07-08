@@ -133,6 +133,17 @@ object ImageOps {
         return RgbImage(w, h, r, g, b)
     }
 
+    /** 8-bit 비디오 레인지 Y' → 선형 휘도 룩업 (블록 평균을 선형 도메인에서 하기 위함) */
+    private val Y_LINEAR_LUT = FloatArray(256) { v ->
+        Math.pow(videoRangeY(v).toDouble(), 2.2).toFloat()
+    }
+
+    /**
+     * sample×sample 블록 평균 다운샘플. 이전의 N픽셀 건너뛰기 점 샘플링은 센서 격자와
+     * OLED 서브픽셀 격자의 간섭(무아레)을 저역 통과 없이 그대로 통과시키고 앨리어싱을
+     * 추가로 만들었다. 블록 평균은 저역 통과 필터 역할과 함께 노이즈도 1/sample로 줄인다.
+     * 광량은 선형으로 더해지므로 평균은 선형화 후에 수행한다.
+     */
     private fun decodeYuvLinearGray(frame: CaptureFrame, maxLongEdge: Int): GrayImage {
         require(frame.planes.isNotEmpty()) { "YUV plane 없음" }
         val sample = yuvSample(frame.width, frame.height, maxLongEdge)
@@ -142,15 +153,30 @@ object ImageOps {
         val out = FloatArray(outW * outH)
         var i = 0
         for (oy in 0 until outH) {
-            val y = (oy * sample).coerceAtMost(frame.height - 1)
+            val y0 = oy * sample
+            val y1 = Math.min(y0 + sample, frame.height)
             for (ox in 0 until outW) {
-                val x = (ox * sample).coerceAtMost(frame.width - 1)
-                out[i++] = yPrimeToLinear(planeByte(yPlane, x, y))
+                val x0 = ox * sample
+                val x1 = Math.min(x0 + sample, frame.width)
+                var acc = 0f
+                for (y in y0 until y1) {
+                    val rowBase = y * yPlane.rowStride
+                    for (x in x0 until x1) {
+                        val index = rowBase + x * yPlane.pixelStride
+                        acc += Y_LINEAR_LUT[yPlane.bytes[index].toInt() and 0xFF]
+                    }
+                }
+                out[i++] = acc / ((y1 - y0) * (x1 - x0))
             }
         }
         return GrayImage(outW, outH, out)
     }
 
+    /**
+     * RGB 경로도 블록 평균 다운샘플. Y'CbCr→R'G'B' 변환이 선형이므로 Y'/Cb/Cr을 블록
+     * 평균한 뒤 한 번만 변환·선형화한다 (측정 패턴은 단색이라 크로마가 저주파여서
+     * 감마 도메인 평균의 편향은 무시 가능한 수준).
+     */
     private fun decodeYuvLinearRgb(frame: CaptureFrame, maxLongEdge: Int): RgbImage {
         require(frame.planes.size >= 3) { "YUV plane 부족" }
         val sample = yuvSample(frame.width, frame.height, maxLongEdge)
@@ -159,19 +185,41 @@ object ImageOps {
         val yPlane = frame.planes[0]
         val uPlane = frame.planes[1]
         val vPlane = frame.planes[2]
+        val chromaW = (frame.width + 1) / 2
+        val chromaH = (frame.height + 1) / 2
         val r = FloatArray(outW * outH)
         val g = FloatArray(outW * outH)
         val b = FloatArray(outW * outH)
         var i = 0
         for (oy in 0 until outH) {
-            val y = (oy * sample).coerceAtMost(frame.height - 1)
-            val cy = y / 2
+            val y0 = oy * sample
+            val y1 = Math.min(y0 + sample, frame.height)
+            val cy0 = y0 / 2
+            val cy1 = Math.max(cy0 + 1, Math.min((y1 + 1) / 2, chromaH))
             for (ox in 0 until outW) {
-                val x = (ox * sample).coerceAtMost(frame.width - 1)
-                val cx = x / 2
-                val yy = videoRangeY(planeByte(yPlane, x, y))
-                val cb = (planeByte(uPlane, cx, cy) - 128) / 224f
-                val cr = (planeByte(vPlane, cx, cy) - 128) / 224f
+                val x0 = ox * sample
+                val x1 = Math.min(x0 + sample, frame.width)
+                var accY = 0f
+                for (y in y0 until y1) {
+                    val rowBase = y * yPlane.rowStride
+                    for (x in x0 until x1) {
+                        accY += (yPlane.bytes[rowBase + x * yPlane.pixelStride].toInt() and 0xFF)
+                    }
+                }
+                val yy = videoRangeY(Math.round(accY / ((y1 - y0) * (x1 - x0))))
+                val cx0 = x0 / 2
+                val cx1 = Math.max(cx0 + 1, Math.min((x1 + 1) / 2, chromaW))
+                var accU = 0f
+                var accV = 0f
+                for (cy in cy0 until cy1) {
+                    for (cx in cx0 until cx1) {
+                        accU += planeByte(uPlane, cx, cy)
+                        accV += planeByte(vPlane, cx, cy)
+                    }
+                }
+                val cn = (cy1 - cy0) * (cx1 - cx0)
+                val cb = (accU / cn - 128f) / 224f
+                val cr = (accV / cn - 128f) / 224f
                 val rp = (yy + 1.5748f * cr).coerceIn(0f, 1f)
                 val gp = (yy - 0.1873f * cb - 0.4681f * cr).coerceIn(0f, 1f)
                 val bp = (yy + 1.8556f * cb).coerceIn(0f, 1f)
@@ -194,9 +242,6 @@ object ImageOps {
         val index = y * plane.rowStride + x * plane.pixelStride
         return plane.bytes[index.coerceIn(0, plane.bytes.size - 1)].toInt() and 0xFF
     }
-
-    private fun yPrimeToLinear(y: Int): Float =
-        Math.pow(videoRangeY(y).toDouble(), 2.2).toFloat()
 
     private fun videoRangeY(y: Int): Float =
         ((y - 16) / 219f).coerceIn(0f, 1f)

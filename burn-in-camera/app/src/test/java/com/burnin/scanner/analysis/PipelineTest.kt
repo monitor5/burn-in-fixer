@@ -273,6 +273,57 @@ class PipelineTest {
         assertTrue("신뢰 낮은 셀은 보정이 억제돼야 함: ${gain[gh / 2 * gw + 15]}", gain[gh / 2 * gw + 15] > 0.995f)
     }
 
+    /** 네이티브 1:1 그리드에서 카메라 픽셀 스케일 노이즈/무아레가 맵에 새겨지지 않아야 한다 */
+    @Test
+    fun adaptiveSmoothRadiusSuppresssSubCameraPixelNoise() {
+        val gw = 96
+        val gh = 96
+        val rnd = java.util.Random(7)
+        // 셀 단위 고주파 노이즈(카메라가 분해 못 하는 스케일의 무아레/노이즈 모사) ±3%
+        val luma = FloatArray(gw * gh) { 1f + (rnd.nextFloat() - 0.5f) * 0.06f }
+
+        val noisy = Analyzer.gainGrid(luma, gw, gh, 0.10f, smoothRadius = 1)
+        val smoothed = Analyzer.gainGrid(luma, gw, gh, 0.10f, smoothRadius = 4)
+
+        fun attenuationRms(gain: FloatArray): Float {
+            val interior = interior(gain, gw, gh)
+            var mean = 0.0
+            for (v in interior) mean += v.toDouble()
+            mean /= interior.size
+            var sq = 0.0
+            for (v in interior) sq += (v - mean) * (v - mean)
+            return Math.sqrt(sq / interior.size).toFloat()
+        }
+
+        val noisyRms = attenuationRms(noisy)
+        val smoothRms = attenuationRms(smoothed)
+        assertTrue(
+            "스무딩 반경 확대가 맵의 고주파 성분을 줄여야 함: r1=$noisyRms r4=$smoothRms",
+            smoothRms < noisyRms * 0.5f,
+        )
+    }
+
+    /** 스무딩 반경을 키워도 넓은 번인 얼룩(저주파)은 계속 보정되어야 한다 */
+    @Test
+    fun adaptiveSmoothRadiusKeepsWideBurnInCorrection() {
+        val gw = 96
+        val gh = 96
+        val luma = FloatArray(gw * gh) { 1f }
+        // 화면 1/3 크기의 어두운 번인 영역 (-6%)
+        for (y in gh / 3 until gh * 2 / 3) {
+            for (x in gw / 3 until gw * 2 / 3) {
+                luma[y * gw + x] = 0.94f
+            }
+        }
+
+        val gain = Analyzer.gainGrid(luma, gw, gh, 0.10f, smoothRadius = 4)
+        val burnCenter = gain[(gh / 2) * gw + gw / 2]
+        val normalRegion = gain[(gh / 6) * gw + gw / 2]
+
+        assertTrue("번인 중앙은 유지(≈1.0)돼야 함: $burnCenter", burnCenter > 0.99f)
+        assertTrue("정상 영역은 낮춰져야 함: $normalRegion", normalRegion < 0.96f)
+    }
+
     @Test
     fun edgeRampDoesNotSuppressStatusBarRegion() {
         val gw = 200

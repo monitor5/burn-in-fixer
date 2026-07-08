@@ -77,6 +77,7 @@ object Session {
     var referenceClient: ControlClient? = null
     var screenWidth: Int = 0
     var screenHeight: Int = 0
+    var screenRefreshRate: Float = 60f
     var targetName: String = ""
     var targetRole: String = Protocol.ROLE_ADJUSTMENT
     var referenceScreenWidth: Int = 0

@@ -414,7 +414,9 @@ object Analyzer {
      * gain 맵 생성 (14.5/14.6):
      *  target = 하위 10퍼센타일, gain = clamp(target/측정값, 1-maxAtt, 1)
      *  → 밝은(정상) 영역일수록 gain < 1 (낮춤), 번인(어두운) 영역은 1 (유지)
-     * 3x3 박스 블러 2회로 측정 노이즈를 죽인다 (MVP smoothing).
+     * 박스 블러 2회로 측정 노이즈를 죽인다. smoothRadius는 그리드 해상도가 카메라의
+     * 실측 해상도보다 높을 때(네이티브 1:1 맵) 카메라 1픽셀 이하 스케일의 노이즈·무아레가
+     * 보정맵에 그대로 새겨지지 않도록 카메라 픽셀 스케일에 맞춰 키운다.
      */
     fun gainGrid(
         luma: FloatArray,
@@ -422,6 +424,7 @@ object Analyzer {
         gh: Int,
         maxAtt: Float,
         confidence: FloatArray? = null,
+        smoothRadius: Int = 1,
     ): FloatArray {
         if (confidence != null) require(confidence.size == luma.size) { "confidence grid size mismatch" }
         val st = stats(luma)
@@ -432,8 +435,8 @@ object Analyzer {
             val conf = confidence?.get(i) ?: 1f
             gain[i] = (1f - (1f - raw) * conf).coerceIn(1f - maxAtt, 1f)
         }
-        var g = boxBlur(gain, gw, gh)
-        g = boxBlur(g, gw, gh)
+        var g = boxBlur(gain, gw, gh, smoothRadius)
+        g = boxBlur(g, gw, gh, smoothRadius)
         applyEdgeRamp(g, gw, gh)
         return g
     }
@@ -490,6 +493,7 @@ object Analyzer {
         gh: Int,
         maxAtt: Float,
         confidence: FloatArray? = null,
+        smoothRadius: Int = 1,
     ): FloatArray {
         if (confidence != null) require(confidence.size == gain.size) { "confidence grid size mismatch" }
         val out = FloatArray(gain.size)
@@ -499,7 +503,7 @@ object Analyzer {
             out[i] = (gain[i] * Math.pow(ratio, localAlpha.toDouble()).toFloat())
                 .coerceIn(1f - maxAtt, 1f)
         }
-        val g = boxBlur(out, gw, gh)
+        val g = boxBlur(out, gw, gh, smoothRadius)
         applyEdgeRamp(g, gw, gh)
         return g
     }
@@ -519,23 +523,53 @@ object Analyzer {
         }
     }
 
-    private fun boxBlur(src: FloatArray, w: Int, h: Int): FloatArray {
-        val dst = FloatArray(src.size)
+    /** 가로/세로 분리 슬라이딩 윈도 박스 블러. 반경이 커져도 O(w·h)로 동작하며,
+     *  가장자리는 실제 포함된 픽셀 수로 나눠 기존 3x3 구현과 같은 경계 동작을 유지한다. */
+    private fun boxBlur(src: FloatArray, w: Int, h: Int, radius: Int = 1): FloatArray {
+        if (radius < 1) return src.clone()
+        val tmp = FloatArray(src.size)
         for (y in 0 until h) {
+            val row = y * w
+            var acc = 0f
+            var n = 0
+            for (x in 0 until minOf(radius, w)) {
+                acc += src[row + x]
+                n++
+            }
             for (x in 0 until w) {
-                var acc = 0f
-                var n = 0
-                for (dy in -1..1) {
-                    val yy = y + dy
-                    if (yy < 0 || yy >= h) continue
-                    for (dx in -1..1) {
-                        val xx = x + dx
-                        if (xx < 0 || xx >= w) continue
-                        acc += src[yy * w + xx]
-                        n++
-                    }
+                val add = x + radius
+                if (add < w) {
+                    acc += src[row + add]
+                    n++
+                }
+                tmp[row + x] = acc / n
+                val drop = x - radius
+                if (drop >= 0) {
+                    acc -= src[row + drop]
+                    n--
+                }
+            }
+        }
+        val dst = FloatArray(src.size)
+        for (x in 0 until w) {
+            var acc = 0f
+            var n = 0
+            for (y in 0 until minOf(radius, h)) {
+                acc += tmp[y * w + x]
+                n++
+            }
+            for (y in 0 until h) {
+                val add = y + radius
+                if (add < h) {
+                    acc += tmp[add * w + x]
+                    n++
                 }
                 dst[y * w + x] = acc / n
+                val drop = y - radius
+                if (drop >= 0) {
+                    acc -= tmp[drop * w + x]
+                    n--
+                }
             }
         }
         return dst

@@ -152,6 +152,10 @@ class CaptureController(context: Context, private val textureView: TextureView) 
             set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
             set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
             set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
+            set(
+                CaptureRequest.CONTROL_AE_ANTIBANDING_MODE,
+                CameraMetadata.CONTROL_AE_ANTIBANDING_MODE_AUTO,
+            )
             set(CaptureRequest.FLASH_MODE, CameraMetadata.FLASH_MODE_OFF)
         }
         session!!.setRepeatingRequest(previewBuilder.build(), previewCallback, handler)
@@ -169,8 +173,13 @@ class CaptureController(context: Context, private val textureView: TextureView) 
     /**
      * 현재 자동 수렴 값을 수동 값으로 고정한다. FULL/LEVEL_3 기기에서는 ISO/셔터/WB/포커스를
      * Camera2 manual request로 고정하고, 그 외 기기는 AE/AWB lock으로 fallback한다.
+     *
+     * displayRefreshHz가 주어지면 노출 시간을 대상 화면 주사 주기의 정수배로 양자화한다.
+     * OLED는 60Hz 리프레시와 그 정수배 PWM 디밍으로 밝기가 진동하므로, 임의 노출로 찍으면
+     * 롤링셔터 행마다 위상이 달라 가로 줄무늬(밴딩)와 프레임 간 플리커가 생긴다. 노출이
+     * 주기의 정수배면 모든 행이 완전한 사이클을 적분해 밴딩이 원천 상쇄된다.
      */
-    fun lockMeasurementControls(): String {
+    fun lockMeasurementControls(displayRefreshHz: Float = 60f): String {
         val caps = characteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
             ?.toSet()
             .orEmpty()
@@ -180,8 +189,15 @@ class CaptureController(context: Context, private val textureView: TextureView) 
         if (manualCapable && exposure != null && iso != null) {
             val exposureRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
             val isoRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
-            manualExposureTimeNs = exposure.coerceInRange(exposureRange)
-            manualSensitivityIso = iso.coerceInRange(isoRange)
+            val (flickerFreeExposure, compensatedIso) = quantizeExposureToRefresh(
+                exposure.coerceInRange(exposureRange),
+                iso.coerceInRange(isoRange),
+                displayRefreshHz,
+                exposureRange,
+                isoRange,
+            )
+            manualExposureTimeNs = flickerFreeExposure
+            manualSensitivityIso = compensatedIso
             manualAwbGains = latestAwbGains
             manualFocusDistance = latestFocusDistance?.let { focus ->
                 val maxFocus = characteristics.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
@@ -192,11 +208,49 @@ class CaptureController(context: Context, private val textureView: TextureView) 
             applyMeasurementControls(previewBuilder)
             session?.setRepeatingRequest(previewBuilder.build(), previewCallback, handler)
             val focusText = manualFocusDistance?.let { ", focus ${"%.2f".format(it)}D" } ?: ""
-            return "수동 고정: ISO $manualSensitivityIso, ${manualExposureTimeNs}ns$focusText"
+            val flickerText = if (flickerFreeExposure != exposure) {
+                val cycles = Math.round(flickerFreeExposure * displayRefreshHz / 1e9)
+                " (flicker-sync ${displayRefreshHz.toInt()}Hz×$cycles, AE ${exposure}ns→)"
+            } else {
+                ""
+            }
+            return "수동 고정: ISO $manualSensitivityIso, ${manualExposureTimeNs}ns$focusText$flickerText"
         }
 
         lockAeAwb()
         return "AE/AWB lock fallback"
+    }
+
+    /**
+     * 노출을 주사 주기(1/refreshHz)의 정수배로 양자화하고, 총 노출량이 유지되도록 ISO를
+     * 반비례 보상한다. 우선 올림(노출↑·ISO↓, 노이즈도 감소)을 시도하고, ISO 하한이나
+     * 노출 상한에 걸려 밝기가 15% 이상 달라지면 내림을 시도하며, 둘 다 불가하면 원값 유지.
+     */
+    private fun quantizeExposureToRefresh(
+        exposureNs: Long,
+        iso: Int,
+        refreshHz: Float,
+        exposureRange: Range<Long>?,
+        isoRange: Range<Int>?,
+    ): Pair<Long, Int> {
+        if (refreshHz < 1f || exposureNs <= 0L) return exposureNs to iso
+        val periodNs = Math.round(1e9 / refreshHz)
+        if (periodNs <= 0L) return exposureNs to iso
+
+        fun candidate(cycles: Long): Pair<Long, Int>? {
+            if (cycles < 1) return null
+            val quantized = cycles * periodNs
+            if (exposureRange != null && quantized !in exposureRange.lower..exposureRange.upper) return null
+            val compensated = Math.round(iso.toDouble() * exposureNs / quantized)
+                .toInt()
+                .coerceInRange(isoRange)
+            val brightnessRatio = compensated.toDouble() * quantized / (iso.toDouble() * exposureNs)
+            if (brightnessRatio > 1.15 || brightnessRatio < 0.85) return null
+            return quantized to compensated
+        }
+
+        val up = (exposureNs + periodNs - 1) / periodNs
+        return candidate(up) ?: candidate(exposureNs / periodNs) ?: (exposureNs to iso)
     }
 
     suspend fun captureFrames(count: Int, interFrameDelayMs: Long = 150): List<CaptureFrame> {

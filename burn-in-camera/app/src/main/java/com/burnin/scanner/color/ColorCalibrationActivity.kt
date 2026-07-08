@@ -132,7 +132,7 @@ class ColorCalibrationActivity : Activity() {
             adjust.showPattern(WHITE_PATTERN)
         }
         delay(SETTLE_MS)
-        val lockText = cap.lockMeasurementControls()
+        val lockText = cap.lockMeasurementControls(Session.screenRefreshRate)
         log("카메라 고정: $lockText")
 
         status("대조설비 원본 흰색 측정...")

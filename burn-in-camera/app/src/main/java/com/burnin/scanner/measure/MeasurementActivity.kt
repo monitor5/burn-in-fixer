@@ -81,6 +81,11 @@ class MeasurementActivity : Activity() {
         private const val FLICKER_OK_RELATIVE_RANGE = 0.015f
         private const val FLICKER_ZERO_RELATIVE_RANGE = 0.045f
         private const val FLICKER_INTER_FRAME_DELAY_MS = 1_200L
+
+        // 1200ms는 60Hz 주사 주기(16.67ms)의 정확히 72배라, 잔여 롤링 밴드가 매 프레임
+        // 같은 위상(같은 위치)에 반복되어 평균화로 상쇄되지 않았다. 주기의 정수배가 아닌
+        // 오프셋을 프레임마다 더해 밴드 위상을 흩뜨린다.
+        private val FLICKER_PHASE_JITTER_MS = longArrayOf(0, 7, 23, 41, 11)
         private const val CAPTURE_FRAME_MAGIC = 0x42494631 // BIF1
         private val RGB70_PATTERNS = listOf("red70", "green70", "blue70")
         private val RGB30_PATTERNS = listOf("red30", "green30", "blue30")
@@ -203,8 +208,8 @@ class MeasurementActivity : Activity() {
             client.showPattern("gray70")
         }
         delay(2500)
-        val lockText = cap.lockMeasurementControls()
-        log("캡처 고정: $lockText")
+        val lockText = cap.lockMeasurementControls(Session.screenRefreshRate)
+        log("캡처 고정: $lockText (대상 주사율 ${Session.screenRefreshRate}Hz)")
         delay(400)
 
         // ── 2. 기준 촬영 + 화면 검출 ─────────────────────────────
@@ -296,6 +301,8 @@ class MeasurementActivity : Activity() {
         val gw = screenW
         val gh = screenH
         log("보정맵 해상도: ${gw}x${gh} (대상 기기 해상도 1:1)")
+        val smoothRadius = mapSmoothRadius(det.quad, gw, gh)
+        log("보정맵 스무딩 반경 ${smoothRadius}셀 — 카메라 해상 한계 이하 노이즈/무아레가 맵에 새겨지지 않도록 적응 조정")
         val lumaBeforeRaw = withContext(Dispatchers.Default) {
             Analyzer.lumaGrid(grayAvg, blackAvg, homography, screenW, screenH, gw, gh)
         }
@@ -402,6 +409,7 @@ class MeasurementActivity : Activity() {
                 flatField = flatField,
                 makeHeatmaps = true,
                 includeGain = true,
+                smoothRadius = smoothRadius,
             )
         } catch (e: Exception) {
             log("RGB30 채널 측정 건너뜀: ${e.message}")
@@ -433,10 +441,10 @@ class MeasurementActivity : Activity() {
 
         // ── 7~8. 초기 보정맵 + 반복 보정 루프 ────────────────────
         val gray70Gain = withContext(Dispatchers.Default) {
-            Analyzer.gainGrid(lumaBefore, gw, gh, MAX_ATTENUATION, confidence70)
+            Analyzer.gainGrid(lumaBefore, gw, gh, MAX_ATTENUATION, confidence70, smoothRadius)
         }
         val lowLightGain = withContext(Dispatchers.Default) {
-            Analyzer.gainGrid(lumaLowBefore, gw, gh, MAX_ATTENUATION, confidenceLow)
+            Analyzer.gainGrid(lumaLowBefore, gw, gh, MAX_ATTENUATION, confidenceLow, smoothRadius)
         }
         val grayMixedGain = withContext(Dispatchers.Default) {
             Analyzer.mixGainGrids(gray70Gain, lowLightGain, lowLightWeight, MAX_ATTENUATION)
@@ -612,15 +620,17 @@ class MeasurementActivity : Activity() {
 
             val refined70 = withContext(Dispatchers.Default) {
                 Analyzer.refineGain(
-                    gain, lumaAfter, target, DAMPING_ALPHA, gw, gh, MAX_ATTENUATION, confidenceAfter
+                    gain, lumaAfter, target, DAMPING_ALPHA, gw, gh, MAX_ATTENUATION,
+                    confidenceAfter, smoothRadius
                 )
             }
             val refined30 = withContext(Dispatchers.Default) {
                 Analyzer.refineGain(
-                    gain, lumaLowAfter, lowTarget, DAMPING_ALPHA, gw, gh, MAX_ATTENUATION, confidenceLowAfter
+                    gain, lumaLowAfter, lowTarget, DAMPING_ALPHA, gw, gh, MAX_ATTENUATION,
+                    confidenceLowAfter, smoothRadius
                 )
             }
-            val refinedRgb30 = refineRgbGain(gain, rgb30After, rgb30Targets, gw, gh)
+            val refinedRgb30 = refineRgbGain(gain, rgb30After, rgb30Targets, gw, gh, smoothRadius)
             val refinedGray = withContext(Dispatchers.Default) {
                 Analyzer.mixGainGrids(refined70, refined30, lowLightWeight, MAX_ATTENUATION)
             }
@@ -942,6 +952,7 @@ class MeasurementActivity : Activity() {
         makeHeatmaps: Boolean,
         includeGain: Boolean,
         keepGrids: Boolean = false,
+        smoothRadius: Int = 1,
     ): RgbMeasurement {
         val stats = LinkedHashMap<String, Analyzer.Stats>()
         val grids = LinkedHashMap<String, FloatArray>()
@@ -996,7 +1007,7 @@ class MeasurementActivity : Activity() {
             if (includeGain) {
                 val confidence = confidences[pattern]
                 val gain = withContext(Dispatchers.Default) {
-                    Analyzer.gainGrid(grid, gw, gh, MAX_ATTENUATION, confidence)
+                    Analyzer.gainGrid(grid, gw, gh, MAX_ATTENUATION, confidence, smoothRadius)
                 }
                 gains += gain
                 channelGains[channel] = gain
@@ -1030,6 +1041,7 @@ class MeasurementActivity : Activity() {
         targets: Map<String, Float>,
         gw: Int,
         gh: Int,
+        smoothRadius: Int = 1,
     ): FloatArray? {
         if (measurement.grids.isEmpty()) return null
         val refined = ArrayList<FloatArray>()
@@ -1038,7 +1050,8 @@ class MeasurementActivity : Activity() {
             val confidence = measurement.confidences[pattern]
             refined += withContext(Dispatchers.Default) {
                 Analyzer.refineGain(
-                    currentGain, grid, target, DAMPING_ALPHA, gw, gh, MAX_ATTENUATION, confidence
+                    currentGain, grid, target, DAMPING_ALPHA, gw, gh, MAX_ATTENUATION,
+                    confidence, smoothRadius
                 )
             }
         }
@@ -1174,7 +1187,9 @@ class MeasurementActivity : Activity() {
                 val file = File.createTempFile("capture_${System.nanoTime()}_", ".bin", cacheDir)
                 writeCaptureFrame(file, frame)
                 files += file
-                if (index != frameCount - 1) delay(interFrameDelayMs)
+                if (index != frameCount - 1) {
+                    delay(interFrameDelayMs + FLICKER_PHASE_JITTER_MS[index % FLICKER_PHASE_JITTER_MS.size])
+                }
             }
             val sensorSpanMs = firstTimestampNs?.let { first ->
                 lastTimestampNs?.let { last -> ((last - first) / 1_000_000L).coerceAtLeast(0L) }
@@ -1187,26 +1202,49 @@ class MeasurementActivity : Activity() {
         }
     }
 
+    /**
+     * 프레임 스택 → 픽셀별 절사 평균. 4장 이상이면 픽셀별 최소/최대 1장씩을 제외해,
+     * 잔여 롤링 밴드나 순간 플리커가 남은 프레임이 평균을 끌고 가는 것을 막는다.
+     * (min/max 추적만 추가하면 되어 스트리밍 처리 그대로 유지)
+     */
     private suspend fun averageGrayFromStore(store: CaptureFrameStore): GrayImage =
         withContext(Dispatchers.Default) {
             var width = 0
             var height = 0
             var acc: FloatArray? = null
+            var minArr: FloatArray? = null
+            var maxArr: FloatArray? = null
             for (file in store.files) {
                 val img = ImageOps.decodeLinearGray(readCaptureFrame(file))
                 if (acc == null) {
                     width = img.w
                     height = img.h
                     acc = FloatArray(img.data.size)
+                    minArr = FloatArray(img.data.size) { Float.MAX_VALUE }
+                    maxArr = FloatArray(img.data.size) { -Float.MAX_VALUE }
                 } else {
                     require(img.w == width && img.h == height) { "프레임 크기 불일치" }
                 }
                 val dst = acc!!
-                for (i in dst.indices) dst[i] += img.data[i]
+                val mn = minArr!!
+                val mx = maxArr!!
+                for (i in dst.indices) {
+                    val v = img.data[i]
+                    dst[i] += v
+                    if (v < mn[i]) mn[i] = v
+                    if (v > mx[i]) mx[i] = v
+                }
             }
             val dst = acc ?: throw IllegalStateException("프레임 없음")
-            val n = store.files.size.toFloat()
-            for (i in dst.indices) dst[i] /= n
+            val n = store.files.size
+            if (n >= 4) {
+                val mn = minArr!!
+                val mx = maxArr!!
+                val div = (n - 2).toFloat()
+                for (i in dst.indices) dst[i] = (dst[i] - mn[i] - mx[i]) / div
+            } else {
+                for (i in dst.indices) dst[i] /= n.toFloat()
+            }
             GrayImage(width, height, dst)
         }
 
@@ -1313,6 +1351,20 @@ class MeasurementActivity : Activity() {
                 frameStore.delete()
             }
         }
+
+    /**
+     * gain 맵 스무딩 반경(그리드 셀 단위)을 카메라의 실측 해상도에 맞춘다.
+     * 네이티브 1:1 그리드는 촬영 이미지보다 훨씬 조밀해서(카메라 1픽셀 ≈ 여러 셀),
+     * 고정 3x3 블러로는 카메라 픽셀 스케일의 노이즈·무아레가 거의 그대로 맵에 새겨져
+     * 화면에 줄무늬/얼룩으로 표시됐다. 반경을 '카메라 1픽셀이 차지하는 셀 수' 이상으로
+     * 잡으면 카메라가 실제로 분해하지 못하는 성분만 제거되고 실측 정보는 보존된다.
+     */
+    private fun mapSmoothRadius(quad: ScreenDetector.Quad, gw: Int, gh: Int): Int {
+        val screenSpanPx = maxOf(quad.topLen(), quad.sideLen())
+        if (screenSpanPx <= 1f) return 1
+        val cellsPerCameraPx = maxOf(gw, gh) / screenSpanPx
+        return Math.ceil(cellsPerCameraPx.toDouble()).toInt().coerceIn(1, 8)
+    }
 
     private fun stabilityGridSize(gw: Int, gh: Int): Pair<Int, Int> {
         val maxEdge = maxOf(gw, gh)
