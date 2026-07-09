@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuite name="com.burnin.scanner.analysis.HomographyTest" tests="4" skipped="0" failures="0" errors="0" timestamp="2026-07-07T18:56:18" hostname="MacBook-Pro-3.local" time="0.022">
+<testsuite name="com.burnin.scanner.analysis.HomographyTest" tests="4" skipped="0" failures="0" errors="0" timestamp="2026-07-09T16:53:07.417Z" hostname="MacBook-Pro-3.local" time="0.011">
   <properties/>
-  <testcase name="mapsRectangleExactly" classname="com.burnin.scanner.analysis.HomographyTest" time="0.002"/>
-  <testcase name="solvesLeastSquaresFromManyPointPairs" classname="com.burnin.scanner.analysis.HomographyTest" time="0.001"/>
-  <testcase name="solvesPerspectiveTransform" classname="com.burnin.scanner.analysis.HomographyTest" time="0.002"/>
-  <testcase name="markerDisambiguatesVerticalFlip" classname="com.burnin.scanner.analysis.HomographyTest" time="0.017"/>
+  <testcase name="mapsRectangleExactly" classname="com.burnin.scanner.analysis.HomographyTest" time="0.001"/>
+  <testcase name="solvesLeastSquaresFromManyPointPairs" classname="com.burnin.scanner.analysis.HomographyTest" time="0.0"/>
+  <testcase name="solvesPerspectiveTransform" classname="com.burnin.scanner.analysis.HomographyTest" time="0.001"/>
+  <testcase name="markerDisambiguatesVerticalFlip" classname="com.burnin.scanner.analysis.HomographyTest" time="0.009"/>
   <system-out><![CDATA[]]></system-out>
   <system-err><![CDATA[]]></system-err>
 </testsuite>

@@ -6,9 +6,12 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.util.Base64
+import android.hardware.camera2.CameraManager
 import android.view.TextureView
 import android.view.WindowManager
 import android.widget.Button
+import android.widget.CheckBox
+import android.widget.EditText
 import android.widget.TextView
 import com.burnin.scanner.R
 import com.burnin.scanner.analysis.Analyzer
@@ -18,6 +21,7 @@ import com.burnin.scanner.analysis.Homography
 import com.burnin.scanner.analysis.ImageOps
 import com.burnin.scanner.analysis.RgbImage
 import com.burnin.scanner.analysis.ScreenDetector
+import com.burnin.scanner.camera.CameraEnumerator
 import com.burnin.scanner.camera.CaptureController
 import com.burnin.scanner.camera.CaptureFrame
 import com.burnin.scanner.net.ControlClient
@@ -97,6 +101,10 @@ class MeasurementActivity : Activity() {
     private lateinit var txtResult: TextView
     private lateinit var btnStart: Button
     private lateinit var btnToggle: Button
+    private lateinit var editRefresh: EditText
+    private lateinit var chkTri: CheckBox
+    private var triSelection: CameraEnumerator.TriSelection? = null
+    private var measuring = false
     private var correctionOn = true
     private val resultLog = StringBuilder()
 
@@ -153,20 +161,57 @@ class MeasurementActivity : Activity() {
             return
         }
 
+        editRefresh = findViewById(R.id.editRefresh)
+        chkTri = findViewById(R.id.chkTri)
+        if (Session.screenRefreshRate >= 1f) editRefresh.setText(fmtRefresh(Session.screenRefreshRate))
+
+        val choices = CameraEnumerator.enumerate(getSystemService(CameraManager::class.java))
+        triSelection = if (Build.VERSION.SDK_INT >= 28) CameraEnumerator.selectTriSet(choices) else null
+        log(CameraEnumerator.report(choices, triSelection).trimEnd())
+        chkTri.isEnabled = triSelection != null
+        chkTri.isChecked = triSelection != null
+        chkTri.setOnCheckedChangeListener { _, _ -> if (!measuring) startCamera() }
+
+        startCamera()
+    }
+
+    /** 선택 상태(3각 동시 on/off)에 맞춰 카메라 세션을 (재)시작한다. */
+    private fun startCamera() {
         scope.launch {
             try {
+                capture?.close()
+                capture = null
                 val c = CaptureController(this@MeasurementActivity, findViewById<TextureView>(R.id.preview))
-                c.start()
+                c.start(if (chkTri.isChecked) triSelection else null)
                 capture = c
                 status("카메라 준비 완료 — 정렬 확인 후 [측정 시작]")
                 log(
                     "카메라: ${c.captureSize.width}x${c.captureSize.height} " +
                         "${c.captureFormatText}, ${c.hardwareLevelText()}"
                 )
+                if (chkTri.isChecked) {
+                    log(
+                        if (c.isTriActive) "동시 3각 세션 구성: ${c.triSummary()}"
+                        else "동시 3각 구성 실패 → 메인 단독 폴백 (기기 HAL 제한)"
+                    )
+                }
             } catch (e: Exception) {
                 status("카메라 초기화 실패: ${e.message}")
                 btnStart.isEnabled = false
             }
+        }
+    }
+
+    private fun fmtRefresh(hz: Float): String =
+        if (hz == Math.floor(hz.toDouble()).toFloat()) hz.toInt().toString()
+        else String.format(java.util.Locale.US, "%.1f", hz)
+
+    /** 사용자가 입력한 주사율(기본 60, HELLO 값 프리필). 셔터 양자화의 기준. */
+    private fun inputRefreshHz(): Float {
+        val v = editRefresh.text.toString().trim().toFloatOrNull()
+        return when {
+            v == null || v < 1f -> if (Session.screenRefreshRate >= 1f) Session.screenRefreshRate else 60f
+            else -> v.coerceIn(24f, 480f)
         }
     }
 
@@ -182,6 +227,9 @@ class MeasurementActivity : Activity() {
     }
 
     private suspend fun runMeasurementSafely() {
+        measuring = true
+        chkTri.isEnabled = false
+        editRefresh.isEnabled = false
         try {
             runMeasurement()
         } catch (e: Exception) {
@@ -189,6 +237,9 @@ class MeasurementActivity : Activity() {
             log("!! 중단: ${e.message}")
         } finally {
             btnStart.isEnabled = true
+            measuring = false
+            chkTri.isEnabled = triSelection != null
+            editRefresh.isEnabled = true
         }
     }
 
@@ -208,13 +259,17 @@ class MeasurementActivity : Activity() {
             client.showPattern("gray70")
         }
         delay(2500)
-        val lockText = cap.lockMeasurementControls(Session.screenRefreshRate)
-        log("캡처 고정: $lockText (대상 주사율 ${Session.screenRefreshRate}Hz)")
+        val refreshHz = inputRefreshHz()
+        val lockText = cap.lockMeasurementControls(refreshHz)
+        log("캡처 고정: $lockText (입력 주사율 ${fmtRefresh(refreshHz)}Hz)")
+        if (cap.isTriActive) log("동시 3각 촬영 활성: ${cap.triSummary()}")
         delay(400)
 
-        // ── 2. 기준 촬영 + 화면 검출 ─────────────────────────────
+        // ── 2. 기준 촬영 + 화면 검출 (활성 화각 전체 동시 캡처) ────
         status("2/10 기준 패턴 촬영 (${FRAMES_PER_PATTERN}장)...")
-        val grayCapture = captureGray(cap)
+        val triGrayStores = captureTriStores(cap, FRAMES_PER_PATTERN)
+        val mainGrayStore = triGrayStores.getValue(CameraEnumerator.ROLE_MAIN)
+        val grayCapture = GrayCapture(averageGrayFromStore(mainGrayStore), mainGrayStore)
         val grayAvg = grayCapture.average
         val det = withContext(Dispatchers.Default) { ScreenDetector.detect(grayAvg) }
             ?: throw IllegalStateException("화면 검출 실패 — 차광 상태와 카메라 정렬을 확인하세요")
@@ -237,10 +292,15 @@ class MeasurementActivity : Activity() {
         val fallbackHomography = Analyzer.buildHomography(det.quad, screenW, screenH)
             ?: throw IllegalStateException("호모그래피 계산 실패")
         status("2/10 방향 마커 촬영, 화면 좌표 방향 판별...")
+        var markerTriFrames: Map<String, CaptureFrame> = emptyMap()
         val markerOrientation = try {
             withContext(Dispatchers.IO) { client.showPattern("marker") }
             delay(800)
             val markerAvg = captureAveraged(cap)
+            if (cap.isTriActive) {
+                // 보조 화각도 방향 판별이 필요하다 (교차 그리드 180° 뒤집힘 방지)
+                markerTriFrames = runCatching { cap.captureTriFrames() }.getOrDefault(emptyMap())
+            }
             withContext(Dispatchers.Default) {
                 Analyzer.buildHomographyWithMarker(det.quad, markerAvg, screenW, screenH)
             }
@@ -287,11 +347,12 @@ class MeasurementActivity : Activity() {
             log("dot-grid 정합 실패 — 4모서리 호모그래피로 계속 진행")
         }
 
-        // ── 3. 블랙 오프셋 ──────────────────────────────────────
+        // ── 3. 블랙 오프셋 (활성 화각 전체 동시 캡처) ─────────────
         status("3/10 black 패턴 촬영 (오프셋/미광 검증)...")
         withContext(Dispatchers.IO) { client.showPattern("black") }
         delay(700)
-        val blackStore = captureFrameStore(cap, FRAMES_PER_PATTERN)
+        val triBlackStores = captureTriStores(cap, FRAMES_PER_PATTERN)
+        val blackStore = triBlackStores.getValue(CameraEnumerator.ROLE_MAIN)
         val blackAvg = averageGrayFromStore(blackStore)
         val blackRgbAvg = averageRgbFromStore(blackStore)
         blackStore.delete()
@@ -321,8 +382,28 @@ class MeasurementActivity : Activity() {
         val flickerConfidence70 = temporalLumaConfidence(
             grayCapture.frameStore, blackAvg, homography, screenW, screenH, gw, gh
         )
-        val confidence70 = withContext(Dispatchers.Default) {
+        val confidence70Single = withContext(Dispatchers.Default) {
             Analyzer.combineConfidence(baseConfidence70, flickerConfidence70)
+        }
+
+        // ── 3.5 동시 3각 교차 분석: 화각 간 불일치 구간을 보정에서 무시 ──
+        val cross = analyzeCrossRoles(
+            triGrayStores, triBlackStores, markerTriFrames, lumaBefore, screenW, screenH, gw, gh,
+        )
+        val confidence70 = if (cross != null) {
+            withContext(Dispatchers.Default) {
+                Analyzer.combineConfidence(confidence70Single, cross.agreement)
+            }
+        } else {
+            confidence70Single
+        }
+        if (cross != null) {
+            cross.notes.forEach { log(it) }
+            log(
+                "3각 교차 일치도 평균 ${pct(cross.meanAgreement)} " +
+                    "(${cross.roles.joinToString("+")}) — 불일치 구간은 gain 반영 제외"
+            )
+            cap.physicalExposureSummary(refreshHz)?.let { log("물리 카메라 노출: $it") }
         }
         val blackGrid = withContext(Dispatchers.Default) {
             Analyzer.lumaGrid(blackAvg, null, homography, screenW, screenH, 16, 16)
@@ -778,6 +859,13 @@ class MeasurementActivity : Activity() {
             .put("lowLightFrameStabilityMean", Analyzer.meanConfidence(flickerConfidenceLow).toDouble())
             .put("lowLightFlickerFrameSpanSeconds", lowBeforeCapture.frameStore.spanMs / 1000.0)
             .put("strayLightRatio", strayRatio.toDouble())
+            .put("cameraSetup", cap.triSummary())
+            .put("simultaneousTriCapture", cap.isTriActive)
+            .put("refreshRateUsedHz", refreshHz.toDouble())
+            .put("crossAgreementMean", (cross?.meanAgreement ?: 1f).toDouble())
+            .put("crossRoles", JSONArray(cross?.roles ?: emptyList<String>()))
+            .put("crossRoleStats", statsMapJson(cross?.roleStats ?: LinkedHashMap()))
+            .put("physicalExposures", cap.physicalExposureSummary(refreshHz) ?: "")
             .put("rmsBefore", statsBefore.rmsDev.toDouble())
             .put("p95Before", statsBefore.p95Dev.toDouble())
             .put("maxBefore", statsBefore.maxDev.toDouble())
@@ -856,6 +944,11 @@ class MeasurementActivity : Activity() {
             files.putAll(rgb70.heatmaps)
             files.putAll(rgb30.heatmaps)
             files.putAll(finalRgb30.heatmaps)
+            if (cross != null) {
+                files.putAll(cross.files)
+                // 역해석용 메인 화각 평균 프레임도 함께 저장
+                files["camera_main_gray70.png"] = Analyzer.grayImagePng(grayAvg)
+            }
             ReportStore.save(dir, report, files)
         }
         log("리포트 저장: ${dir.absolutePath}")
@@ -1200,6 +1293,155 @@ class MeasurementActivity : Activity() {
             files.forEach { file -> runCatching { file.delete() } }
             throw e
         }
+    }
+
+    /**
+     * 활성 화각 전체(메인+초광각+망원)를 동시 캡처로 N회 촬영해 role별 스토어로 만든다.
+     * 각 회차는 하나의 캡처 요청이므로 role 간 프레임은 "같은 순간"의 화면이다.
+     * 메인 단독 세션이면 main 스토어 하나만 반환된다 (기존 코드 경로와 동일).
+     */
+    private suspend fun captureTriStores(
+        cap: CaptureController,
+        frameCount: Int,
+        interFrameDelayMs: Long = FLICKER_INTER_FRAME_DELAY_MS,
+    ): Map<String, CaptureFrameStore> {
+        val filesByRole = LinkedHashMap<String, ArrayList<File>>()
+        val firstTs = HashMap<String, Long>()
+        val lastTs = HashMap<String, Long>()
+        val wallStartMs = System.currentTimeMillis()
+        try {
+            repeat(frameCount) { index ->
+                val frames = cap.captureTriFrames()
+                for ((role, frame) in frames) {
+                    if (frame.timestampNs > 0L) {
+                        if (!firstTs.containsKey(role)) firstTs[role] = frame.timestampNs
+                        lastTs[role] = frame.timestampNs
+                    }
+                    val file = File.createTempFile(
+                        "capture_${role}_${System.nanoTime()}_", ".bin", cacheDir,
+                    )
+                    writeCaptureFrame(file, frame)
+                    filesByRole.getOrPut(role) { ArrayList() } += file
+                }
+                if (index != frameCount - 1) {
+                    delay(
+                        interFrameDelayMs +
+                            FLICKER_PHASE_JITTER_MS[index % FLICKER_PHASE_JITTER_MS.size],
+                    )
+                }
+            }
+            val wallSpanMs = (System.currentTimeMillis() - wallStartMs).coerceAtLeast(0L)
+            return filesByRole.mapValues { (role, files) ->
+                val span = firstTs[role]?.let { f ->
+                    lastTs[role]?.let { l -> ((l - f) / 1_000_000L).coerceAtLeast(0L) }
+                } ?: 0L
+                CaptureFrameStore(files, if (span > 0L) span else wallSpanMs)
+            }
+        } catch (e: Exception) {
+            filesByRole.values.flatten().forEach { runCatching { it.delete() } }
+            throw e
+        }
+    }
+
+    private data class CrossResult(
+        val agreement: FloatArray,
+        val roles: List<String>,
+        val meanAgreement: Float,
+        val roleStats: LinkedHashMap<String, Analyzer.Stats>,
+        val files: LinkedHashMap<String, ByteArray>,
+        val notes: List<String>,
+    )
+
+    /**
+     * 동시 촬영된 보조 화각(초광각/망원)을 각자 검출·방향판별·정합·flat-field 후
+     * 정규화 그리드로 만들고, 메인과의 교차 일치도 confidence를 계산한다.
+     * 화각 간 불일치 구간 = 카메라 기인 성분 → 보정에서 무시 (사용자 요구사항).
+     * 역해석용으로 화각별 평균 프레임 PNG와 편차 히트맵을 세션 폴더에 남긴다.
+     */
+    private suspend fun analyzeCrossRoles(
+        grayStores: Map<String, CaptureFrameStore>,
+        blackStores: Map<String, CaptureFrameStore>,
+        markerFrames: Map<String, CaptureFrame>,
+        mainLuma: FloatArray,
+        screenW: Int,
+        screenH: Int,
+        gw: Int,
+        gh: Int,
+    ): CrossResult? {
+        val extraRoles = grayStores.keys.filter { it != CameraEnumerator.ROLE_MAIN }
+        if (extraRoles.isEmpty()) return null
+
+        val norms = ArrayList<FloatArray>()
+        norms += withContext(Dispatchers.Default) { Analyzer.normalizeByMedian(mainLuma) }
+        val okRoles = ArrayList<String>()
+        val roleStats = LinkedHashMap<String, Analyzer.Stats>()
+        val files = LinkedHashMap<String, ByteArray>()
+        val notes = ArrayList<String>()
+
+        for (role in extraRoles) {
+            val grayStore = grayStores.getValue(role)
+            val blackStore = blackStores[role]
+            try {
+                status("3/10 3각 교차 분석: $role...")
+                val roleGray = averageGrayFromStore(grayStore)
+                val roleBlack = blackStore?.let { averageGrayFromStore(it) }
+
+                val det = withContext(Dispatchers.Default) { ScreenDetector.detect(roleGray) }
+                    ?: throw IllegalStateException("화면 검출 실패 (프레이밍/초점)")
+                if (det.areaRatio > 0.97f) throw IllegalStateException("화면이 프레임 초과 (망원 한계)")
+                if (det.areaRatio < 0.04f) throw IllegalStateException("화면 점유율 과소")
+
+                val markerImg = markerFrames[role]?.let { frame ->
+                    withContext(Dispatchers.Default) { ImageOps.decodeLinearGray(frame) }
+                }
+                val oriented = markerImg?.let { img ->
+                    withContext(Dispatchers.Default) {
+                        Analyzer.buildHomographyWithMarker(det.quad, img, screenW, screenH)
+                    }
+                }
+                val h = oriented?.homography
+                    ?: withContext(Dispatchers.Default) {
+                        Analyzer.buildHomography(det.quad, screenW, screenH)
+                    }
+                    ?: throw IllegalStateException("호모그래피 실패")
+
+                val raw = withContext(Dispatchers.Default) {
+                    Analyzer.lumaGrid(roleGray, roleBlack, h, screenW, screenH, gw, gh)
+                }
+                val ff = withContext(Dispatchers.Default) { Analyzer.radialFlatField(raw, gw, gh) }
+                val grid = withContext(Dispatchers.Default) { Analyzer.applyFlatField(raw, ff) }
+                val st = Analyzer.stats(grid)
+                roleStats[role] = st
+                norms += withContext(Dispatchers.Default) { Analyzer.normalizeByMedian(grid) }
+                okRoles += role
+                files["camera_${role}_gray70.png"] =
+                    withContext(Dispatchers.Default) { Analyzer.grayImagePng(roleGray) }
+                files["deviation_${role}_before.png"] =
+                    withContext(Dispatchers.Default) { Analyzer.deviationHeatmapPng(grid, gw, gh) }
+                notes += "교차 포함: $role — 점유율 ${(det.areaRatio * 100).toInt()}%, " +
+                    "RMS ${pct(st.rmsDev)}" +
+                    (oriented?.let { ", 방향 ${it.mapping.label}" } ?: ", 방향 기본매핑")
+            } catch (e: Exception) {
+                notes += "교차 제외: $role — ${e.message}"
+            } finally {
+                grayStore.delete()
+                blackStore?.delete()
+            }
+        }
+
+        val agreement = if (okRoles.isEmpty()) {
+            FloatArray(gw * gh) { 1f } // 전부 제외 → 중립 (메인 단독과 동일)
+        } else {
+            withContext(Dispatchers.Default) { Analyzer.crossAgreementConfidence(norms, gw, gh) }
+        }
+        return CrossResult(
+            agreement = agreement,
+            roles = listOf(CameraEnumerator.ROLE_MAIN) + okRoles,
+            meanAgreement = Analyzer.meanConfidence(agreement),
+            roleStats = roleStats,
+            files = files,
+            notes = notes,
+        )
     }
 
     /**

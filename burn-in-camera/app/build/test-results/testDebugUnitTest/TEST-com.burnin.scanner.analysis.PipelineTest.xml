@@ -1,18 +1,20 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuite name="com.burnin.scanner.analysis.PipelineTest" tests="12" skipped="0" failures="0" errors="0" timestamp="2026-07-07T18:56:18" hostname="MacBook-Pro-3.local" time="0.154">
+<testsuite name="com.burnin.scanner.analysis.PipelineTest" tests="14" skipped="0" failures="0" errors="0" timestamp="2026-07-09T16:53:07.430Z" hostname="MacBook-Pro-3.local" time="0.164">
   <properties/>
   <testcase name="geometryQualityIsLowForUndistortedQuad" classname="com.burnin.scanner.analysis.PipelineTest" time="0.004"/>
-  <testcase name="edgeRampDoesNotSuppressStatusBarRegion" classname="com.burnin.scanner.analysis.PipelineTest" time="0.016"/>
-  <testcase name="lowLightGainMixContributesToCorrection" classname="com.burnin.scanner.analysis.PipelineTest" time="0.0"/>
+  <testcase name="edgeRampDoesNotSuppressStatusBarRegion" classname="com.burnin.scanner.analysis.PipelineTest" time="0.018"/>
+  <testcase name="lowLightGainMixContributesToCorrection" classname="com.burnin.scanner.analysis.PipelineTest" time="0.001"/>
   <testcase name="averageGainGridsMergesRgbLowLightAttenuation" classname="com.burnin.scanner.analysis.PipelineTest" time="0.0"/>
-  <testcase name="homographyAlignsScreenCoordinates" classname="com.burnin.scanner.analysis.PipelineTest" time="0.011"/>
+  <testcase name="homographyAlignsScreenCoordinates" classname="com.burnin.scanner.analysis.PipelineTest" time="0.012"/>
   <testcase name="endToEndCorrectionImprovesUniformity" classname="com.burnin.scanner.analysis.PipelineTest" time="0.038"/>
-  <testcase name="rotatedCameraStillBuildsHomography" classname="com.burnin.scanner.analysis.PipelineTest" time="0.001"/>
-  <testcase name="radialFlatFieldReducesCameraVignetting" classname="com.burnin.scanner.analysis.PipelineTest" time="0.004"/>
-  <testcase name="iterativeRefinementConverges" classname="com.burnin.scanner.analysis.PipelineTest" time="0.055"/>
+  <testcase name="rotatedCameraStillBuildsHomography" classname="com.burnin.scanner.analysis.PipelineTest" time="0.002"/>
+  <testcase name="radialFlatFieldReducesCameraVignetting" classname="com.burnin.scanner.analysis.PipelineTest" time="0.003"/>
+  <testcase name="iterativeRefinementConverges" classname="com.burnin.scanner.analysis.PipelineTest" time="0.062"/>
+  <testcase name="adaptiveSmoothRadiusKeepsWideBurnInCorrection" classname="com.burnin.scanner.analysis.PipelineTest" time="0.002"/>
   <testcase name="confidenceWeightedGainSuppressesLowTrustCells" classname="com.burnin.scanner.analysis.PipelineTest" time="0.001"/>
   <testcase name="correctionPngUsesSameScreenMarginAsMeasurementGrid" classname="com.burnin.scanner.analysis.PipelineTest" time="0.002"/>
-  <testcase name="rgbChannelGridExtractsSelectedLowLightChannel" classname="com.burnin.scanner.analysis.PipelineTest" time="0.021"/>
+  <testcase name="adaptiveSmoothRadiusSuppresssSubCameraPixelNoise" classname="com.burnin.scanner.analysis.PipelineTest" time="0.005"/>
+  <testcase name="rgbChannelGridExtractsSelectedLowLightChannel" classname="com.burnin.scanner.analysis.PipelineTest" time="0.013"/>
   <system-out><![CDATA[]]></system-out>
   <system-err><![CDATA[]]></system-err>
 </testsuite>

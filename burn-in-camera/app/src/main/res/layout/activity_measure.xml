@@ -19,6 +19,38 @@
         android:textStyle="bold"
         android:text="준비" />
 
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="10dp"
+        android:paddingEnd="10dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textSize="13sp"
+            android:text="주사율(Hz)" />
+
+        <EditText
+            android:id="@+id/editRefresh"
+            android:layout_width="76dp"
+            android:layout_height="wrap_content"
+            android:inputType="numberDecimal"
+            android:maxLines="1"
+            android:text="60" />
+
+        <CheckBox
+            android:id="@+id/chkTri"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:enabled="false"
+            android:textSize="13sp"
+            android:text="3각 동시 교차(초광각/표준/망원)" />
+    </LinearLayout>
+
     <ScrollView
         android:layout_width="match_parent"
         android:layout_height="0dp"

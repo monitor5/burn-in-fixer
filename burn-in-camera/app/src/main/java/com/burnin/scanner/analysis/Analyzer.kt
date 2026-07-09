@@ -410,6 +410,70 @@ object Analyzer {
         }
     }
 
+    /** 그리드를 자체 중앙값으로 정규화 (카메라 간 노출·감도 차이 제거) */
+    fun normalizeByMedian(grid: FloatArray): FloatArray {
+        val med = stats(grid).median.coerceAtLeast(1e-6f)
+        return FloatArray(grid.size) { grid[it] / med }
+    }
+
+    /**
+     * 동시 촬영한 서로 다른 화각(초광각/표준/망원)의 정규화 휘도 그리드를 비교해
+     * 카메라 간 "일치도" confidence를 만든다. 같은 순간의 같은 화면이므로
+     * 카메라끼리 서로 다르게 잰 구간은 화면(번인)이 아니라 카메라 기인
+     * 성분(무아레·왜곡 잔차·플리커 위상)이다 → 해당 구간은 보정에서 무시한다.
+     */
+    fun crossAgreementConfidence(
+        normalizedGrids: List<FloatArray>,
+        gw: Int,
+        gh: Int,
+        okRelativeRange: Float = 0.02f,
+        zeroRelativeRange: Float = 0.06f,
+    ): FloatArray {
+        if (normalizedGrids.size < 2) return FloatArray(gw * gh) { 1f }
+        val size = gw * gh
+        for (grid in normalizedGrids) require(grid.size == size) { "cross grid size mismatch" }
+        val out = FloatArray(size)
+        for (i in 0 until size) {
+            var min = Float.MAX_VALUE
+            var max = -Float.MAX_VALUE
+            var sum = 0.0
+            for (grid in normalizedGrids) {
+                val v = grid[i]
+                min = minOf(min, v)
+                max = maxOf(max, v)
+                sum += v.toDouble()
+            }
+            val mean = (sum / normalizedGrids.size).toFloat().coerceAtLeast(1e-5f)
+            out[i] = confidenceRamp((max - min) / mean, okRelativeRange, zeroRelativeRange)
+        }
+        return boxBlur(boxBlur(out, gw, gh), gw, gh)
+    }
+
+    /** 역해석용 8-bit 그레이 PNG (다운스케일). 카메라별 평균 프레임 저장에 사용. */
+    fun grayImagePng(img: GrayImage, maxLongEdge: Int = 1600): ByteArray {
+        val stride = Math.max(1, Math.ceil(maxOf(img.w, img.h) / maxLongEdge.toDouble()).toInt())
+        val outW = Math.max(1, img.w / stride)
+        val outH = Math.max(1, img.h / stride)
+        var peak = 1e-6f
+        for (v in img.data) if (v > peak) peak = v
+        val pixels = IntArray(outW * outH)
+        var i = 0
+        for (y in 0 until outH) {
+            val sy = y * stride
+            for (x in 0 until outW) {
+                // 감마 재적용(1/2.2)해 사람이 보기 좋은 밝기로 저장
+                val lin = (img[x * stride, sy] / peak).coerceIn(0f, 1f)
+                val v = Math.round(Math.pow(lin.toDouble(), 1.0 / 2.2) * 255).toInt().coerceIn(0, 255)
+                pixels[i++] = (0xFF shl 24) or (v shl 16) or (v shl 8) or v
+            }
+        }
+        val bmp = Bitmap.createBitmap(pixels, outW, outH, Bitmap.Config.ARGB_8888)
+        val bos = ByteArrayOutputStream()
+        bmp.compress(Bitmap.CompressFormat.PNG, 100, bos)
+        bmp.recycle()
+        return bos.toByteArray()
+    }
+
     /**
      * gain 맵 생성 (14.5/14.6):
      *  target = 하위 10퍼센타일, gain = clamp(target/측정값, 1-maxAtt, 1)

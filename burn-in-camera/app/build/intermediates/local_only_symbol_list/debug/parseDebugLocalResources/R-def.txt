@@ -6,8 +6,10 @@ id btnConnectReference
 id btnMeasure
 id btnStart
 id btnToggle
+id chkTri
 id editIp
 id editReferenceIp
+id editRefresh
 id preview
 id scrollLog
 id txtLog

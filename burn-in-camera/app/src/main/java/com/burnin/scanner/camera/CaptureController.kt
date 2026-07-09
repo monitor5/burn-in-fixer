@@ -12,15 +12,20 @@ import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
+import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.RggbChannelVector
+import android.hardware.camera2.params.SessionConfiguration
 import android.media.Image
 import android.media.ImageReader
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Range
 import android.util.Size
 import android.view.Surface
 import android.view.TextureView
+import java.util.concurrent.Executor
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeout
@@ -61,6 +66,27 @@ class CaptureController(context: Context, private val textureView: TextureView) 
     private var reader: ImageReader? = null
     private var previewSurface: Surface? = null
     private lateinit var previewBuilder: CaptureRequest.Builder
+
+    /** 동시 3각 촬영용 보조 화각 리더 (role → reader). 비어 있으면 메인 단독. */
+    private val extraReaders = LinkedHashMap<String, ImageReader>()
+    private var triSelection: CameraEnumerator.TriSelection? = null
+
+    /** 마지막 동시 촬영에서 물리 카메라별 실제 노출(ns). 플리커 싱크 검증용. */
+    private val lastPhysicalExposureNs = LinkedHashMap<String, Long>()
+
+    val isTriActive: Boolean get() = extraReaders.isNotEmpty()
+
+    val activeRoles: List<String>
+        get() = listOf(CameraEnumerator.ROLE_MAIN) + extraReaders.keys
+
+    fun triSummary(): String {
+        val tri = triSelection ?: return "메인 단독 [$cameraId]"
+        return tri.roles()
+            .filter { (role, _) ->
+                role == CameraEnumerator.ROLE_MAIN || extraReaders.containsKey(role)
+            }
+            .joinToString(" + ") { (role, c) -> "$role[${c.key}] FOV ${c.fovDeg.toInt()}°" }
+    }
 
     lateinit var cameraId: String
         private set
@@ -112,15 +138,27 @@ class CaptureController(context: Context, private val textureView: TextureView) 
             "RAW ${if (raw) "가능" else "불가"}, AE잠금 ${if (aeLockAvailable) "가능" else "불가"}"
     }
 
+    /**
+     * 카메라 시작. selection이 주어지고 기기가 지원하면(API 28+, 논리 멀티카메라)
+     * 초광각/표준/망원 물리 스트림을 한 세션에 함께 구성해 동시 촬영을 준비한다.
+     * 동시 구성 실패 시 메인 단독으로 자동 폴백한다.
+     */
     @SuppressLint("MissingPermission")
-    suspend fun start() {
+    suspend fun start(selection: CameraEnumerator.TriSelection? = null) {
         val texture = awaitSurfaceTexture()
 
-        cameraId = manager.cameraIdList.firstOrNull { id ->
-            manager.getCameraCharacteristics(id)
-                .get(CameraCharacteristics.LENS_FACING) == CameraMetadata.LENS_FACING_BACK
-        } ?: throw IllegalStateException("후면 카메라 없음")
-        characteristics = manager.getCameraCharacteristics(cameraId)
+        val tri = if (selection != null && Build.VERSION.SDK_INT >= 28) selection else null
+        triSelection = tri
+        if (tri == null) {
+            cameraId = manager.cameraIdList.firstOrNull { id ->
+                manager.getCameraCharacteristics(id)
+                    .get(CameraCharacteristics.LENS_FACING) == CameraMetadata.LENS_FACING_BACK
+            } ?: throw IllegalStateException("후면 카메라 없음")
+            characteristics = manager.getCameraCharacteristics(cameraId)
+        } else {
+            cameraId = tri.openId
+            characteristics = manager.getCameraCharacteristics(tri.main.physicalId ?: tri.openId)
+        }
 
         val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
             ?: throw IllegalStateException("스트림 설정 없음")
@@ -144,8 +182,40 @@ class CaptureController(context: Context, private val textureView: TextureView) 
 
         reader = ImageReader.newInstance(captureSize.width, captureSize.height, captureFormat, 3)
 
+        extraReaders.clear()
+        if (tri != null) {
+            for ((role, choice) in tri.roles()) {
+                if (role == CameraEnumerator.ROLE_MAIN) continue
+                val rc = runCatching {
+                    manager.getCameraCharacteristics(choice.physicalId ?: choice.openId)
+                }.getOrNull() ?: continue
+                val rMap = rc.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: continue
+                val rSizes = rMap.getOutputSizes(ImageFormat.YUV_420_888)?.toList().orEmpty()
+                // 보조 화각은 4096px 이하로 캡: 3스트림 동시 대역폭·메모리 한도 보호
+                val rSize = rSizes.filter { maxOf(it.width, it.height) <= 4096 }
+                    .maxByOrNull { it.width.toLong() * it.height }
+                    ?: rSizes.minByOrNull { it.width.toLong() * it.height }
+                    ?: continue
+                extraReaders[role] =
+                    ImageReader.newInstance(rSize.width, rSize.height, ImageFormat.YUV_420_888, 2)
+            }
+        }
+
         device = openCamera()
-        session = createSession(listOf(pSurface, reader!!.surface))
+        session = if (tri != null && extraReaders.isNotEmpty() && Build.VERSION.SDK_INT >= 28) {
+            try {
+                createTriSession(tri, pSurface)
+            } catch (e: Exception) {
+                // 동시 3각 구성 실패 → 보조 리더 정리 후 메인 단독 폴백
+                extraReaders.values.forEach { runCatching { it.close() } }
+                extraReaders.clear()
+                createSession(listOf(pSurface, reader!!.surface))
+            }
+        } else {
+            extraReaders.values.forEach { runCatching { it.close() } }
+            extraReaders.clear()
+            createSession(listOf(pSurface, reader!!.surface))
+        }
 
         previewBuilder = device!!.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
             addTarget(pSurface)
@@ -314,6 +384,77 @@ class CaptureController(context: Context, private val textureView: TextureView) 
         }
     }
 
+    /**
+     * 활성 화각 전체(메인 + 보조)를 "한 번의 캡처 요청"으로 동시 촬영한다.
+     * 같은 순간·같은 화면 상태를 서로 다른 광학 경로로 기록하므로,
+     * 결과 간 불일치는 화면이 아니라 카메라 기인 성분(무아레·왜곡·플리커 위상)이다.
+     * 메인 단독 세션에서는 main 한 장만 담긴 맵을 반환한다 (호출부 코드 경로 동일).
+     */
+    suspend fun captureTriFrames(): Map<String, CaptureFrame> = withTimeout(15_000) {
+        val mainReader = reader ?: throw IllegalStateException("카메라 미시작")
+        val readers = LinkedHashMap<String, ImageReader>()
+        readers[CameraEnumerator.ROLE_MAIN] = mainReader
+        readers.putAll(extraReaders)
+
+        val waits = readers.mapValues { CompletableDeferred<CaptureFrame>() }
+        try {
+            for ((role, r) in readers) {
+                r.setOnImageAvailableListener({ rd ->
+                    val image = rd.acquireLatestImage() ?: return@setOnImageAvailableListener
+                    val frame = try {
+                        image.toCaptureFrame()
+                    } finally {
+                        image.close()
+                    }
+                    rd.setOnImageAvailableListener(null, null)
+                    waits.getValue(role).complete(frame)
+                }, handler)
+            }
+            val req = device!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                readers.values.forEach { addTarget(it.surface) }
+                applyMeasurementControls(this)
+                if (captureFormat == ImageFormat.JPEG) set(CaptureRequest.JPEG_QUALITY, 98.toByte())
+            }
+            session!!.capture(req.build(), triCallback, handler)
+            waits.mapValues { it.value.await() }
+        } finally {
+            readers.values.forEach { it.setOnImageAvailableListener(null, null) }
+        }
+    }
+
+    /**
+     * 물리 카메라별 실제 노출이 화면 주사 주기의 정수배(플리커 싱크)인지 요약.
+     * 보조 화각이 싱크에서 벗어나면 해당 카메라 프레임은 밴딩이 남을 수 있으므로
+     * 교차 일치도 마스킹의 근거 로그로 남긴다.
+     */
+    fun physicalExposureSummary(refreshHz: Float): String? {
+        if (lastPhysicalExposureNs.isEmpty() || refreshHz < 1f) return null
+        val periodNs = 1e9 / refreshHz
+        return lastPhysicalExposureNs.entries.joinToString(", ") { (pid, ns) ->
+            val cycles = ns / periodNs
+            val synced = Math.abs(cycles - Math.round(cycles)) < 0.05
+            "[$pid] ${ns}ns ${if (synced) "sync✓" else "sync✗"}"
+        }
+    }
+
+    private val triCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            result: TotalCaptureResult,
+        ) {
+            previewCallback.onCaptureCompleted(session, request, result)
+            if (Build.VERSION.SDK_INT >= 28) {
+                @Suppress("DEPRECATION")
+                val physical = runCatching { result.physicalCameraResults }.getOrNull() ?: return
+                for ((pid, r) in physical) {
+                    r.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+                        ?.let { lastPhysicalExposureNs[pid] = it }
+                }
+            }
+        }
+    }
+
     private val previewCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(
             session: CameraCaptureSession,
@@ -393,10 +534,58 @@ class CaptureController(context: Context, private val textureView: TextureView) 
             }, handler)
         }
 
+    /**
+     * 논리 멀티카메라 동시 세션: 각 출력 스트림을 setPhysicalCameraId로
+     * 초광각/표준/망원 물리 카메라에 라우팅한다 (API 28+).
+     */
+    private suspend fun createTriSession(
+        tri: CameraEnumerator.TriSelection,
+        previewSurface: Surface,
+    ): CameraCaptureSession = suspendCancellableCoroutine { cont ->
+        require(Build.VERSION.SDK_INT >= 28)
+        val mainPid = tri.main.physicalId
+        val outputs = ArrayList<OutputConfiguration>()
+        outputs += OutputConfiguration(previewSurface).also {
+            if (mainPid != null) it.setPhysicalCameraId(mainPid)
+        }
+        outputs += OutputConfiguration(reader!!.surface).also {
+            if (mainPid != null) it.setPhysicalCameraId(mainPid)
+        }
+        for ((role, choice) in tri.roles()) {
+            if (role == CameraEnumerator.ROLE_MAIN) continue
+            val r = extraReaders[role] ?: continue
+            outputs += OutputConfiguration(r.surface).also { out ->
+                choice.physicalId?.let { out.setPhysicalCameraId(it) }
+            }
+        }
+        val config = SessionConfiguration(
+            SessionConfiguration.SESSION_REGULAR,
+            outputs,
+            Executor { handler.post(it) },
+            object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(s: CameraCaptureSession) {
+                    if (cont.isActive) cont.resume(s)
+                }
+                override fun onConfigureFailed(s: CameraCaptureSession) {
+                    if (cont.isActive) {
+                        cont.resumeWithException(IllegalStateException("동시 3각 세션 구성 실패"))
+                    }
+                }
+            },
+        )
+        try {
+            device!!.createCaptureSession(config)
+        } catch (e: Exception) {
+            if (cont.isActive) cont.resumeWithException(e)
+        }
+    }
+
     fun close() {
         runCatching { session?.close() }
         runCatching { device?.close() }
         runCatching { reader?.close() }
+        extraReaders.values.forEach { runCatching { it.close() } }
+        extraReaders.clear()
         runCatching { previewSurface?.release() }
         session = null
         device = null

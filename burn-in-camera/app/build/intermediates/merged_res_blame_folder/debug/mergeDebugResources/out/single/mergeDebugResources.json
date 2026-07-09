@@ -1,14 +1,10 @@
 [
     {
-        "merged": "/Users/gim-uhyeon/.gradle/daemon/8.9/com.burnin.scanner.app-debug-4:/layout_activity_measure.xml.flat",
-        "source": "/Users/gim-uhyeon/.gradle/daemon/8.9/com.burnin.scanner.app-main-6:/layout/activity_measure.xml"
+        "merged": "com.burnin.scanner.app-debug-4:/layout_activity_measure.xml.flat",
+        "source": "com.burnin.scanner.app-main-6:/layout/activity_measure.xml"
     },
     {
         "merged": "com.burnin.scanner.app-debug-4:/layout_activity_main.xml.flat",
         "source": "com.burnin.scanner.app-main-6:/layout/activity_main.xml"
-    },
-    {
-        "merged": "/Users/gim-uhyeon/.gradle/daemon/8.9/com.burnin.scanner.app-debug-4:/layout_activity_main.xml.flat",
-        "source": "/Users/gim-uhyeon/.gradle/daemon/8.9/com.burnin.scanner.app-main-6:/layout/activity_main.xml"
     }
 ]
