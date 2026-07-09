@@ -1,4 +1,4 @@
-#Wed Jul 08 03:58:47 KST 2026
+#Fri Jul 10 01:54:11 KST 2026
 base.0=/Users/gim-uhyeon/Documents/projectfolder/2025-2026/burn-in-fixer/burn-in-fixed/app/build/intermediates/dex/debug/mergeExtDexDebug/classes.dex
 base.1=/Users/gim-uhyeon/Documents/projectfolder/2025-2026/burn-in-fixer/burn-in-fixed/app/build/intermediates/dex/debug/mergeProjectDexDebug/0/classes.dex
 base.2=/Users/gim-uhyeon/Documents/projectfolder/2025-2026/burn-in-fixer/burn-in-fixed/app/build/intermediates/dex/debug/mergeProjectDexDebug/1/classes.dex
