@@ -59,8 +59,9 @@ class CrossAgreementTest {
         val a = FloatArray(gw * gh) { 1f }
         val b = FloatArray(gw * gh) { 1f }
         val c = FloatArray(gw * gh) { 1f }
-        c[10 * gw + 10] = 1.2f // 셋 중 하나만 튀어도 해당 셀은 불신
+        // 셋 중 하나만 튀어도 해당 블록은 불신 (블러 스무딩을 견디도록 3x3 블록)
+        for (y in 9..11) for (x in 9..11) c[y * gw + x] = 1.2f
         val conf = Analyzer.crossAgreementConfidence(listOf(a, b, c), gw, gh, 0.02f, 0.06f)
-        assertTrue(conf[10 * gw + 10] < 0.3f)
+        assertTrue("3자 불일치 마스킹 실패: ${conf[10 * gw + 10]}", conf[10 * gw + 10] < 0.3f)
     }
 }

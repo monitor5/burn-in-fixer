@@ -1,16 +1,15 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuite name="com.burnin.scanner.analysis.CrossAgreementTest" tests="5" skipped="0" failures="1" errors="0" timestamp="2026-07-09T16:53:07.395Z" hostname="MacBook-Pro-3.local" time="0.021">
+<testsuite name="com.burnin.scanner.analysis.CrossAgreementTest" tests="5" skipped="0" failures="1" errors="0" timestamp="2026-07-09T16:53:58.591Z" hostname="MacBook-Pro-3.local" time="0.022">
   <properties/>
-  <testcase name="identicalGridsGiveFullConfidence" classname="com.burnin.scanner.analysis.CrossAgreementTest" time="0.017"/>
+  <testcase name="identicalGridsGiveFullConfidence" classname="com.burnin.scanner.analysis.CrossAgreementTest" time="0.016"/>
   <testcase name="disagreementRegionIsMasked" classname="com.burnin.scanner.analysis.CrossAgreementTest" time="0.001"/>
   <testcase name="singleGridIsNeutral" classname="com.burnin.scanner.analysis.CrossAgreementTest" time="0.0"/>
   <testcase name="normalizeByMedianRemovesExposureScale" classname="com.burnin.scanner.analysis.CrossAgreementTest" time="0.001"/>
-  <testcase name="threeWayAgreementUsesWorstPair" classname="com.burnin.scanner.analysis.CrossAgreementTest" time="0.002">
-    <failure message="java.lang.AssertionError" type="java.lang.AssertionError">java.lang.AssertionError
-	at org.junit.Assert.fail(Assert.java:87)
+  <testcase name="threeWayAgreementUsesWorstPair" classname="com.burnin.scanner.analysis.CrossAgreementTest" time="0.003">
+    <failure message="java.lang.AssertionError: 3자 불일치 마스킹 실패: 0.39506176" type="java.lang.AssertionError">java.lang.AssertionError: 3자 불일치 마스킹 실패: 0.39506176
+	at org.junit.Assert.fail(Assert.java:89)
 	at org.junit.Assert.assertTrue(Assert.java:42)
-	at org.junit.Assert.assertTrue(Assert.java:53)
-	at com.burnin.scanner.analysis.CrossAgreementTest.threeWayAgreementUsesWorstPair(CrossAgreementTest.kt:64)
+	at com.burnin.scanner.analysis.CrossAgreementTest.threeWayAgreementUsesWorstPair(CrossAgreementTest.kt:65)
 	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(Unknown Source)
 	at java.base/java.lang.reflect.Method.invoke(Unknown Source)
 	at org.junit.runners.model.FrameworkMethod$1.runReflectiveCall(FrameworkMethod.java:59)

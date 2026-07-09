@@ -1,9 +1,5 @@
 [
     {
-        "merged": "/Users/gim-uhyeon/.gradle/daemon/8.9/com.burnin.target.app-debug-4:/layout_activity_main.xml.flat",
-        "source": "/Users/gim-uhyeon/.gradle/daemon/8.9/com.burnin.target.app-main-6:/layout/activity_main.xml"
-    },
-    {
         "merged": "com.burnin.target.app-debug-4:/layout_activity_main.xml.flat",
         "source": "com.burnin.target.app-main-6:/layout/activity_main.xml"
     }

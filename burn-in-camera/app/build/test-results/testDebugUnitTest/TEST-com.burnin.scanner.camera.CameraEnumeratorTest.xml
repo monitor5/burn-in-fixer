@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuite name="com.burnin.scanner.camera.CameraEnumeratorTest" tests="7" skipped="0" failures="0" errors="0" timestamp="2026-07-09T16:53:07.599Z" hostname="MacBook-Pro-3.local" time="0.004">
+<testsuite name="com.burnin.scanner.camera.CameraEnumeratorTest" tests="7" skipped="0" failures="0" errors="0" timestamp="2026-07-09T16:53:58.833Z" hostname="MacBook-Pro-3.local" time="0.004">
   <properties/>
-  <testcase name="classifiesRolesByFov" classname="com.burnin.scanner.camera.CameraEnumeratorTest" time="0.0"/>
+  <testcase name="classifiesRolesByFov" classname="com.burnin.scanner.camera.CameraEnumeratorTest" time="0.001"/>
   <testcase name="suitabilityNotesWarnTeleAndUltraWide" classname="com.burnin.scanner.camera.CameraEnumeratorTest" time="0.002"/>
   <testcase name="computesHorizontalFov" classname="com.burnin.scanner.camera.CameraEnumeratorTest" time="0.0"/>
   <testcase name="rejectsWhenNoPhysicalSubCameras" classname="com.burnin.scanner.camera.CameraEnumeratorTest" time="0.0"/>
