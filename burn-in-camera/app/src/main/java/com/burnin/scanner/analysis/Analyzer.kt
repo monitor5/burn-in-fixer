@@ -17,8 +17,11 @@ import java.io.ByteArrayOutputStream
  * SNR/미광/클리핑 confidence를 gain 계산에 곱해 과보정을 억제한다.
  */
 object Analyzer {
-    const val SCREEN_SAMPLE_MARGIN = 0.01f
-    const val EDGE_RAMP_FRACTION = SCREEN_SAMPLE_MARGIN
+    const val SCREEN_SAMPLE_MARGIN = 0f
+    const val EDGE_RAMP_FRACTION = 0f
+    private const val FLAT_FIELD_OUTLIER_OK = 0.04f
+    private const val FLAT_FIELD_OUTLIER_REJECT = 0.12f
+    private const val FLAT_FIELD_MAX_DEVIATION = 0.18f
 
 
     data class Stats(
@@ -168,7 +171,7 @@ object Analyzer {
     /**
      * 분석 그리드 휘도맵. 각 셀 중심 주변 3x3 지점을 호모그래피로 이미지에 투영해
      * 평균 샘플하고, black offset 맵(있으면)을 같은 위치에서 빼준다.
-     * 화면 가장자리 2% 는 베젤 blending 오차가 커서 제외(클램프)한다.
+     * 화면 전체를 마진 없이 샘플한다. 출력 보정맵도 같은 좌표계를 사용한다.
      */
     fun lumaGrid(
         gray: GrayImage,
@@ -271,24 +274,47 @@ object Analyzer {
 
     /**
      * 카메라 비네팅/플랫필드 근사. 별도 적분구/무한균일 광원이 없는 현장 측정이므로,
-     * gray 기준 프레임에서 반지름별 저주파 평균만 추정한다. 국소 번인 패턴은 radial bin에서
-     * 희석되고, 화면 자체의 고주파/국소 편차는 보정맵 계산에 남는다.
+     * gray 기준 프레임에서 반지름별 저주파 성분만 추정한다. 2-pass outlier 억제로
+     * 번인/얼룩이 렌즈 비네팅으로 흡수되는 것을 줄이고, 과한 현장 보정은 제한한다.
      */
     fun radialFlatField(luma: FloatArray, gw: Int, gh: Int, bins: Int = 64): FloatArray {
         require(luma.size == gw * gh) { "grid size mismatch" }
         val median = stats(luma).median.coerceAtLeast(1e-5f)
-        val sum = DoubleArray(bins)
-        val count = IntArray(bins)
         val cx = (gw - 1) * 0.5f
         val cy = (gh - 1) * 0.5f
         val maxR = Math.sqrt((cx * cx + cy * cy).toDouble()).coerceAtLeast(1e-5)
-        for (y in 0 until gh) {
+
+        fun radialBin(x: Int, y: Int): Int {
+            val dx = x - cx
             val dy = y - cy
+            return ((Math.sqrt((dx * dx + dy * dy).toDouble()) / maxR) * (bins - 1))
+                .toInt()
+                .coerceIn(0, bins - 1)
+        }
+
+        fun smoothProfile(profile: FloatArray, passes: Int = 3) {
+            repeat(passes) {
+                val copy = profile.clone()
+                for (i in profile.indices) {
+                    var acc = 0f
+                    var n = 0
+                    for (d in -2..2) {
+                        val j = i + d
+                        if (j in profile.indices) {
+                            acc += copy[j]
+                            n++
+                        }
+                    }
+                    profile[i] = acc / n
+                }
+            }
+        }
+
+        val sum = DoubleArray(bins)
+        val count = IntArray(bins)
+        for (y in 0 until gh) {
             for (x in 0 until gw) {
-                val dx = x - cx
-                val b = ((Math.sqrt((dx * dx + dy * dy).toDouble()) / maxR) * (bins - 1))
-                    .toInt()
-                    .coerceIn(0, bins - 1)
+                val b = radialBin(x, y)
                 sum[b] += (luma[y * gw + x] / median).toDouble()
                 count[b]++
             }
@@ -296,21 +322,35 @@ object Analyzer {
         val profile = FloatArray(bins) { i ->
             if (count[i] > 0) (sum[i] / count[i]).toFloat() else 1f
         }
-        repeat(3) {
-            val copy = profile.clone()
-            for (i in profile.indices) {
-                var acc = 0f
-                var n = 0
-                for (d in -2..2) {
-                    val j = i + d
-                    if (j in profile.indices) {
-                        acc += copy[j]
-                        n++
-                    }
+        smoothProfile(profile)
+
+        val robustSum = DoubleArray(bins)
+        val robustWeight = DoubleArray(bins)
+        for (y in 0 until gh) {
+            for (x in 0 until gw) {
+                val b = radialBin(x, y)
+                val normalized = luma[y * gw + x] / median
+                val expected = profile[b].coerceAtLeast(1e-5f)
+                val residual = normalized / expected - 1f
+                val absResidual = Math.abs(residual)
+                val weight = when {
+                    absResidual <= FLAT_FIELD_OUTLIER_OK -> 1.0
+                    absResidual >= FLAT_FIELD_OUTLIER_REJECT -> 0.0
+                    else -> 1.0 -
+                        (absResidual - FLAT_FIELD_OUTLIER_OK) /
+                        (FLAT_FIELD_OUTLIER_REJECT - FLAT_FIELD_OUTLIER_OK)
                 }
-                profile[i] = acc / n
+                if (weight > 0.0) {
+                    robustSum[b] += normalized.toDouble() * weight
+                    robustWeight[b] += weight
+                }
             }
         }
+        for (i in profile.indices) {
+            if (robustWeight[i] > 0.0) profile[i] = (robustSum[i] / robustWeight[i]).toFloat()
+        }
+        smoothProfile(profile, passes = 4)
+
         val out = FloatArray(luma.size)
         for (y in 0 until gh) {
             val dy = y - cy
@@ -323,10 +363,41 @@ object Analyzer {
                 val t = f - i0
                 val a = profile[i0]
                 val b = profile[(i0 + 1).coerceAtMost(bins - 1)]
-                out[y * gw + x] = (a * (1 - t) + b * t).coerceIn(0.70f, 1.30f)
+                out[y * gw + x] = (a * (1 - t) + b * t)
+                    .coerceIn(1f - FLAT_FIELD_MAX_DEVIATION, 1f + FLAT_FIELD_MAX_DEVIATION)
             }
         }
         return out
+    }
+
+    fun edgeFalloff(luma: FloatArray, gw: Int, gh: Int, bandFraction: Float = 0.06f): Float {
+        require(luma.size == gw * gh) { "grid size mismatch" }
+        val bx = (gw * bandFraction).toInt().coerceIn(1, (gw / 2).coerceAtLeast(1))
+        val by = (gh * bandFraction).toInt().coerceIn(1, (gh / 2).coerceAtLeast(1))
+        val centerX0 = gw / 4
+        val centerX1 = gw - centerX0
+        val centerY0 = gh / 4
+        val centerY1 = gh - centerY0
+        var edgeSum = 0.0
+        var edgeCount = 0
+        var centerSum = 0.0
+        var centerCount = 0
+        for (y in 0 until gh) {
+            for (x in 0 until gw) {
+                val v = luma[y * gw + x].toDouble()
+                if (x < bx || x >= gw - bx || y < by || y >= gh - by) {
+                    edgeSum += v
+                    edgeCount++
+                }
+                if (x in centerX0 until centerX1 && y in centerY0 until centerY1) {
+                    centerSum += v
+                    centerCount++
+                }
+            }
+        }
+        val edgeMean = edgeSum / edgeCount.coerceAtLeast(1)
+        val centerMean = centerSum / centerCount.coerceAtLeast(1)
+        return (1f - (edgeMean / centerMean.coerceAtLeast(1e-5)).toFloat()).coerceAtLeast(0f)
     }
 
     fun applyFlatField(grid: FloatArray, flatField: FloatArray?): FloatArray {
@@ -760,6 +831,7 @@ object Analyzer {
 
     /** 가장자리 confidence 감쇠: 렌즈 왜곡/비네팅 잔차가 큰 맨 바깥 영역만 보정 강도를 줄인다 */
     private fun applyEdgeRamp(g: FloatArray, gw: Int, gh: Int) {
+        if (EDGE_RAMP_FRACTION <= 0f) return
         val rampX = (gw * EDGE_RAMP_FRACTION).coerceAtLeast(1f)
         val rampY = (gh * EDGE_RAMP_FRACTION).coerceAtLeast(1f)
         for (y in 0 until gh) {

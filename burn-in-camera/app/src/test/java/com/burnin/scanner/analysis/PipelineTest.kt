@@ -64,7 +64,7 @@ class PipelineTest {
         return RgbImage(camW, camH, r, g, b)
     }
 
-    /** 가장자리 confidence ramp 바깥(내부 80%)만 잘라낸 그리드 */
+    /** 안정적인 비교를 위해 내부 80%만 잘라낸 그리드 */
     private fun interior(grid: FloatArray, gw: Int, gh: Int): FloatArray {
         val x0 = (gw * 0.10f).toInt()
         val x1 = (gw * 0.90f).toInt()
@@ -102,7 +102,7 @@ class PipelineTest {
 
         // 3. 보정 적용 시뮬레이션: 분석 그리드 좌표계의 역사상으로 화면에 gain 적용
         val gridImg = GrayImage(gw, gh, gain)
-        val margin = 0.02f
+        val margin = Analyzer.SCREEN_SAMPLE_MARGIN
         val gainAt = { u: Float, v: Float ->
             val gx = ((u / screenW - margin) / (1 - 2 * margin)) * gw - 0.5f
             val gy = ((v / screenH - margin) / (1 - 2 * margin)) * gh - 0.5f
@@ -138,7 +138,7 @@ class PipelineTest {
         val gw = 96
         val gh = 60
         val maxAtt = 0.05f
-        val margin = 0.02f
+        val margin = Analyzer.SCREEN_SAMPLE_MARGIN
 
         val before = renderCamera()
         val det = ScreenDetector.detect(before)!!
@@ -325,7 +325,7 @@ class PipelineTest {
     }
 
     @Test
-    fun edgeRampDoesNotSuppressStatusBarRegion() {
+    fun gainGridKeepsEdgeCellsActive() {
         val gw = 200
         val gh = 200
         val luma = FloatArray(gw * gh) { 1f }
@@ -340,9 +340,9 @@ class PipelineTest {
         val topEdge = gain[0 * gw + centerX]
         val statusBarRegion = gain[4 * gw + centerX] // 2% from top
 
-        assertTrue("맨 가장자리는 여전히 완충되어야 함: $topEdge", topEdge > 0.98f)
+        assertTrue("맨 가장자리도 보정돼야 함: $topEdge", topEdge < 0.93f)
         assertTrue(
-            "상단바 영역 보정이 edge ramp에 과하게 눌림: $statusBarRegion",
+            "상단바 영역 보정이 유지돼야 함: $statusBarRegion",
             statusBarRegion < 0.93f,
         )
     }
@@ -370,6 +370,24 @@ class PipelineTest {
         val after = Analyzer.stats(corrected).rmsDev
 
         assertTrue("flat-field 보정 후 RMS가 줄어야 함: before=$before after=$after", after < before * 0.35f)
+    }
+
+    @Test
+    fun edgeFalloffReportsDarkEdges() {
+        val gw = 100
+        val gh = 80
+        val luma = FloatArray(gw * gh) { 1f }
+        for (y in 0 until gh) {
+            for (x in 0 until gw) {
+                if (x < 6 || x >= gw - 6 || y < 5 || y >= gh - 5) {
+                    luma[y * gw + x] = 0.85f
+                }
+            }
+        }
+
+        val falloff = Analyzer.edgeFalloff(luma, gw, gh)
+
+        assertTrue("가장자리 감광률이 감지돼야 함: $falloff", falloff in 0.10f..0.20f)
     }
 
     @Test

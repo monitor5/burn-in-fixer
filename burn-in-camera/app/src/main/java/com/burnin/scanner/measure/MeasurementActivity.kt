@@ -412,6 +412,9 @@ class MeasurementActivity : Activity() {
         val flatField = withContext(Dispatchers.Default) {
             Analyzer.radialFlatField(lumaBeforeRaw, gw, gh)
         }
+        val edgeFalloff = withContext(Dispatchers.Default) {
+            Analyzer.edgeFalloff(lumaBeforeRaw, gw, gh)
+        }
         val lumaBefore = withContext(Dispatchers.Default) {
             Analyzer.applyFlatField(lumaBeforeRaw, flatField)
         }
@@ -462,10 +465,17 @@ class MeasurementActivity : Activity() {
         val strayRatio = blackStats.median / statsBefore.median
         log(
             "카메라 flat-field 보정: radial max ${pct(Analyzer.flatFieldStrength(flatField))}, " +
+                "raw edge falloff ${pct(edgeFalloff)}, " +
                 "gray70 confidence 평균 ${pct(Analyzer.meanConfidence(confidence70))}, " +
                 "프레임 안정도 ${pct(Analyzer.meanConfidence(flickerConfidence70))}, " +
                 "flicker span ${fmtSeconds(grayCapture.frameStore.spanMs)}"
         )
+        if (edgeFalloff > 0.08f) {
+            log(
+                "경고: 화면 가장자리가 중앙보다 ${pct(edgeFalloff)} 어둡게 촬영됨 — " +
+                    "카메라를 화면과 평행하게 두고 조금 더 멀리서 1.5~2x 망원/기본 렌즈로 재측정 권장"
+            )
+        }
         if (strayRatio > 0.05f) {
             log("경고: 잔여 미광 ${(strayRatio * 100).toInt()}% — 박스 차광을 보완하세요")
         }
@@ -684,6 +694,7 @@ class MeasurementActivity : Activity() {
             markerOrientation = markerOrientation,
             dotGrid = dotGrid,
             flatField = flatField,
+            edgeFalloff = edgeFalloff,
             confidence70 = confidence70,
             flickerConfidence70 = flickerConfidence70,
             grayCapture = grayCapture,
@@ -1044,6 +1055,7 @@ class MeasurementActivity : Activity() {
         markerOrientation: Analyzer.OrientedHomography?,
         dotGrid: DotGridDetector.Result?,
         flatField: FloatArray,
+        edgeFalloff: Float,
         confidence70: FloatArray,
         flickerConfidence70: FloatArray,
         grayCapture: GrayCapture,
@@ -1119,6 +1131,7 @@ class MeasurementActivity : Activity() {
             .put("dotGridRmsResidualPx", (dotGrid?.rmsResidualPx ?: 0f).toDouble())
             .put("dotGridMaxResidualPx", (dotGrid?.maxResidualPx ?: 0f).toDouble())
             .put("flatFieldRadialMaxDeviation", Analyzer.flatFieldStrength(flatField).toDouble())
+            .put("rawEdgeFalloff", edgeFalloff.toDouble())
             .put("gray70ConfidenceMean", Analyzer.meanConfidence(confidence70).toDouble())
             .put("gray70FrameStabilityMean", Analyzer.meanConfidence(flickerConfidence70).toDouble())
             .put("gray70FlickerFrameSpanSeconds", grayCapture.frameStore.spanMs / 1000.0)
