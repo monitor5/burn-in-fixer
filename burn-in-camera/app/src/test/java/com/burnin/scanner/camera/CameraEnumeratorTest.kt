@@ -71,6 +71,37 @@ class CameraEnumeratorTest {
     }
 
     @Test
+    fun listedUltraWideRequiresConcurrentSetWhenOsReportsSets() {
+        val listedUltra = choice(
+            "2",
+            fov = 103f,
+            w = 4000,
+            h = 3000,
+            openId = "2",
+            source = CameraEnumerator.Source.LISTED,
+            minFocusCm = null,
+        )
+        val main = choice("5", fov = 74f, w = 4080, h = 3060)
+        val tele = choice("6", fov = 29f, w = 3648, h = 2736)
+
+        val unsupported = CameraEnumerator.selectTriSet(
+            listOf(listedUltra, main, tele),
+            concurrentSets = listOf(setOf("0", "1"), setOf("0", "3")),
+        )
+        assertNotNull(unsupported)
+        assertNull(unsupported!!.ultraWide)
+        assertEquals("6", unsupported.tele?.physicalId)
+
+        val supported = CameraEnumerator.selectTriSet(
+            listOf(listedUltra, main, tele),
+            concurrentSets = listOf(setOf("0", "2")),
+        )
+        assertNotNull(supported)
+        assertEquals("2", supported!!.ultraWide?.openId)
+        assertTrue(supported.isStandalone(CameraEnumerator.ROLE_ULTRA_WIDE))
+    }
+
+    @Test
     fun rejectsWhenNoPhysicalSubCameras() {
         // LISTED 단독(물리 미노출 기기) → 동시 3각 불가
         val only = choice("0", fov = 80f, w = 8000, h = 6000, source = CameraEnumerator.Source.LISTED)

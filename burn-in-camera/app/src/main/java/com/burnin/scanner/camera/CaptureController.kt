@@ -69,24 +69,41 @@ class CaptureController(context: Context, private val textureView: TextureView) 
 
     /** 동시 3각 촬영용 보조 화각 리더 (role → reader). 비어 있으면 메인 단독. */
     private val extraReaders = LinkedHashMap<String, ImageReader>()
+    private val standaloneCameras = LinkedHashMap<String, StandaloneCamera>()
     private var triSelection: CameraEnumerator.TriSelection? = null
+    private val setupNotes = ArrayList<String>()
 
     /** 마지막 동시 촬영에서 물리 카메라별 실제 노출(ns). 플리커 싱크 검증용. */
     private val lastPhysicalExposureNs = LinkedHashMap<String, Long>()
 
-    val isTriActive: Boolean get() = extraReaders.isNotEmpty()
+    val isTriActive: Boolean get() = extraReaders.isNotEmpty() || standaloneCameras.isNotEmpty()
 
     val activeRoles: List<String>
-        get() = listOf(CameraEnumerator.ROLE_MAIN) + extraReaders.keys
+        get() = listOf(CameraEnumerator.ROLE_MAIN) + extraReaders.keys + standaloneCameras.keys
 
     fun triSummary(): String {
         val tri = triSelection ?: return "메인 단독 [$cameraId]"
         return tri.roles()
             .filter { (role, _) ->
-                role == CameraEnumerator.ROLE_MAIN || extraReaders.containsKey(role)
+                role == CameraEnumerator.ROLE_MAIN ||
+                    extraReaders.containsKey(role) ||
+                    standaloneCameras.containsKey(role)
             }
-            .joinToString(" + ") { (role, c) -> "$role[${c.key}] FOV ${c.fovDeg.toInt()}°" }
+            .joinToString(" + ") { (role, c) ->
+                val mode = if (standaloneCameras.containsKey(role)) ", 독립동시오픈" else ""
+                "$role[${c.key}] FOV ${c.fovDeg.toInt()}°$mode"
+            }
     }
+
+    fun diagnosticNotes(): List<String> = setupNotes.toList()
+
+    private data class StandaloneCamera(
+        val role: String,
+        val choice: CameraEnumerator.CameraChoice,
+        val device: CameraDevice,
+        val session: CameraCaptureSession,
+        val reader: ImageReader,
+    )
 
     lateinit var cameraId: String
         private set
@@ -149,6 +166,7 @@ class CaptureController(context: Context, private val textureView: TextureView) 
 
         val tri = if (selection != null && Build.VERSION.SDK_INT >= 28) selection else null
         triSelection = tri
+        setupNotes.clear()
         if (tri == null) {
             cameraId = manager.cameraIdList.firstOrNull { id ->
                 manager.getCameraCharacteristics(id)
@@ -183,9 +201,12 @@ class CaptureController(context: Context, private val textureView: TextureView) 
         reader = ImageReader.newInstance(captureSize.width, captureSize.height, captureFormat, 3)
 
         extraReaders.clear()
+        standaloneCameras.values.forEach { runCatching { it.close() } }
+        standaloneCameras.clear()
         if (tri != null) {
             for ((role, choice) in tri.roles()) {
                 if (role == CameraEnumerator.ROLE_MAIN) continue
+                if (tri.isStandalone(role)) continue
                 val rc = runCatching {
                     manager.getCameraCharacteristics(choice.physicalId ?: choice.openId)
                 }.getOrNull() ?: continue
@@ -207,6 +228,7 @@ class CaptureController(context: Context, private val textureView: TextureView) 
                 createTriSession(tri, pSurface)
             } catch (e: Exception) {
                 // 동시 3각 구성 실패 → 보조 리더 정리 후 메인 단독 폴백
+                setupNotes += "논리 멀티카메라 세션 실패: ${e.message}"
                 extraReaders.values.forEach { runCatching { it.close() } }
                 extraReaders.clear()
                 createSession(listOf(pSurface, reader!!.surface))
@@ -215,6 +237,19 @@ class CaptureController(context: Context, private val textureView: TextureView) 
             extraReaders.values.forEach { runCatching { it.close() } }
             extraReaders.clear()
             createSession(listOf(pSurface, reader!!.surface))
+        }
+
+        if (tri != null) {
+            for ((role, choice) in tri.roles()) {
+                if (!tri.isStandalone(role)) continue
+                val standalone = runCatching { openStandaloneCamera(role, choice) }
+                    .onFailure { setupNotes += "독립 $role[${choice.key}] 동시 오픈 실패: ${it.message}" }
+                    .getOrNull()
+                if (standalone != null) {
+                    standaloneCameras[role] = standalone
+                    setupNotes += "독립 $role[${choice.key}] 동시 오픈 활성"
+                }
+            }
         }
 
         previewBuilder = device!!.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
@@ -395,6 +430,7 @@ class CaptureController(context: Context, private val textureView: TextureView) 
         val readers = LinkedHashMap<String, ImageReader>()
         readers[CameraEnumerator.ROLE_MAIN] = mainReader
         readers.putAll(extraReaders)
+        standaloneCameras.forEach { (role, cam) -> readers[role] = cam.reader }
 
         val waits = readers.mapValues { CompletableDeferred<CaptureFrame>() }
         try {
@@ -411,11 +447,19 @@ class CaptureController(context: Context, private val textureView: TextureView) 
                 }, handler)
             }
             val req = device!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
-                readers.values.forEach { addTarget(it.surface) }
+                addTarget(mainReader.surface)
+                extraReaders.values.forEach { addTarget(it.surface) }
                 applyMeasurementControls(this)
                 if (captureFormat == ImageFormat.JPEG) set(CaptureRequest.JPEG_QUALITY, 98.toByte())
             }
             session!!.capture(req.build(), triCallback, handler)
+            standaloneCameras.values.forEach { cam ->
+                val sReq = cam.device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                    addTarget(cam.reader.surface)
+                    applyStandaloneMeasurementControls(this)
+                }
+                cam.session.capture(sReq.build(), standaloneCallback(cam.choice.key), handler)
+            }
             waits.mapValues { it.value.await() }
         } finally {
             readers.values.forEach { it.setOnImageAvailableListener(null, null) }
@@ -506,7 +550,15 @@ class CaptureController(context: Context, private val textureView: TextureView) 
 
     @SuppressLint("MissingPermission")
     private suspend fun openCamera(): CameraDevice = suspendCancellableCoroutine { cont ->
-        manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
+        openCameraById(cameraId, cont)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun openCameraById(
+        id: String,
+        cont: kotlinx.coroutines.CancellableContinuation<CameraDevice>,
+    ) {
+        manager.openCamera(id, object : CameraDevice.StateCallback() {
             override fun onOpened(camera: CameraDevice) {
                 if (cont.isActive) cont.resume(camera)
             }
@@ -521,10 +573,38 @@ class CaptureController(context: Context, private val textureView: TextureView) 
         }, handler)
     }
 
+    @SuppressLint("MissingPermission")
+    private suspend fun openStandaloneCamera(
+        role: String,
+        choice: CameraEnumerator.CameraChoice,
+    ): StandaloneCamera {
+        val rc = manager.getCameraCharacteristics(choice.openId)
+        val rMap = rc.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            ?: throw IllegalStateException("스트림 설정 없음")
+        val rSizes = rMap.getOutputSizes(ImageFormat.YUV_420_888)?.toList().orEmpty()
+        val rSize = rSizes.filter { maxOf(it.width, it.height) <= 4096 }
+            .maxByOrNull { it.width.toLong() * it.height }
+            ?: rSizes.minByOrNull { it.width.toLong() * it.height }
+            ?: throw IllegalStateException("YUV 출력 없음")
+        val sReader = ImageReader.newInstance(rSize.width, rSize.height, ImageFormat.YUV_420_888, 2)
+        val sDevice = suspendCancellableCoroutine<CameraDevice> { cont ->
+            openCameraById(choice.openId, cont)
+        }
+        val sSession = createSession(sDevice, listOf(sReader.surface))
+        return StandaloneCamera(role, choice, sDevice, sSession, sReader)
+    }
+
     @Suppress("DEPRECATION")
     private suspend fun createSession(surfaces: List<Surface>): CameraCaptureSession =
+        createSession(device!!, surfaces)
+
+    @Suppress("DEPRECATION")
+    private suspend fun createSession(
+        camera: CameraDevice,
+        surfaces: List<Surface>,
+    ): CameraCaptureSession =
         suspendCancellableCoroutine { cont ->
-            device!!.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
+            camera.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(s: CameraCaptureSession) {
                     if (cont.isActive) cont.resume(s)
                 }
@@ -533,6 +613,37 @@ class CaptureController(context: Context, private val textureView: TextureView) 
                 }
             }, handler)
         }
+
+    private fun applyStandaloneMeasurementControls(builder: CaptureRequest.Builder) {
+        builder.set(CaptureRequest.FLASH_MODE, CameraMetadata.FLASH_MODE_OFF)
+        if (manualLocked) {
+            builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+            builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
+            builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
+            builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
+            manualExposureTimeNs?.let { builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, it) }
+            manualSensitivityIso?.let { builder.set(CaptureRequest.SENSOR_SENSITIVITY, it) }
+            manualAwbGains?.let {
+                builder.set(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
+                builder.set(CaptureRequest.COLOR_CORRECTION_GAINS, it)
+            }
+        } else {
+            builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+            builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
+            builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+        }
+    }
+
+    private fun standaloneCallback(key: String) = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            result: TotalCaptureResult,
+        ) {
+            result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+                ?.let { lastPhysicalExposureNs[key] = it }
+        }
+    }
 
     /**
      * 논리 멀티카메라 동시 세션: 각 출력 스트림을 setPhysicalCameraId로
@@ -584,6 +695,8 @@ class CaptureController(context: Context, private val textureView: TextureView) 
         runCatching { session?.close() }
         runCatching { device?.close() }
         runCatching { reader?.close() }
+        standaloneCameras.values.forEach { runCatching { it.close() } }
+        standaloneCameras.clear()
         extraReaders.values.forEach { runCatching { it.close() } }
         extraReaders.clear()
         runCatching { previewSurface?.release() }
@@ -591,6 +704,12 @@ class CaptureController(context: Context, private val textureView: TextureView) 
         device = null
         reader = null
         thread.quitSafely()
+    }
+
+    private fun StandaloneCamera.close() {
+        runCatching { session.close() }
+        runCatching { device.close() }
+        runCatching { reader.close() }
     }
 
     private fun Long.coerceInRange(range: Range<Long>?): Long =

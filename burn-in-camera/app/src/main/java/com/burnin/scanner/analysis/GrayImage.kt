@@ -147,8 +147,8 @@ object ImageOps {
     private fun decodeYuvLinearGray(frame: CaptureFrame, maxLongEdge: Int): GrayImage {
         require(frame.planes.isNotEmpty()) { "YUV plane 없음" }
         val sample = yuvSample(frame.width, frame.height, maxLongEdge)
-        val outW = Math.max(1, frame.width / sample)
-        val outH = Math.max(1, frame.height / sample)
+        val outW = Math.max(1, (frame.width + sample - 1) / sample)
+        val outH = Math.max(1, (frame.height + sample - 1) / sample)
         val yPlane = frame.planes[0]
         val out = FloatArray(outW * outH)
         var i = 0
@@ -180,8 +180,8 @@ object ImageOps {
     private fun decodeYuvLinearRgb(frame: CaptureFrame, maxLongEdge: Int): RgbImage {
         require(frame.planes.size >= 3) { "YUV plane 부족" }
         val sample = yuvSample(frame.width, frame.height, maxLongEdge)
-        val outW = Math.max(1, frame.width / sample)
-        val outH = Math.max(1, frame.height / sample)
+        val outW = Math.max(1, (frame.width + sample - 1) / sample)
+        val outH = Math.max(1, (frame.height + sample - 1) / sample)
         val yPlane = frame.planes[0]
         val uPlane = frame.planes[1]
         val vPlane = frame.planes[2]

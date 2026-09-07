@@ -1,6 +1,9 @@
 package com.burnin.scanner.analysis
 
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
 import java.io.ByteArrayOutputStream
 
 /**
@@ -46,6 +49,16 @@ object Analyzer {
         val mapping: CornerMapping,
         val markerScore: Float,
         val confidence: Float,
+    )
+
+    data class GridRegion(
+        val minX: Int,
+        val minY: Int,
+        val maxX: Int,
+        val maxY: Int,
+        val area: Int,
+        val minConfidence: Float,
+        val meanConfidence: Float,
     )
 
     /** 화면 4모서리(스크린 좌표)와 검출 사각형(이미지 좌표)로 호모그래피 생성.
@@ -418,9 +431,9 @@ object Analyzer {
 
     /**
      * 동시 촬영한 서로 다른 화각(초광각/표준/망원)의 정규화 휘도 그리드를 비교해
-     * 카메라 간 "일치도" confidence를 만든다. 같은 순간의 같은 화면이므로
-     * 카메라끼리 서로 다르게 잰 구간은 화면(번인)이 아니라 카메라 기인
-     * 성분(무아레·왜곡 잔차·플리커 위상)이다 → 해당 구간은 보정에서 무시한다.
+     * 카메라 간 screen-space 재현성 confidence를 만든다. 같은 순간의 같은 화면을
+     * 여러 광학 경로로 봤을 때 재현되지 않는 구간은 촬영계 잔차일 가능성이 높으므로
+     * 보정 반영을 낮춘다. 실제 화면 결함 여부는 이 값만으로 의미론적 판정하지 않는다.
      */
     fun crossAgreementConfidence(
         normalizedGrids: List<FloatArray>,
@@ -449,6 +462,95 @@ object Analyzer {
         return boxBlur(boxBlur(out, gw, gh), gw, gh)
     }
 
+    fun lowConfidenceRegions(
+        confidence: FloatArray,
+        gw: Int,
+        gh: Int,
+        threshold: Float = 0.55f,
+        minArea: Int = 48,
+        maxRegions: Int = 4,
+    ): List<GridRegion> {
+        require(confidence.size == gw * gh) { "confidence grid size mismatch" }
+        val seen = BooleanArray(confidence.size)
+        val regions = ArrayList<GridRegion>()
+        val qx = IntArray(confidence.size)
+        val qy = IntArray(confidence.size)
+        for (sy in 0 until gh) {
+            for (sx in 0 until gw) {
+                val start = sy * gw + sx
+                if (seen[start] || confidence[start] >= threshold) continue
+                var head = 0
+                var tail = 0
+                qx[tail] = sx
+                qy[tail] = sy
+                tail++
+                seen[start] = true
+                var minX = sx
+                var minY = sy
+                var maxX = sx
+                var maxY = sy
+                var area = 0
+                var sum = 0.0
+                var minConf = Float.MAX_VALUE
+                while (head < tail) {
+                    val x = qx[head]
+                    val y = qy[head]
+                    head++
+                    val idx = y * gw + x
+                    val c = confidence[idx]
+                    area++
+                    sum += c.toDouble()
+                    if (c < minConf) minConf = c
+                    if (x < minX) minX = x
+                    if (y < minY) minY = y
+                    if (x > maxX) maxX = x
+                    if (y > maxY) maxY = y
+
+                    fun add(nx: Int, ny: Int) {
+                        if (nx !in 0 until gw || ny !in 0 until gh) return
+                        val ni = ny * gw + nx
+                        if (!seen[ni] && confidence[ni] < threshold) {
+                            seen[ni] = true
+                            qx[tail] = nx
+                            qy[tail] = ny
+                            tail++
+                        }
+                    }
+
+                    add(x - 1, y)
+                    add(x + 1, y)
+                    add(x, y - 1)
+                    add(x, y + 1)
+                }
+                if (area >= minArea) {
+                    regions += GridRegion(minX, minY, maxX, maxY, area, minConf, (sum / area).toFloat())
+                }
+            }
+        }
+        return regions
+            .sortedWith(compareBy<GridRegion> { it.meanConfidence }.thenByDescending { it.area })
+            .take(maxRegions)
+    }
+
+    fun raiseConfidenceFloor(
+        confidence: FloatArray,
+        gw: Int,
+        gh: Int,
+        region: GridRegion,
+        floor: Float,
+    ): FloatArray {
+        require(confidence.size == gw * gh) { "confidence grid size mismatch" }
+        val out = confidence.copyOf()
+        val f = floor.coerceIn(0f, 1f)
+        for (y in region.minY..region.maxY) {
+            for (x in region.minX..region.maxX) {
+                val i = y * gw + x
+                out[i] = maxOf(out[i], f)
+            }
+        }
+        return out
+    }
+
     /** 역해석용 8-bit 그레이 PNG (다운스케일). 카메라별 평균 프레임 저장에 사용. */
     fun grayImagePng(img: GrayImage, maxLongEdge: Int = 1600): ByteArray {
         val stride = Math.max(1, Math.ceil(maxOf(img.w, img.h) / maxLongEdge.toDouble()).toInt())
@@ -471,6 +573,90 @@ object Analyzer {
         val bos = ByteArrayOutputStream()
         bmp.compress(Bitmap.CompressFormat.PNG, 100, bos)
         bmp.recycle()
+        return bos.toByteArray()
+    }
+
+    fun screenCropBitmap(
+        img: GrayImage,
+        h: Homography,
+        screenW: Int,
+        screenH: Int,
+        gw: Int,
+        gh: Int,
+        region: GridRegion,
+        maxLongEdge: Int = 640,
+    ): Bitmap {
+        val minScreenSide = minOf(screenW, screenH).coerceAtLeast(1)
+        val rawX0 = region.minX.toFloat() / gw * screenW
+        val rawY0 = region.minY.toFloat() / gh * screenH
+        val rawX1 = (region.maxX + 1).toFloat() / gw * screenW
+        val rawY1 = (region.maxY + 1).toFloat() / gh * screenH
+        val minSpan = minScreenSide * 0.14f
+        val spanX = maxOf(rawX1 - rawX0, minSpan)
+        val spanY = maxOf(rawY1 - rawY0, minSpan)
+        val cx = (rawX0 + rawX1) * 0.5f
+        val cy = (rawY0 + rawY1) * 0.5f
+        val padX = spanX * 0.30f
+        val padY = spanY * 0.30f
+        val x0 = (cx - spanX * 0.5f - padX).coerceIn(0f, screenW.toFloat())
+        val y0 = (cy - spanY * 0.5f - padY).coerceIn(0f, screenH.toFloat())
+        val x1 = (cx + spanX * 0.5f + padX).coerceIn(0f, screenW.toFloat())
+        val y1 = (cy + spanY * 0.5f + padY).coerceIn(0f, screenH.toFloat())
+        val cropW = maxOf(1f, x1 - x0)
+        val cropH = maxOf(1f, y1 - y0)
+        val scale = minOf(maxLongEdge / cropW, maxLongEdge / cropH, 1f)
+        val outW = maxOf(16, Math.round(cropW * scale))
+        val outH = maxOf(16, Math.round(cropH * scale))
+        val values = FloatArray(outW * outH)
+        val mapped = DoubleArray(2)
+        var i = 0
+        for (y in 0 until outH) {
+            val sv = y0 + (y + 0.5f) / outH * cropH
+            for (x in 0 until outW) {
+                val su = x0 + (x + 0.5f) / outW * cropW
+                h.map(su.toDouble(), sv.toDouble(), mapped)
+                values[i++] = img.bilinear(mapped[0].toFloat(), mapped[1].toFloat())
+            }
+        }
+        val sorted = values.copyOf()
+        sorted.sort()
+        val p1 = sorted[(sorted.size * 0.01f).toInt().coerceIn(0, sorted.lastIndex)]
+        val p99 = sorted[(sorted.size * 0.99f).toInt().coerceIn(0, sorted.lastIndex)]
+        val span = (p99 - p1).coerceAtLeast(1e-5f)
+        val pixels = IntArray(outW * outH)
+        for (idx in values.indices) {
+            val lin = ((values[idx] - p1) / span).coerceIn(0f, 1f)
+            val s = Math.round(Math.pow(lin.toDouble(), 1.0 / 2.2) * 255).toInt().coerceIn(0, 255)
+            pixels[idx] = Color.rgb(s, s, s)
+        }
+        return Bitmap.createBitmap(pixels, outW, outH, Bitmap.Config.ARGB_8888)
+    }
+
+    fun contactSheetBitmap(items: List<Pair<String, Bitmap>>): Bitmap {
+        require(items.isNotEmpty()) { "contact sheet requires at least one bitmap" }
+        val labelH = 30
+        val cellW = items.maxOf { it.second.width }
+        val cellH = items.maxOf { it.second.height } + labelH
+        val out = Bitmap.createBitmap(cellW * items.size, cellH, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(out)
+        canvas.drawColor(Color.BLACK)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            textSize = 20f
+        }
+        val linePaint = Paint().apply { color = Color.rgb(80, 80, 80) }
+        for ((idx, item) in items.withIndex()) {
+            val x = idx * cellW
+            canvas.drawText(item.first, x + 8f, 22f, paint)
+            canvas.drawBitmap(item.second, x.toFloat(), labelH.toFloat(), null)
+            if (idx > 0) canvas.drawLine(x.toFloat(), 0f, x.toFloat(), cellH.toFloat(), linePaint)
+        }
+        return out
+    }
+
+    fun bitmapPng(bitmap: Bitmap): ByteArray {
+        val bos = ByteArrayOutputStream()
+        bitmap.compress(Bitmap.CompressFormat.PNG, 100, bos)
         return bos.toByteArray()
     }
 

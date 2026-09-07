@@ -57,6 +57,7 @@ object CameraEnumerator {
         val main: CameraChoice,
         val ultraWide: CameraChoice?,
         val tele: CameraChoice?,
+        val standaloneRoles: Set<String> = emptySet(),
     ) {
         /** role → choice, main 우선 순서 고정 */
         fun roles(): List<Pair<String, CameraChoice>> = buildList {
@@ -66,6 +67,7 @@ object CameraEnumerator {
         }
 
         val roleCount: Int get() = roles().size
+        fun isStandalone(role: String): Boolean = role in standaloneRoles
     }
 
     // ── 순수 계산 (JVM 단위 테스트 대상) ──────────────────────────
@@ -101,21 +103,52 @@ object CameraEnumerator {
      * 그 안에서 초광각(FOV 최대·95°↑) / 표준(55~95° 중 최고 해상도 = "best wide") /
      * 망원(FOV 최소·55°↓)을 배정한다. 표준이 없으면 남은 것 중 최고 해상도.
      */
-    fun selectTriSet(choices: List<CameraChoice>): TriSelection? {
+    fun selectTriSet(
+        choices: List<CameraChoice>,
+        concurrentSets: List<Set<String>> = emptyList(),
+    ): TriSelection? {
         val grouped = choices
             .filter { it.source == Source.LOGICAL_PHYSICAL && it.physicalId != null }
             .groupBy { it.openId }
         val group = grouped.maxByOrNull { it.value.size }?.value ?: return null
         if (group.isEmpty()) return null
 
-        val ultra = group.filter { it.fovDeg >= 95f }.maxByOrNull { it.fovDeg }
+        val listedBack = choices.filter { it.source == Source.LISTED && it.physicalId == null }
+        val ultraFromGroup = group.filter { it.fovDeg >= 95f }.maxByOrNull { it.fovDeg }
+        val ultraFromListed = listedBack
+            .filter { listed ->
+                listed.fovDeg >= 95f &&
+                    group.none { it.key == listed.key } &&
+                    canOpenConcurrently(group.first().openId, listed.openId, concurrentSets)
+            }
+            .maxByOrNull { it.fovDeg }
+        val ultra = ultraFromGroup ?: ultraFromListed
         val tele = group.filter { it.fovDeg > 0f && it.fovDeg < 55f }.minByOrNull { it.fovDeg }
         val mids = group.filter { it !== ultra && it !== tele && (it.fovDeg <= 0f || it.fovDeg in 55f..95f) }
         val main = mids.maxByOrNull { it.maxW.toLong() * it.maxH }
             ?: group.filter { it !== ultra && it !== tele }.maxByOrNull { it.maxW.toLong() * it.maxH }
             ?: return null
         if (ultra == null && tele == null) return null // 화각이 하나뿐이면 동시 교차 의미 없음
-        return TriSelection(main.openId, main, ultra, tele)
+        val standalone = buildSet {
+            if (ultra != null && ultra.source != Source.LOGICAL_PHYSICAL) add(ROLE_ULTRA_WIDE)
+        }
+        return TriSelection(main.openId, main, ultra, tele, standalone)
+    }
+
+    private fun canOpenConcurrently(
+        logicalId: String,
+        listedId: String,
+        concurrentSets: List<Set<String>>,
+    ): Boolean {
+        if (concurrentSets.isEmpty()) return true
+        return concurrentSets.any { logicalId in it && listedId in it }
+    }
+
+    fun concurrentCameraSets(manager: CameraManager): List<Set<String>> {
+        if (Build.VERSION.SDK_INT < 30) return emptyList()
+        return runCatching {
+            manager.concurrentCameraIds.map { it.toSet() }
+        }.getOrDefault(emptyList())
     }
 
     // ── Camera2 조회 ─────────────────────────────────────────────
@@ -202,7 +235,11 @@ object CameraEnumerator {
                 "동시 3각 세트: 표준=[${tri.main.key}]" +
                     (tri.ultraWide?.let { ", 초광각=[${it.key}]" } ?: "") +
                     (tri.tele?.let { ", 망원=[${it.key}]" } ?: "") +
-                    " (논리 ${tri.openId} 한 세션에서 동시 촬영)"
+                    if (tri.standaloneRoles.isEmpty()) {
+                        " (논리 ${tri.openId} 한 세션에서 동시 촬영)"
+                    } else {
+                        " (논리 ${tri.openId} + 독립 ${tri.standaloneRoles.joinToString()} 동시 오픈 시도)"
+                    }
             )
         } else {
             appendLine("동시 3각 세트: 불가 — 이 기기는 물리 서브카메라를 서드파티에 노출하지 않음 (메인 단독 측정)")

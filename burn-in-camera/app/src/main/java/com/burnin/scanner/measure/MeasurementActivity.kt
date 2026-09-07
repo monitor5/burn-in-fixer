@@ -29,6 +29,7 @@ import com.burnin.scanner.net.Protocol
 import com.burnin.scanner.net.Session
 import com.burnin.scanner.report.ReportStore
 import com.burnin.scanner.util.AppLog
+import com.burnin.scanner.vl.VisionTrustGate
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -85,6 +86,9 @@ class MeasurementActivity : Activity() {
         private const val FLICKER_OK_RELATIVE_RANGE = 0.015f
         private const val FLICKER_ZERO_RELATIVE_RANGE = 0.045f
         private const val FLICKER_INTER_FRAME_DELAY_MS = 1_200L
+        private const val VL_REGION_CONFIDENCE_THRESHOLD = 0.55f
+        private const val VL_REGION_MIN_AREA = 96
+        private const val VL_RESTORED_CONFIDENCE_FLOOR = 0.85f
 
         // 1200ms는 60Hz 주사 주기(16.67ms)의 정확히 72배라, 잔여 롤링 밴드가 매 프레임
         // 같은 위상(같은 위치)에 반복되어 평균화로 상쇄되지 않았다. 주기의 정수배가 아닌
@@ -107,6 +111,8 @@ class MeasurementActivity : Activity() {
     private var measuring = false
     private var correctionOn = true
     private val resultLog = StringBuilder()
+    private val visionTrustGateHolder = lazy { VisionTrustGate() }
+    private val visionTrustGate by visionTrustGateHolder
 
     private data class GrayCapture(
         val average: GrayImage,
@@ -139,6 +145,26 @@ class MeasurementActivity : Activity() {
         val signalValid: Boolean,
     )
 
+    private data class CorrectionIterations(
+        val bestGain: FloatArray,
+        val bestRms: Float,
+        val bestLowRms: Float,
+        val bestLowRgbRms: Float,
+        val invalid: Boolean,
+        val rgb30Targets: LinkedHashMap<String, Float>,
+        val grayRms: List<Float>,
+        val lowLightRms: List<Float>,
+        val lowRgbRms: List<Float>,
+    )
+
+    private data class FinalEvaluation(
+        val lumaAfter: FloatArray?,
+        val statsAfter: Analyzer.Stats?,
+        val lowLumaAfter: FloatArray?,
+        val lowStatsAfter: Analyzer.Stats?,
+        val rgb30: RgbMeasurement,
+    )
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_measure)
@@ -165,9 +191,20 @@ class MeasurementActivity : Activity() {
         chkTri = findViewById(R.id.chkTri)
         if (Session.screenRefreshRate >= 1f) editRefresh.setText(fmtRefresh(Session.screenRefreshRate))
 
-        val choices = CameraEnumerator.enumerate(getSystemService(CameraManager::class.java))
-        triSelection = if (Build.VERSION.SDK_INT >= 28) CameraEnumerator.selectTriSet(choices) else null
+        val cameraManager = getSystemService(CameraManager::class.java)
+        val choices = CameraEnumerator.enumerate(cameraManager)
+        val concurrentSets = CameraEnumerator.concurrentCameraSets(cameraManager)
+        triSelection = if (Build.VERSION.SDK_INT >= 28) {
+            CameraEnumerator.selectTriSet(choices, concurrentSets)
+        } else {
+            null
+        }
         log(CameraEnumerator.report(choices, triSelection).trimEnd())
+        if (concurrentSets.isNotEmpty()) {
+            log("OS concurrent camera sets: ${concurrentSets.joinToString { set -> set.joinToString(prefix = "[", postfix = "]") }}")
+        } else if (Build.VERSION.SDK_INT >= 30) {
+            log("OS concurrent camera sets: 없음 — 공개 카메라 동시 오픈 보장 없음")
+        }
         chkTri.isEnabled = triSelection != null
         chkTri.isChecked = triSelection != null
         chkTri.setOnCheckedChangeListener { _, _ -> if (!measuring) startCamera() }
@@ -195,6 +232,7 @@ class MeasurementActivity : Activity() {
                         else "동시 3각 구성 실패 → 메인 단독 폴백 (기기 HAL 제한)"
                     )
                 }
+                c.diagnosticNotes().forEach { log(it) }
             } catch (e: Exception) {
                 status("카메라 초기화 실패: ${e.message}")
                 btnStart.isEnabled = false
@@ -263,6 +301,7 @@ class MeasurementActivity : Activity() {
         val lockText = cap.lockMeasurementControls(refreshHz)
         log("캡처 고정: $lockText (입력 주사율 ${fmtRefresh(refreshHz)}Hz)")
         if (cap.isTriActive) log("동시 3각 촬영 활성: ${cap.triSummary()}")
+        cap.diagnosticNotes().forEach { log(it) }
         delay(400)
 
         // ── 2. 기준 촬영 + 화면 검출 (활성 화각 전체 동시 캡처) ────
@@ -388,7 +427,16 @@ class MeasurementActivity : Activity() {
 
         // ── 3.5 동시 3각 교차 분석: 화각 간 불일치 구간을 보정에서 무시 ──
         val cross = analyzeCrossRoles(
-            triGrayStores, triBlackStores, markerTriFrames, lumaBefore, screenW, screenH, gw, gh,
+            triGrayStores,
+            triBlackStores,
+            markerTriFrames,
+            grayAvg,
+            homography,
+            lumaBefore,
+            screenW,
+            screenH,
+            gw,
+            gh,
         )
         val confidence70 = if (cross != null) {
             withContext(Dispatchers.Default) {
@@ -521,6 +569,195 @@ class MeasurementActivity : Activity() {
         }
 
         // ── 7~8. 초기 보정맵 + 반복 보정 루프 ────────────────────
+        val correction = runCorrectionIterations(
+            client = client,
+            cap = cap,
+            screenW = screenW,
+            screenH = screenH,
+            gw = gw,
+            gh = gh,
+            lumaBefore = lumaBefore,
+            lumaLowBefore = lumaLowBefore,
+            confidence70 = confidence70,
+            confidenceLow = confidenceLow,
+            lowLightWeight = lowLightWeight,
+            rgb30 = rgb30,
+            lowRgbWeight = lowRgbWeight,
+            blackAvg = blackAvg,
+            blackRgbAvg = blackRgbAvg,
+            blackFullGrid = blackFullGrid,
+            homography = homography,
+            det = det,
+            cornerMapping = cornerMapping,
+            statsBefore = statsBefore,
+            target = target,
+            lowTarget = lowTarget,
+            flatField = flatField,
+            smoothRadius = smoothRadius,
+        )
+        val bestGain = correction.bestGain
+        val bestRms = correction.bestRms
+        val bestLowRms = correction.bestLowRms
+        val bestLowRgbRms = correction.bestLowRgbRms
+        val invalid = correction.invalid
+        val rgb30Targets = correction.rgb30Targets
+        val iterRmsList = correction.grayRms
+        val iterLowRmsList = correction.lowLightRms
+        val iterLowRgbRmsList = correction.lowRgbRms
+
+        // ── 8. 최종 평가·판정 ───────────────────────────────────
+        val finalEval = runFinalEvaluation(
+            invalid = invalid,
+            client = client,
+            cap = cap,
+            blackAvg = blackAvg,
+            blackRgbAvg = blackRgbAvg,
+            homography = homography,
+            cornerMapping = cornerMapping,
+            screenW = screenW,
+            screenH = screenH,
+            gw = gw,
+            gh = gh,
+            flatField = flatField,
+            rgb30Targets = rgb30Targets,
+        )
+        val finalLumaAfter = finalEval.lumaAfter
+        val finalStatsAfter = finalEval.statsAfter
+        val finalLowLumaAfter = finalEval.lowLumaAfter
+        val finalLowStatsAfter = finalEval.lowStatsAfter
+        val finalRgb30 = finalEval.rgb30
+
+        val finalRms = finalStatsAfter?.rmsDev
+            ?: if (bestRms == Float.MAX_VALUE) statsBefore.rmsDev else bestRms
+        val finalLowRms = finalLowStatsAfter?.rmsDev
+            ?: if (bestLowRms == Float.MAX_VALUE) lowStatsBefore.rmsDev else bestLowRms
+        val finalP95 = finalStatsAfter?.p95Dev ?: statsBefore.p95Dev
+        val finalLowP95 = finalLowStatsAfter?.p95Dev ?: lowStatsBefore.p95Dev
+        val finalLowRgbRms = when {
+            finalRgb30.stats.isNotEmpty() -> finalRgb30.meanRms
+            bestLowRgbRms != Float.MAX_VALUE -> bestLowRgbRms
+            else -> rgb30.meanRms
+        }
+        val finalGray70Passed = finalStatsAfter?.let { uniformityPassed(it) } == true
+        val finalLowPassed = finalLowStatsAfter?.let { uniformityPassed(it) } == true
+        val finalUniformityPassed = finalGray70Passed && finalLowPassed
+        val improvement = 1.0 - finalRms.toDouble() / statsBefore.rmsDev
+        val lowImprovement = 1.0 - finalLowRms.toDouble() / lowStatsBefore.rmsDev
+        val rgb30Improvement = if (rgb30.meanRms > 0f) {
+            1.0 - finalLowRgbRms.toDouble() / rgb30.meanRms.toDouble()
+        } else {
+            0.0
+        }
+        val brightnessLoss = (1f - mean(bestGain)).toDouble()
+        val verdict = when {
+            invalid -> "평가 무효(측정 조건 변화)"
+            finalUniformityPassed -> "합격"
+            else -> "미달(측정 환경 개선 또는 심한 번인)"
+        }
+        log("──────────────")
+        log(
+            "반복 ${iterRmsList.size}회, 최종 gray70 RMS ${pct(finalRms)} / P95 ${pct(finalP95)} " +
+                "(보정 전 RMS ${pct(statsBefore.rmsDev)})"
+        )
+        log(
+            "$LOW_LIGHT_PATTERN 보정 후 RMS ${pct(finalLowRms)} / P95 ${pct(finalLowP95)} " +
+                "(보정 전 RMS ${pct(lowStatsBefore.rmsDev)}, 개선율 ${pct(lowImprovement.toFloat())})"
+        )
+        if (rgb30.stats.isNotEmpty()) {
+            log(
+                "RGB30 보정 후 평균 RMS ${pct(finalLowRgbRms)} " +
+                    "(보정 전 ${pct(rgb30.meanRms)}, 개선율 ${pct(rgb30Improvement.toFloat())})"
+            )
+        }
+        log("개선율 ${pct(improvement.toFloat())}, 평균 밝기 손실 ${pct(brightnessLoss.toFloat())}")
+        log("판정: $verdict (gray70/$LOW_LIGHT_PATTERN 모두 RMS ≤ ${pct(PASS_RMS)}, P95 ≤ ${pct(PASS_P95)})")
+
+        // ── 9. 리포트 저장 ──────────────────────────────────────
+        status("10/10 리포트 저장...")
+        val dir = saveMeasurementReport(
+            screenW = screenW,
+            screenH = screenH,
+            gw = gw,
+            gh = gh,
+            det = det,
+            geometry = geometry,
+            markerOrientation = markerOrientation,
+            dotGrid = dotGrid,
+            flatField = flatField,
+            confidence70 = confidence70,
+            flickerConfidence70 = flickerConfidence70,
+            grayCapture = grayCapture,
+            confidenceLow = confidenceLow,
+            flickerConfidenceLow = flickerConfidenceLow,
+            lowBeforeCapture = lowBeforeCapture,
+            strayRatio = strayRatio,
+            cap = cap,
+            refreshHz = refreshHz,
+            cross = cross,
+            statsBefore = statsBefore,
+            finalRms = finalRms,
+            finalP95 = finalP95,
+            iterRmsList = iterRmsList,
+            iterLowRmsList = iterLowRmsList,
+            iterLowRgbRmsList = iterLowRgbRmsList,
+            improvement = improvement,
+            finalGray70Passed = finalGray70Passed,
+            lowStatsBefore = lowStatsBefore,
+            finalLowRms = finalLowRms,
+            finalLowP95 = finalLowP95,
+            lowImprovement = lowImprovement,
+            lowStrayRatio = lowStrayRatio,
+            lowSignalValid = lowSignalValid,
+            lowLightWeight = lowLightWeight,
+            finalLowPassed = finalLowPassed,
+            rgb30 = rgb30,
+            finalLowRgbRms = finalLowRgbRms,
+            rgb30Improvement = rgb30Improvement,
+            lowRgbWeight = lowRgbWeight,
+            finalRgb30 = finalRgb30,
+            rgb70 = rgb70,
+            brightnessLoss = brightnessLoss,
+            bestGain = bestGain,
+            finalUniformityPassed = finalUniformityPassed,
+            invalid = invalid,
+            lumaBefore = lumaBefore,
+            finalLumaAfter = finalLumaAfter,
+            lumaLowBefore = lumaLowBefore,
+            finalLowLumaAfter = finalLowLumaAfter,
+            grayAvg = grayAvg,
+        )
+        log("리포트 저장: ${dir.absolutePath}")
+        status("측정 완료 — $verdict, 개선율 ${pct(improvement.toFloat())}")
+        btnToggle.isEnabled = true
+        correctionOn = true
+    }
+
+    private suspend fun runCorrectionIterations(
+        client: ControlClient,
+        cap: CaptureController,
+        screenW: Int,
+        screenH: Int,
+        gw: Int,
+        gh: Int,
+        lumaBefore: FloatArray,
+        lumaLowBefore: FloatArray,
+        confidence70: FloatArray,
+        confidenceLow: FloatArray,
+        lowLightWeight: Float,
+        rgb30: RgbMeasurement,
+        lowRgbWeight: Float,
+        blackAvg: GrayImage,
+        blackRgbAvg: RgbImage,
+        blackFullGrid: FloatArray,
+        homography: Homography,
+        det: ScreenDetector.Result,
+        cornerMapping: Analyzer.CornerMapping?,
+        statsBefore: Analyzer.Stats,
+        target: Float,
+        lowTarget: Float,
+        flatField: FloatArray,
+        smoothRadius: Int,
+    ): CorrectionIterations {
         val gray70Gain = withContext(Dispatchers.Default) {
             Analyzer.gainGrid(lumaBefore, gw, gh, MAX_ATTENUATION, confidence70, smoothRadius)
         }
@@ -628,10 +865,8 @@ class MeasurementActivity : Activity() {
             } else {
                 0f
             }
-            val compositeScore =
-                grayScore * (1f - lowRgbWeight) + rgbScore * lowRgbWeight
+            val compositeScore = grayScore * (1f - lowRgbWeight) + rgbScore * lowRgbWeight
 
-            // 측정 조건 변화 감지 (M-FR-013): 중앙 휘도가 예상치에서 크게 벗어나면 무효
             val loss = 1f - mean(gain)
             val drift = st.median / (statsBefore.median * (1f - loss)) - 1f
             if (Math.abs(drift) > DRIFT_LIMIT) {
@@ -675,24 +910,14 @@ class MeasurementActivity : Activity() {
             val lastScore = prevScore
             if (lastScore != null) {
                 val stopDelta = 0.01f + compositeScore * 0.01f
-                if (compositeScore > lastScore + stopDelta) {
-                    divergeCount++
-                } else {
-                    divergeCount = 0
-                }
-                if (lastScore - compositeScore < stopDelta) {
-                    stalledCount++
-                } else {
-                    stalledCount = 0
-                }
+                divergeCount = if (compositeScore > lastScore + stopDelta) divergeCount + 1 else 0
+                stalledCount = if (lastScore - compositeScore < stopDelta) stalledCount + 1 else 0
                 if (divergeCount >= DIVERGENCE_LIMIT) {
                     log("균일도 점수 증가 ${DIVERGENCE_LIMIT}회 감지 — 최적 맵으로 롤백")
                     stopAfterThisEvaluation = true
                 }
                 if (stalledCount >= STAGNATION_LIMIT) {
-                    log(
-                        "추가 개선 정체 ${STAGNATION_LIMIT}회 — 현재 측정 조건에서 최적 맵으로 평가 진행"
-                    )
+                    log("추가 개선 정체 ${STAGNATION_LIMIT}회 — 현재 측정 조건에서 최적 맵으로 평가 진행")
                     stopAfterThisEvaluation = true
                 }
             }
@@ -722,118 +947,160 @@ class MeasurementActivity : Activity() {
             } ?: refinedGray
         }
 
-        // 발산·초과 반복 후에는 최적 시점 맵으로 되돌린다 (14.9 롤백)
         if (!invalid && !lastAppliedIsBest) {
             status("9/10 최적 반복 맵으로 롤백 적용...")
             applyGainMap(client, bestGain, gw, gh, screenW, screenH, rgb30.channelGains, lowRgbWeight)
         }
 
-        // ── 8. 최종 평가·판정 ───────────────────────────────────
-        var finalLumaAfter: FloatArray? = null
-        var finalStatsAfter: Analyzer.Stats? = null
-        var finalLowLumaAfter: FloatArray? = null
-        var finalLowStatsAfter: Analyzer.Stats? = null
-        var finalRgb30 = emptyRgbMeasurement()
-        if (!invalid) {
-            status("9/10 최종 gray70/$LOW_LIGHT_PATTERN/RGB30 촬영·평가...")
-            withContext(Dispatchers.IO) { client.showPattern("gray70") }
-            delay(900)
-            val finalAvg = captureAveraged(cap)
-            val detFinal = withContext(Dispatchers.Default) { ScreenDetector.detect(finalAvg) }
-            val hFinal = detFinal?.let { Analyzer.buildHomography(it.quad, screenW, screenH, cornerMapping) }
-                ?: homography
-            val finalGridRaw = withContext(Dispatchers.Default) {
-                Analyzer.lumaGrid(finalAvg, blackAvg, hFinal, screenW, screenH, gw, gh)
-            }
-            val finalGrid = withContext(Dispatchers.Default) {
-                Analyzer.applyFlatField(finalGridRaw, flatField)
-            }
-            finalLumaAfter = finalGrid
-            finalStatsAfter = Analyzer.stats(finalGrid)
-
-            val lowFinalAvg = capturePatternAveraged(client, cap, LOW_LIGHT_PATTERN, LOW_LIGHT_FRAMES)
-            val finalLowGridRaw = withContext(Dispatchers.Default) {
-                Analyzer.lumaGrid(lowFinalAvg, blackAvg, hFinal, screenW, screenH, gw, gh)
-            }
-            val finalLowGrid = withContext(Dispatchers.Default) {
-                Analyzer.applyFlatField(finalLowGridRaw, flatField)
-            }
-            finalLowLumaAfter = finalLowGrid
-            finalLowStatsAfter = Analyzer.stats(finalLowGrid)
-
-            if (rgb30Targets.isNotEmpty()) {
-                finalRgb30 = measureRgbPatterns(
-                    client, cap, blackRgbAvg, hFinal, screenW, screenH, gw, gh,
-                    RGB30_PATTERNS, LOW_RGB_FRAMES, "deviation_rgb30_after",
-                    flatField = flatField,
-                    makeHeatmaps = true,
-                    includeGain = false,
-                )
-            }
-            withContext(Dispatchers.IO) { client.showPattern("gray70") }
-        }
-
-        val finalRms = finalStatsAfter?.rmsDev
-            ?: if (bestRms == Float.MAX_VALUE) statsBefore.rmsDev else bestRms
-        val finalLowRms = finalLowStatsAfter?.rmsDev
-            ?: if (bestLowRms == Float.MAX_VALUE) lowStatsBefore.rmsDev else bestLowRms
-        val finalP95 = finalStatsAfter?.p95Dev ?: statsBefore.p95Dev
-        val finalLowP95 = finalLowStatsAfter?.p95Dev ?: lowStatsBefore.p95Dev
-        val finalLowRgbRms = when {
-            finalRgb30.stats.isNotEmpty() -> finalRgb30.meanRms
-            bestLowRgbRms != Float.MAX_VALUE -> bestLowRgbRms
-            else -> rgb30.meanRms
-        }
-        val finalGray70Passed = finalStatsAfter?.let { uniformityPassed(it) } == true
-        val finalLowPassed = finalLowStatsAfter?.let { uniformityPassed(it) } == true
-        val finalUniformityPassed = finalGray70Passed && finalLowPassed
-        val improvement = 1.0 - finalRms.toDouble() / statsBefore.rmsDev
-        val lowImprovement = 1.0 - finalLowRms.toDouble() / lowStatsBefore.rmsDev
-        val rgb30Improvement = if (rgb30.meanRms > 0f) {
-            1.0 - finalLowRgbRms.toDouble() / rgb30.meanRms.toDouble()
-        } else {
-            0.0
-        }
-        val brightnessLoss = (1f - mean(bestGain)).toDouble()
-        val verdict = when {
-            invalid -> "평가 무효(측정 조건 변화)"
-            finalUniformityPassed -> "합격"
-            else -> "미달(측정 환경 개선 또는 심한 번인)"
-        }
-        log("──────────────")
-        log(
-            "반복 ${iterRmsList.size}회, 최종 gray70 RMS ${pct(finalRms)} / P95 ${pct(finalP95)} " +
-                "(보정 전 RMS ${pct(statsBefore.rmsDev)})"
+        return CorrectionIterations(
+            bestGain = bestGain,
+            bestRms = bestRms,
+            bestLowRms = bestLowRms,
+            bestLowRgbRms = bestLowRgbRms,
+            invalid = invalid,
+            rgb30Targets = rgb30Targets,
+            grayRms = iterRmsList,
+            lowLightRms = iterLowRmsList,
+            lowRgbRms = iterLowRgbRmsList,
         )
-        log(
-            "$LOW_LIGHT_PATTERN 보정 후 RMS ${pct(finalLowRms)} / P95 ${pct(finalLowP95)} " +
-                "(보정 전 RMS ${pct(lowStatsBefore.rmsDev)}, 개선율 ${pct(lowImprovement.toFloat())})"
-        )
-        if (rgb30.stats.isNotEmpty()) {
-            log(
-                "RGB30 보정 후 평균 RMS ${pct(finalLowRgbRms)} " +
-                    "(보정 전 ${pct(rgb30.meanRms)}, 개선율 ${pct(rgb30Improvement.toFloat())})"
+    }
+
+    private suspend fun runFinalEvaluation(
+        invalid: Boolean,
+        client: ControlClient,
+        cap: CaptureController,
+        blackAvg: GrayImage,
+        blackRgbAvg: RgbImage,
+        homography: Homography,
+        cornerMapping: Analyzer.CornerMapping?,
+        screenW: Int,
+        screenH: Int,
+        gw: Int,
+        gh: Int,
+        flatField: FloatArray,
+        rgb30Targets: Map<String, Float>,
+    ): FinalEvaluation {
+        if (invalid) {
+            return FinalEvaluation(
+                lumaAfter = null,
+                statsAfter = null,
+                lowLumaAfter = null,
+                lowStatsAfter = null,
+                rgb30 = emptyRgbMeasurement(),
             )
         }
-        log("개선율 ${pct(improvement.toFloat())}, 평균 밝기 손실 ${pct(brightnessLoss.toFloat())}")
-        log("판정: $verdict (gray70/$LOW_LIGHT_PATTERN 모두 RMS ≤ ${pct(PASS_RMS)}, P95 ≤ ${pct(PASS_P95)})")
 
-        // ── 9. 리포트 저장 ──────────────────────────────────────
-        status("10/10 리포트 저장...")
+        status("9/10 최종 gray70/$LOW_LIGHT_PATTERN/RGB30 촬영·평가...")
+        withContext(Dispatchers.IO) { client.showPattern("gray70") }
+        delay(900)
+        val finalAvg = captureAveraged(cap)
+        val detFinal = withContext(Dispatchers.Default) { ScreenDetector.detect(finalAvg) }
+        val hFinal = detFinal?.let { Analyzer.buildHomography(it.quad, screenW, screenH, cornerMapping) }
+            ?: homography
+        val finalGridRaw = withContext(Dispatchers.Default) {
+            Analyzer.lumaGrid(finalAvg, blackAvg, hFinal, screenW, screenH, gw, gh)
+        }
+        val finalGrid = withContext(Dispatchers.Default) {
+            Analyzer.applyFlatField(finalGridRaw, flatField)
+        }
+
+        val lowFinalAvg = capturePatternAveraged(client, cap, LOW_LIGHT_PATTERN, LOW_LIGHT_FRAMES)
+        val finalLowGridRaw = withContext(Dispatchers.Default) {
+            Analyzer.lumaGrid(lowFinalAvg, blackAvg, hFinal, screenW, screenH, gw, gh)
+        }
+        val finalLowGrid = withContext(Dispatchers.Default) {
+            Analyzer.applyFlatField(finalLowGridRaw, flatField)
+        }
+
+        val finalRgb30 = if (rgb30Targets.isNotEmpty()) {
+            measureRgbPatterns(
+                client, cap, blackRgbAvg, hFinal, screenW, screenH, gw, gh,
+                RGB30_PATTERNS, LOW_RGB_FRAMES, "deviation_rgb30_after",
+                flatField = flatField,
+                makeHeatmaps = true,
+                includeGain = false,
+            )
+        } else {
+            emptyRgbMeasurement()
+        }
+        withContext(Dispatchers.IO) { client.showPattern("gray70") }
+
+        return FinalEvaluation(
+            lumaAfter = finalGrid,
+            statsAfter = Analyzer.stats(finalGrid),
+            lowLumaAfter = finalLowGrid,
+            lowStatsAfter = Analyzer.stats(finalLowGrid),
+            rgb30 = finalRgb30,
+        )
+    }
+
+    private suspend fun saveMeasurementReport(
+        screenW: Int,
+        screenH: Int,
+        gw: Int,
+        gh: Int,
+        det: ScreenDetector.Result,
+        geometry: Analyzer.GeometryQuality,
+        markerOrientation: Analyzer.OrientedHomography?,
+        dotGrid: DotGridDetector.Result?,
+        flatField: FloatArray,
+        confidence70: FloatArray,
+        flickerConfidence70: FloatArray,
+        grayCapture: GrayCapture,
+        confidenceLow: FloatArray,
+        flickerConfidenceLow: FloatArray,
+        lowBeforeCapture: GrayCapture,
+        strayRatio: Float,
+        cap: CaptureController,
+        refreshHz: Float,
+        cross: CrossResult?,
+        statsBefore: Analyzer.Stats,
+        finalRms: Float,
+        finalP95: Float,
+        iterRmsList: List<Float>,
+        iterLowRmsList: List<Float>,
+        iterLowRgbRmsList: List<Float>,
+        improvement: Double,
+        finalGray70Passed: Boolean,
+        lowStatsBefore: Analyzer.Stats,
+        finalLowRms: Float,
+        finalLowP95: Float,
+        lowImprovement: Double,
+        lowStrayRatio: Float,
+        lowSignalValid: Boolean,
+        lowLightWeight: Float,
+        finalLowPassed: Boolean,
+        rgb30: RgbMeasurement,
+        finalLowRgbRms: Float,
+        rgb30Improvement: Double,
+        lowRgbWeight: Float,
+        finalRgb30: RgbMeasurement,
+        rgb70: RgbMeasurement,
+        brightnessLoss: Double,
+        bestGain: FloatArray,
+        finalUniformityPassed: Boolean,
+        invalid: Boolean,
+        lumaBefore: FloatArray,
+        finalLumaAfter: FloatArray?,
+        lumaLowBefore: FloatArray,
+        finalLowLumaAfter: FloatArray?,
+        grayAvg: GrayImage,
+    ): File {
         val bestPng = withContext(Dispatchers.Default) {
             Analyzer.toAlphaPng(bestGain, gw, gh, screenW, screenH, MAX_ATTENUATION)
         }
         val bestRgbPng = rgbCorrectionPng(bestGain, rgb30.channelGains, lowRgbWeight, gw, gh, screenW, screenH)
-        val iterations = JSONArray().apply { iterRmsList.forEach { put(it.toDouble()) } }
-        val lowIterations = JSONArray().apply { iterLowRmsList.forEach { put(it.toDouble()) } }
-        val rgbIterations = JSONArray().apply { iterLowRgbRmsList.forEach { put(it.toDouble()) } }
+        val lowIterations = floatListJson(iterLowRmsList)
         val rgb70Json = statsMapJson(rgb70.stats)
-        val rgb30BeforeJson = statsMapJson(rgb30.stats)
-        val rgb30AfterJson = statsMapJson(finalRgb30.stats)
         val report = JSONObject()
             .put("reportVersion", 2)
-            .put("createdAt", java.text.SimpleDateFormat(
-                "yyyy-MM-dd'T'HH:mm:ssZ", java.util.Locale.US).format(java.util.Date()))
+            .put(
+                "createdAt",
+                java.text.SimpleDateFormat(
+                    "yyyy-MM-dd'T'HH:mm:ssZ",
+                    java.util.Locale.US,
+                ).format(java.util.Date()),
+            )
             .put("targetDevice", Session.targetName)
             .put("scannerDevice", "${Build.MANUFACTURER} ${Build.MODEL}")
             .put("screenResolution", "${screenW}x${screenH}")
@@ -864,17 +1131,19 @@ class MeasurementActivity : Activity() {
             .put("refreshRateUsedHz", refreshHz.toDouble())
             .put("crossAgreementMean", (cross?.meanAgreement ?: 1f).toDouble())
             .put("crossRoles", JSONArray(cross?.roles ?: emptyList<String>()))
-            .put("crossRoleStats", statsMapJson(cross?.roleStats ?: LinkedHashMap()))
+            .put("crossRoleStats", statsMapJson(cross?.roleStats ?: emptyMap()))
+            .put("vlTrustGate", cross?.vlDecisions?.isNotEmpty() == true)
+            .put("vlTrustDecisions", vlDecisionJson(cross?.vlDecisions ?: emptyList()))
             .put("physicalExposures", cap.physicalExposureSummary(refreshHz) ?: "")
             .put("rmsBefore", statsBefore.rmsDev.toDouble())
             .put("p95Before", statsBefore.p95Dev.toDouble())
             .put("maxBefore", statsBefore.maxDev.toDouble())
             .put("rmsAfterBest", finalRms.toDouble())
             .put("p95AfterBest", finalP95.toDouble())
-            .put("iterationRms", iterations)
+            .put("iterationRms", floatListJson(iterRmsList))
             .put("iterationLowLightRms", lowIterations)
             .put("iterationGray30Rms", lowIterations)
-            .put("iterationRgb30Rms", rgbIterations)
+            .put("iterationRgb30Rms", floatListJson(iterLowRgbRmsList))
             .put("iterationCount", iterRmsList.size)
             .put("improvementRatio", improvement)
             .put("passRmsThreshold", PASS_RMS.toDouble())
@@ -917,8 +1186,8 @@ class MeasurementActivity : Activity() {
             .put("maxAttenuation", MAX_ATTENUATION.toDouble())
             .put("rgbChannels", rgb70Json)
             .put("rgb70Channels", rgb70Json)
-            .put("rgb30ChannelsBefore", rgb30BeforeJson)
-            .put("rgb30ChannelsAfter", rgb30AfterJson)
+            .put("rgb30ChannelsBefore", statsMapJson(rgb30.stats))
+            .put("rgb30ChannelsAfter", statsMapJson(finalRgb30.stats))
             .put(
                 "evaluationVerdict",
                 when {
@@ -927,14 +1196,14 @@ class MeasurementActivity : Activity() {
                     else -> "retry"
                 },
             )
+
         val dir = ReportStore.newSessionDir(this)
         withContext(Dispatchers.IO) {
             val files = LinkedHashMap<String, ByteArray>()
             files["correction_alpha_${screenW}x${screenH}.png"] = bestPng
             if (bestRgbPng != null) files["correction_rgb_${screenW}x${screenH}.png"] = bestRgbPng
             files["deviation_before.png"] = Analyzer.deviationHeatmapPng(lumaBefore, gw, gh)
-            files["deviation_after.png"] =
-                Analyzer.deviationHeatmapPng(finalLumaAfter ?: lumaBefore, gw, gh)
+            files["deviation_after.png"] = Analyzer.deviationHeatmapPng(finalLumaAfter ?: lumaBefore, gw, gh)
             val lowBeforeHeatmap = Analyzer.deviationHeatmapPng(lumaLowBefore, gw, gh)
             val lowAfterHeatmap = Analyzer.deviationHeatmapPng(finalLowLumaAfter ?: lumaLowBefore, gw, gh)
             files["deviation_${LOW_LIGHT_PATTERN}_before.png"] = lowBeforeHeatmap
@@ -946,15 +1215,11 @@ class MeasurementActivity : Activity() {
             files.putAll(finalRgb30.heatmaps)
             if (cross != null) {
                 files.putAll(cross.files)
-                // 역해석용 메인 화각 평균 프레임도 함께 저장
                 files["camera_main_gray70.png"] = Analyzer.grayImagePng(grayAvg)
             }
             ReportStore.save(dir, report, files)
         }
-        log("리포트 저장: ${dir.absolutePath}")
-        status("측정 완료 — $verdict, 개선율 ${pct(improvement.toFloat())}")
-        btnToggle.isEnabled = true
-        correctionOn = true
+        return dir
     }
 
     /** gain 그리드 → 네이티브 알파 PNG → 전송 → 보정 ON → gray70 표시 유지 */
@@ -1058,52 +1323,58 @@ class MeasurementActivity : Activity() {
         for (pattern in patterns) {
             val channel = rgbChannel(pattern)
             val capture = capturePatternRgb(client, cap, pattern, frameCount)
-            val avg = capture.average
-            val rawGrid = withContext(Dispatchers.Default) {
-                Analyzer.channelGrid(avg, blackRgb, channel, h, screenW, screenH, gw, gh)
-            }
-            val grid = withContext(Dispatchers.Default) { Analyzer.applyFlatField(rawGrid, flatField) }
-            val st = Analyzer.stats(grid)
-            val blackGrid = withContext(Dispatchers.Default) {
-                Analyzer.channelGrid(blackRgb, null, channel, h, screenW, screenH, 16, 16)
-            }
-            val blackStats = Analyzer.stats(blackGrid)
-            val strayRatio = blackStats.median / st.median
-            maxStrayRatio = maxOf(maxStrayRatio, strayRatio)
+            try {
+                val avg = capture.average
+                val rawGrid = withContext(Dispatchers.Default) {
+                    Analyzer.channelGrid(avg, blackRgb, channel, h, screenW, screenH, gw, gh)
+                }
+                val grid = withContext(Dispatchers.Default) { Analyzer.applyFlatField(rawGrid, flatField) }
+                val st = Analyzer.stats(grid)
+                val blackGrid = withContext(Dispatchers.Default) {
+                    Analyzer.channelGrid(blackRgb, null, channel, h, screenW, screenH, 16, 16)
+                }
+                val blackStats = Analyzer.stats(blackGrid)
+                val strayRatio = blackStats.median / st.median
+                maxStrayRatio = maxOf(maxStrayRatio, strayRatio)
 
-            stats[pattern] = st
-            if (keepGrids) grids[pattern] = grid
-            if (makeHeatmaps) {
-                heatmaps["${heatmapPrefix}_${pattern}.png"] = Analyzer.deviationHeatmapPng(grid, gw, gh)
-            }
-            if (includeGain || keepGrids) {
-                val blackFull = withContext(Dispatchers.Default) {
-                    Analyzer.channelGrid(blackRgb, null, channel, h, screenW, screenH, gw, gh)
+                stats[pattern] = st
+                if (keepGrids) grids[pattern] = grid
+                if (makeHeatmaps) {
+                    heatmaps["${heatmapPrefix}_${pattern}.png"] = Analyzer.deviationHeatmapPng(grid, gw, gh)
                 }
-                val baseConfidence = withContext(Dispatchers.Default) {
-                    Analyzer.confidenceGrid(rawGrid, blackFull, strayWarn = LOW_LIGHT_STRAY_WARN)
-                }
-                val flickerConfidence = temporalChannelConfidence(
-                    capture.frameStore, blackRgb, channel, h, screenW, screenH, gw, gh
-                )
-                val confidence = withContext(Dispatchers.Default) {
-                    Analyzer.combineConfidence(baseConfidence, flickerConfidence)
-                }
-                confidences[pattern] = confidence
-                if (includeGain || makeHeatmaps) {
-                    log(
-                        "$pattern 프레임 안정도 ${pct(Analyzer.meanConfidence(flickerConfidence))}, " +
-                            "flicker span ${fmtSeconds(capture.frameStore.spanMs)}"
+                if (includeGain || keepGrids) {
+                    val blackFull = withContext(Dispatchers.Default) {
+                        Analyzer.channelGrid(blackRgb, null, channel, h, screenW, screenH, gw, gh)
+                    }
+                    val baseConfidence = withContext(Dispatchers.Default) {
+                        Analyzer.confidenceGrid(rawGrid, blackFull, strayWarn = LOW_LIGHT_STRAY_WARN)
+                    }
+                    val flickerConfidence = temporalChannelConfidence(
+                        capture.frameStore, blackRgb, channel, h, screenW, screenH, gw, gh
                     )
+                    val confidence = withContext(Dispatchers.Default) {
+                        Analyzer.combineConfidence(baseConfidence, flickerConfidence)
+                    }
+                    confidences[pattern] = confidence
+                    if (includeGain || makeHeatmaps) {
+                        log(
+                            "$pattern 프레임 안정도 ${pct(Analyzer.meanConfidence(flickerConfidence))}, " +
+                                "flicker span ${fmtSeconds(capture.frameStore.spanMs)}"
+                        )
+                    }
                 }
-            }
-            if (includeGain) {
-                val confidence = confidences[pattern]
-                val gain = withContext(Dispatchers.Default) {
-                    Analyzer.gainGrid(grid, gw, gh, MAX_ATTENUATION, confidence, smoothRadius)
+                if (includeGain) {
+                    val confidence = confidences[pattern]
+                    val gain = withContext(Dispatchers.Default) {
+                        Analyzer.gainGrid(grid, gw, gh, MAX_ATTENUATION, confidence, smoothRadius)
+                    }
+                    gains += gain
+                    channelGains[channel] = gain
                 }
-                gains += gain
-                channelGains[channel] = gain
+            } finally {
+                if (!includeGain && !keepGrids) {
+                    capture.frameStore.delete()
+                }
             }
         }
 
@@ -1171,6 +1442,9 @@ class MeasurementActivity : Activity() {
         else -> throw IllegalArgumentException("RGB 패턴 아님: $pattern")
     }
 
+    private fun floatListJson(values: List<Float>): JSONArray =
+        JSONArray().apply { values.forEach { put(it.toDouble()) } }
+
     private fun statsMapJson(stats: Map<String, Analyzer.Stats>): JSONObject {
         val json = JSONObject()
         stats.forEach { (name, st) ->
@@ -1186,6 +1460,20 @@ class MeasurementActivity : Activity() {
             )
         }
         return json
+    }
+
+    private fun vlDecisionJson(decisions: List<VisionTrustGate.Decision>): JSONArray {
+        val arr = JSONArray()
+        decisions.forEach { d ->
+            arr.put(
+                JSONObject()
+                    .put("status", d.status.name)
+                    .put("confidence", d.confidence.toDouble())
+                    .put("reason", d.reason)
+                    .put("rawText", d.rawText),
+            )
+        }
+        return arr
     }
 
     private suspend fun capturePatternAveraged(
@@ -1350,18 +1638,22 @@ class MeasurementActivity : Activity() {
         val roleStats: LinkedHashMap<String, Analyzer.Stats>,
         val files: LinkedHashMap<String, ByteArray>,
         val notes: List<String>,
+        val vlDecisions: List<VisionTrustGate.Decision>,
     )
 
     /**
      * 동시 촬영된 보조 화각(초광각/망원)을 각자 검출·방향판별·정합·flat-field 후
-     * 정규화 그리드로 만들고, 메인과의 교차 일치도 confidence를 계산한다.
-     * 화각 간 불일치 구간 = 카메라 기인 성분 → 보정에서 무시 (사용자 요구사항).
+     * 정규화 그리드로 만들고, 메인과의 screen-space 재현성 confidence를 계산한다.
+     * 낮은 재현성 구간은 촬영계 성분으로 의심하되, Gemini Nano VL이 사용 가능하면
+     * 해당 crop이 실제 화면 결함인지 보조 판정해 과도한 마스킹을 완화한다.
      * 역해석용으로 화각별 평균 프레임 PNG와 편차 히트맵을 세션 폴더에 남긴다.
      */
     private suspend fun analyzeCrossRoles(
         grayStores: Map<String, CaptureFrameStore>,
         blackStores: Map<String, CaptureFrameStore>,
         markerFrames: Map<String, CaptureFrame>,
+        mainGray: GrayImage,
+        mainHomography: Homography,
         mainLuma: FloatArray,
         screenW: Int,
         screenH: Int,
@@ -1377,6 +1669,10 @@ class MeasurementActivity : Activity() {
         val roleStats = LinkedHashMap<String, Analyzer.Stats>()
         val files = LinkedHashMap<String, ByteArray>()
         val notes = ArrayList<String>()
+        val roleImages = LinkedHashMap<String, GrayImage>()
+        val roleHomographies = LinkedHashMap<String, Homography>()
+        roleImages[CameraEnumerator.ROLE_MAIN] = mainGray
+        roleHomographies[CameraEnumerator.ROLE_MAIN] = mainHomography
 
         for (role in extraRoles) {
             val grayStore = grayStores.getValue(role)
@@ -1414,6 +1710,8 @@ class MeasurementActivity : Activity() {
                 roleStats[role] = st
                 norms += withContext(Dispatchers.Default) { Analyzer.normalizeByMedian(grid) }
                 okRoles += role
+                roleImages[role] = roleGray
+                roleHomographies[role] = h
                 files["camera_${role}_gray70.png"] =
                     withContext(Dispatchers.Default) { Analyzer.grayImagePng(roleGray) }
                 files["deviation_${role}_before.png"] =
@@ -1429,10 +1727,68 @@ class MeasurementActivity : Activity() {
             }
         }
 
-        val agreement = if (okRoles.isEmpty()) {
+        var agreement = if (okRoles.isEmpty()) {
             FloatArray(gw * gh) { 1f } // 전부 제외 → 중립 (메인 단독과 동일)
         } else {
             withContext(Dispatchers.Default) { Analyzer.crossAgreementConfidence(norms, gw, gh) }
+        }
+        val vlDecisions = ArrayList<VisionTrustGate.Decision>()
+        if (okRoles.isNotEmpty()) {
+            val regions = withContext(Dispatchers.Default) {
+                Analyzer.lowConfidenceRegions(
+                    agreement,
+                    gw,
+                    gh,
+                    VL_REGION_CONFIDENCE_THRESHOLD,
+                    VL_REGION_MIN_AREA,
+                )
+            }
+            if (regions.isNotEmpty()) {
+                notes += "VL 교차 후보: ${regions.size}개 crop 검사 시도"
+            }
+            for ((idx, region) in regions.withIndex()) {
+                val crops = ArrayList<Pair<String, android.graphics.Bitmap>>()
+                try {
+                    for (role in listOf(CameraEnumerator.ROLE_MAIN) + okRoles) {
+                        val img = roleImages[role] ?: continue
+                        val h = roleHomographies[role] ?: continue
+                        val bmp = withContext(Dispatchers.Default) {
+                            Analyzer.screenCropBitmap(img, h, screenW, screenH, gw, gh, region)
+                        }
+                        crops += role to bmp
+                    }
+                    if (crops.isEmpty()) continue
+                    val sheet = withContext(Dispatchers.Default) { Analyzer.contactSheetBitmap(crops) }
+                    files["vl_cross_candidate_${idx + 1}.png"] =
+                        withContext(Dispatchers.Default) { Analyzer.bitmapPng(sheet) }
+                    val decision = visionTrustGate.assessCrop(
+                        sheet,
+                        (listOf(CameraEnumerator.ROLE_MAIN) + okRoles).joinToString("+"),
+                        "grid=(${region.minX},${region.minY})-(${region.maxX},${region.maxY}), " +
+                            "area=${region.area}, meanConfidence=${fmt(region.meanConfidence)}",
+                    )
+                    vlDecisions += decision
+                    notes += "VL 후보 ${idx + 1}: ${decision.status} " +
+                        "conf ${pct(decision.confidence)} — ${decision.reason}"
+                    if (
+                        decision.status == VisionTrustGate.Status.TRUST_SCREEN &&
+                        decision.confidence >= 0.55f
+                    ) {
+                        agreement = withContext(Dispatchers.Default) {
+                            Analyzer.raiseConfidenceFloor(
+                                agreement,
+                                gw,
+                                gh,
+                                region,
+                                VL_RESTORED_CONFIDENCE_FLOOR,
+                            )
+                        }
+                    }
+                    sheet.recycle()
+                } finally {
+                    crops.forEach { (_, bmp) -> bmp.recycle() }
+                }
+            }
         }
         return CrossResult(
             agreement = agreement,
@@ -1441,6 +1797,7 @@ class MeasurementActivity : Activity() {
             roleStats = roleStats,
             files = files,
             notes = notes,
+            vlDecisions = vlDecisions,
         )
     }
 
@@ -1497,6 +1854,12 @@ class MeasurementActivity : Activity() {
             var accR: FloatArray? = null
             var accG: FloatArray? = null
             var accB: FloatArray? = null
+            var minR: FloatArray? = null
+            var minG: FloatArray? = null
+            var minB: FloatArray? = null
+            var maxR: FloatArray? = null
+            var maxG: FloatArray? = null
+            var maxB: FloatArray? = null
             for (file in store.files) {
                 val img = ImageOps.decodeLinearRgb(readCaptureFrame(file))
                 if (accR == null) {
@@ -1505,26 +1868,63 @@ class MeasurementActivity : Activity() {
                     accR = FloatArray(img.r.size)
                     accG = FloatArray(img.g.size)
                     accB = FloatArray(img.b.size)
+                    minR = FloatArray(img.r.size) { Float.MAX_VALUE }
+                    minG = FloatArray(img.g.size) { Float.MAX_VALUE }
+                    minB = FloatArray(img.b.size) { Float.MAX_VALUE }
+                    maxR = FloatArray(img.r.size) { -Float.MAX_VALUE }
+                    maxG = FloatArray(img.g.size) { -Float.MAX_VALUE }
+                    maxB = FloatArray(img.b.size) { -Float.MAX_VALUE }
                 } else {
                     require(img.w == width && img.h == height) { "프레임 크기 불일치" }
                 }
                 val r = accR!!
                 val g = accG!!
                 val b = accB!!
+                val rn = minR!!
+                val gn = minG!!
+                val bn = minB!!
+                val rx = maxR!!
+                val gx = maxG!!
+                val bx = maxB!!
                 for (i in r.indices) {
-                    r[i] += img.r[i]
-                    g[i] += img.g[i]
-                    b[i] += img.b[i]
+                    val rv = img.r[i]
+                    val gv = img.g[i]
+                    val bv = img.b[i]
+                    r[i] += rv
+                    g[i] += gv
+                    b[i] += bv
+                    if (rv < rn[i]) rn[i] = rv
+                    if (gv < gn[i]) gn[i] = gv
+                    if (bv < bn[i]) bn[i] = bv
+                    if (rv > rx[i]) rx[i] = rv
+                    if (gv > gx[i]) gx[i] = gv
+                    if (bv > bx[i]) bx[i] = bv
                 }
             }
             val r = accR ?: throw IllegalStateException("프레임 없음")
             val g = accG!!
             val b = accB!!
-            val n = store.files.size.toFloat()
-            for (i in r.indices) {
-                r[i] /= n
-                g[i] /= n
-                b[i] /= n
+            val n = store.files.size
+            if (n >= 4) {
+                val div = (n - 2).toFloat()
+                val rn = minR!!
+                val gn = minG!!
+                val bn = minB!!
+                val rx = maxR!!
+                val gx = maxG!!
+                val bx = maxB!!
+                for (i in r.indices) {
+                    r[i] = (r[i] - rn[i] - rx[i]) / div
+                    g[i] = (g[i] - gn[i] - gx[i]) / div
+                    b[i] = (b[i] - bn[i] - bx[i]) / div
+                }
+            } else {
+                val div = n.toFloat()
+                for (i in r.indices) {
+                    r[i] /= div
+                    g[i] /= div
+                    b[i] /= div
+                }
             }
             RgbImage(width, height, r, g, b)
         }
@@ -1698,6 +2098,9 @@ class MeasurementActivity : Activity() {
 
     override fun onDestroy() {
         scope.cancel()
+        if (visionTrustGateHolder.isInitialized()) {
+            runCatching { visionTrustGate.close() }
+        }
         capture?.close()
         capture = null
         super.onDestroy()

@@ -1,0 +1,29 @@
+# Local build state and generated artifacts
+**/.gradle/
+**/build/
+**/.kotlin/
+**/local.properties
+.idea/
+.vscode/
+.DS_Store
+*.iml
+*.apk
+*.aab
+*.class
+*.hprof
+
+# Credentials and signing material
+.env
+.env.*
+!.env.example
+*.jks
+*.keystore
+*.p12
+*.pem
+key.properties
+keystore.properties
+
+# Captures and experiment outputs: publish curated, consented datasets separately
+sessions/
+captures/
+reports/

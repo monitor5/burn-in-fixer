@@ -1,7 +1,0 @@
-com.burnin.scanner.app-pngs-0 /Users/gim-uhyeon/Documents/projectfolder/2025-2026/burn-in-fixer/burn-in-camera/app/build/generated/res/pngs/debug
-com.burnin.scanner.app-resValues-1 /Users/gim-uhyeon/Documents/projectfolder/2025-2026/burn-in-fixer/burn-in-camera/app/build/generated/res/resValues/debug
-com.burnin.scanner.app-packageDebugResources-2 /Users/gim-uhyeon/Documents/projectfolder/2025-2026/burn-in-fixer/burn-in-camera/app/build/intermediates/incremental/debug/packageDebugResources/merged.dir
-com.burnin.scanner.app-packageDebugResources-3 /Users/gim-uhyeon/Documents/projectfolder/2025-2026/burn-in-fixer/burn-in-camera/app/build/intermediates/incremental/debug/packageDebugResources/stripped.dir
-com.burnin.scanner.app-debug-4 /Users/gim-uhyeon/Documents/projectfolder/2025-2026/burn-in-fixer/burn-in-camera/app/build/intermediates/merged_res/debug/mergeDebugResources
-com.burnin.scanner.app-debug-5 /Users/gim-uhyeon/Documents/projectfolder/2025-2026/burn-in-fixer/burn-in-camera/app/src/debug/res
-com.burnin.scanner.app-main-6 /Users/gim-uhyeon/Documents/projectfolder/2025-2026/burn-in-fixer/burn-in-camera/app/src/main/res

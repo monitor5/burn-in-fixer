@@ -9,7 +9,7 @@ android {
 
     defaultConfig {
         applicationId = "com.burnin.scanner"
-        minSdk = 24
+        minSdk = 26
         targetSdk = 33
         versionCode = 1
         versionName = "0.1.0"
@@ -33,5 +33,6 @@ android {
 
 dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+    implementation("com.google.mlkit:genai-prompt:1.0.0-beta2")
     testImplementation("junit:junit:4.13.2")
 }

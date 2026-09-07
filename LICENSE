@@ -1,0 +1,123 @@
+Burn-in-fixer Noncommercial Research and Education License
+Version 1.0, 7 September 2026
+SPDX-License-Identifier: LicenseRef-BurnInFixer-NC-Research-1.0
+
+Copyright (c) 2026 the burn-in-fixer contributors.
+
+This is a custom source-available license, not an OSI-approved open source
+license. The English text of this file controls. Explanatory documentation
+and translations do not modify these terms.
+
+1. Definitions and scope
+
+"Material" means the original source code, documentation, and other original
+files in this repository made available under this license. Third-party
+software, models, data, trademarks, and files identified as separately licensed
+are excluded and remain governed by their respective terms.
+
+"Licensor" means each copyright holder granting rights in their own Material.
+No contributor grants rights in material owned by another person.
+
+"Permitted Purpose" means noncommercial scientific or academic investigation,
+reproducibility studies, teaching, coursework, or personal learning experiments.
+The activity must not be primarily intended for or directed toward commercial
+advantage or monetary compensation. An organization's nonprofit or academic
+status alone does not make every activity a Permitted Purpose.
+
+Ordinary tuition-supported teaching and publicly disseminated, noncommercial
+grant-funded academic research are Permitted Purposes. Commercial product
+research, proprietary sponsor-directed development, paid device testing or
+repair, refurbishment for resale, business operations, and development or
+provision of commercial products or services are not Permitted Purposes.
+General-purpose personal use unrelated to research, education, or learning is
+not licensed by this grant.
+
+2. Limited copyright grant
+
+Subject to these terms, each Licensor grants a worldwide, royalty-free,
+nonexclusive copyright license to use, run, reproduce, study, modify, and
+prepare derivative works of their Material solely for a Permitted Purpose.
+You may share unmodified or modified Material, in source or compiled form,
+without charging for access to that Material, subject to Section 3.
+
+Publication of research findings, papers, figures, and measurements, including
+in subscription journals, is allowed. This license does not claim ownership
+of independently created research outputs. Material copied into such outputs
+remains subject to this license, and third-party rights remain unaffected.
+
+3. Redistribution
+
+Every redistribution of Material or a derivative work must include this
+LICENSE and retain applicable copyright, attribution, and third-party notices.
+Clearly identify your modifications and their date. License the Material and
+your modifications to it under these same terms; do not grant broader rights
+in the Material. When distributing compiled derivatives, make the corresponding
+source code, including your modifications and build instructions, available
+to recipients without an additional charge.
+
+These conditions apply to the Material and modifications of it, not to
+independent works merely distributed alongside it. Recipients receive this
+limited grant directly from the relevant Licensors.
+
+4. Uses requiring separate permission
+
+Commercial use, sale of the Material, incorporation into commercial products
+or services, commercial R&D, paid calibration or repair services, and other
+uses outside a Permitted Purpose require prior written permission from the
+relevant copyright holders. Contact the repository maintainers through the
+repository for permission requests. Silence is not permission.
+
+5. Patents, trademarks, and third-party rights
+
+This license grants copyright permissions only. It grants no express patent
+license, trademark license, right to a manufacturer's proprietary software,
+firmware, service materials, or confidential information, or permission to
+bypass access controls. You are responsible for any additional permissions
+required by applicable law and third-party terms. Nothing in this license
+limits rights or exceptions you already have under applicable law.
+
+Samsung Electronics, Samsung Display, and their affiliates do not sponsor,
+endorse, certify, or affiliate with this independent project. Product and
+company names are used for identification only and belong to their respective
+owners. Do not imply endorsement by a contributor, institution, or manufacturer.
+
+An academic or noncommercial purpose does not itself establish noninfringement
+or immunity from third-party claims. This license is not a patent clearance,
+legal opinion, safety certification, or manufacturer warranty.
+
+6. No warranty
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE MATERIAL IS PROVIDED
+"AS IS", WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, EXPRESS OR IMPLIED,
+INCLUDING TITLE, NON-INFRINGEMENT, MERCHANTABILITY, FITNESS FOR A PARTICULAR
+PURPOSE, MEASUREMENT ACCURACY, DEVICE COMPATIBILITY, OR CORRECTION EFFECTIVENESS.
+The Material is experimental and does not physically restore degraded OLED
+pixels. You are responsible for deciding whether it is appropriate to use.
+
+7. Limitation of liability
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, NO LICENSOR OR CONTRIBUTOR
+IS LIABLE FOR DAMAGES ARISING FROM USE, MODIFICATION, OR DISTRIBUTION OF THE
+MATERIAL, INCLUDING DEVICE DAMAGE, DATA LOSS, OR LOSS OF PROFITS, WHETHER IN
+CONTRACT, TORT, OR OTHERWISE. This clause does not exclude liability that
+cannot lawfully be excluded. It does not bind third-party rights holders or
+prevent them from asserting their rights.
+
+8. Termination
+
+The rights granted to you terminate upon your breach of these terms. If this
+is your first breach and you cure it within 30 days after becoming aware of
+it, the rights are automatically reinstated. Otherwise, reinstatement requires
+written permission from the relevant Licensor. Termination of your rights does
+not terminate the rights of recipients who comply with this license.
+
+9. Contributions and reserved rights
+
+By intentionally submitting Material for inclusion in this project, unless
+you state otherwise before submission and the maintainers agree, you offer
+your contribution under this license and represent that you are authorized
+to do so. You retain ownership of your contribution. No ownership assignment
+or authority to relicense other contributors' work is implied.
+
+All rights not expressly granted are reserved. If a provision is unenforceable,
+the remaining provisions continue to apply to the extent permitted by law.
