@@ -122,4 +122,25 @@ class CameraEnumeratorTest {
         assertTrue(CameraEnumerator.suitabilityNotes(80f, null).any { it.contains("고정초점") })
         assertTrue(CameraEnumerator.suitabilityNotes(80f, 30f).any { it.contains("최단 초점") })
     }
+    @Test fun exactFovBoundariesAndInvalidValuesHaveStableRoles() {
+        assertEquals("망원",CameraEnumerator.roleName(54.999f))
+        assertEquals("광각",CameraEnumerator.roleName(55f))
+        assertEquals("광각",CameraEnumerator.roleName(94.999f))
+        assertEquals("초광각",CameraEnumerator.roleName(95f))
+        for(value in listOf(Float.NaN,Float.POSITIVE_INFINITY,0f,-1f)) {
+            assertEquals("화각미상",CameraEnumerator.roleName(value))
+            assertEquals(0f,CameraEnumerator.fovDeg(value,5f),0f)
+        }
+    }
+
+    @Test fun unusableLargestLogicalGroupDoesNotHideAValidSmallerSet() {
+        val redundant=(1..3).map{choice("wide$it",80f,4000,3000,openId="bad")}
+        val valid=listOf(choice("main",80f,4000,3000,openId="good"),choice("ultra",120f,4000,3000,openId="good"))
+        for(choices in listOf(redundant+valid,(redundant+valid).reversed())) {
+            val result=CameraEnumerator.selectTriSet(choices)!!
+            assertEquals("good",result.openId);assertEquals(2,result.roleCount)
+            assertEquals(listOf(CameraEnumerator.ROLE_MAIN,CameraEnumerator.ROLE_ULTRA_WIDE),result.roles().map{it.first})
+        }
+    }
+
 }

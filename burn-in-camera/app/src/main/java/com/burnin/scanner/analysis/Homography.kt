@@ -8,7 +8,9 @@ class Homography private constructor(private val m: DoubleArray) {
 
     /** (u,v) 화면 좌표 → 이미지 좌표 (out[0]=x, out[1]=y) */
     fun map(u: Double, v: Double, out: DoubleArray) {
+        require(out.size >= 2 && u.isFinite() && v.isFinite()) { "invalid projection input" }
         val w = m[6] * u + m[7] * v + 1.0
+        require(w.isFinite() && Math.abs(w) > 1e-12) { "projection is at infinity" }
         out[0] = (m[0] * u + m[1] * v + m[2]) / w
         out[1] = (m[3] * u + m[4] * v + m[5]) / w
     }
@@ -20,6 +22,7 @@ class Homography private constructor(private val m: DoubleArray) {
          */
         fun from4Points(src: Array<Vec2>, dst: Array<Vec2>): Homography? {
             require(src.size == 4 && dst.size == 4)
+            if ((src.asList() + dst.asList()).any { !it.x.isFinite() || !it.y.isFinite() }) return null
             val a = Array(8) { DoubleArray(9) }
             for (k in 0 until 4) {
                 fillRows(a, k * 2, src[k], dst[k])
@@ -35,6 +38,7 @@ class Homography private constructor(private val m: DoubleArray) {
         fun fromPointPairs(src: List<Vec2>, dst: List<Vec2>): Homography? {
             require(src.size == dst.size) { "point-pair size mismatch" }
             require(src.size >= 4) { "at least four point pairs required" }
+            if ((src + dst).any { !it.x.isFinite() || !it.y.isFinite() }) return null
             val normal = Array(8) { DoubleArray(9) }
             val rows = Array(2) { DoubleArray(9) }
             for (i in src.indices) {
@@ -83,7 +87,7 @@ class Homography private constructor(private val m: DoubleArray) {
                     for (c in col..n) aug[r][c] -= f * aug[col][c]
                 }
             }
-            return DoubleArray(8) { aug[it][8] }
+            return DoubleArray(8) { aug[it][8] }.takeIf { values -> values.all { it.isFinite() } }
         }
     }
 }

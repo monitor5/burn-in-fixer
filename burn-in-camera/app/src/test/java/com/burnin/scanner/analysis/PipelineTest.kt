@@ -435,17 +435,11 @@ class PipelineTest {
         val h = Analyzer.buildHomography(det.quad, 400, 640)
         assertNotNull(h)
         val out = DoubleArray(2)
-        // 화면 (0,0) → 사각형의 어느 모서리든 3px 내에 사상되어야 한다
+        // 화면 (0,0)은 90도 회전 규칙에 따라 이미지 TR로 사상되어야 한다.
         h!!.map(0.0, 0.0, out)
-        val corners = listOf(
-            doubleArrayOf(left.toDouble(), top.toDouble()),
-            doubleArrayOf(right.toDouble(), top.toDouble()),
-            doubleArrayOf(right.toDouble(), bottom.toDouble()),
-            doubleArrayOf(left.toDouble(), bottom.toDouble()),
-        )
         assertTrue(
             "회전 대응 실패: (${out[0]}, ${out[1]})",
-            corners.any { Math.abs(it[0] - out[0]) < 3 && Math.abs(it[1] - out[1]) < 3 },
+            Math.abs(right - out[0]) < 3 && Math.abs(top - out[1]) < 3,
         )
     }
 }

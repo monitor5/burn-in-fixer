@@ -74,11 +74,11 @@ object CameraEnumerator {
 
     /** 센서 가로 크기(mm)와 초점거리(mm)로 수평 화각 계산 */
     fun fovDeg(sensorWidthMm: Float, focalMm: Float): Float =
-        if (sensorWidthMm <= 0f || focalMm <= 0f) 0f
+        if (!sensorWidthMm.isFinite() || !focalMm.isFinite() || sensorWidthMm <= 0f || focalMm <= 0f) 0f
         else Math.toDegrees(2.0 * Math.atan((sensorWidthMm / (2.0 * focalMm)))).toFloat()
 
     fun roleName(fovDeg: Float): String = when {
-        fovDeg <= 0f -> "화각미상"
+        !fovDeg.isFinite() || fovDeg <= 0f -> "화각미상"
         fovDeg >= 95f -> "초광각"
         fovDeg >= 55f -> "광각"
         else -> "망원"
@@ -110,10 +110,12 @@ object CameraEnumerator {
         val grouped = choices
             .filter { it.source == Source.LOGICAL_PHYSICAL && it.physicalId != null }
             .groupBy { it.openId }
-        val group = grouped.maxByOrNull { it.value.size }?.value ?: return null
-        if (group.isEmpty()) return null
-
         val listedBack = choices.filter { it.source == Source.LISTED && it.physicalId == null }
+        return grouped.values.sortedByDescending { it.size }
+            .firstNotNullOfOrNull { selectFromGroup(it, listedBack, concurrentSets) }
+    }
+
+    private fun selectFromGroup(group: List<CameraChoice>, listedBack: List<CameraChoice>, concurrentSets: List<Set<String>>): TriSelection? {
         val ultraFromGroup = group.filter { it.fovDeg >= 95f }.maxByOrNull { it.fovDeg }
         val ultraFromListed = listedBack
             .filter { listed ->

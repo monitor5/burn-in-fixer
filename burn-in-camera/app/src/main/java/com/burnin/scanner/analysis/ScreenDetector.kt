@@ -43,6 +43,7 @@ object ScreenDetector {
     data class Result(val quad: Quad, val areaRatio: Float, val threshold: Float)
 
     fun detect(img: GrayImage): Result? {
+        if (img.data.any { !it.isFinite() || it < 0f }) return null
         // p99 추정 (히스토그램 1024 bin)
         val bins = IntArray(1024)
         var maxV = 1e-6f
@@ -63,35 +64,49 @@ object ScreenDetector {
         val threshold = p99 * 0.30f
         if (p99 < 0.005f) return null // 화면이 너무 어두움 (패턴 미표시?)
 
-        var minSum = Float.MAX_VALUE
-        var maxSum = -Float.MAX_VALUE
-        var minDiff = Float.MAX_VALUE
-        var maxDiff = -Float.MAX_VALUE
-        val tl = Vec2()
-        val br = Vec2()
-        val bl = Vec2()
-        val tr = Vec2()
+        // Use one connected screen component; isolated glare must not move its corners.
+        val seen = BooleanArray(total)
+        val queue = IntArray(total)
         var count = 0
-
-        var i = 0
-        for (y in 0 until img.h) {
-            for (x in 0 until img.w) {
-                if (img.data[i] > threshold) {
-                    count++
-                    val s = (x + y).toFloat()
-                    val d = (x - y).toFloat()
-                    if (s < minSum) { minSum = s; tl.set(x.toFloat(), y.toFloat()) }
-                    if (s > maxSum) { maxSum = s; br.set(x.toFloat(), y.toFloat()) }
-                    if (d > maxDiff) { maxDiff = d; tr.set(x.toFloat(), y.toFloat()) }
-                    if (d < minDiff) { minDiff = d; bl.set(x.toFloat(), y.toFloat()) }
+        var bestCorners: Array<Vec2>? = null
+        for (start in img.data.indices) {
+            if (seen[start] || img.data[start] <= threshold) continue
+            var head = 0
+            var tail = 1
+            queue[0] = start
+            seen[start] = true
+            var minSum = Float.MAX_VALUE
+            var maxSum = -Float.MAX_VALUE
+            var minDiff = Float.MAX_VALUE
+            var maxDiff = -Float.MAX_VALUE
+            val tl = Vec2(); val tr = Vec2(); val br = Vec2(); val bl = Vec2()
+            while (head < tail) {
+                val index = queue[head++]
+                val x = index % img.w
+                val y = index / img.w
+                val sum = (x + y).toFloat()
+                val diff = (x - y).toFloat()
+                if (sum < minSum) { minSum = sum; tl.set(x.toFloat(), y.toFloat()) }
+                if (sum > maxSum) { maxSum = sum; br.set(x.toFloat(), y.toFloat()) }
+                if (diff > maxDiff) { maxDiff = diff; tr.set(x.toFloat(), y.toFloat()) }
+                if (diff < minDiff) { minDiff = diff; bl.set(x.toFloat(), y.toFloat()) }
+                fun add(next: Int) {
+                    if (!seen[next] && img.data[next] > threshold) {
+                        seen[next] = true
+                        queue[tail++] = next
+                    }
                 }
-                i++
+                if (x > 0) add(index - 1)
+                if (x + 1 < img.w) add(index + 1)
+                if (y > 0) add(index - img.w)
+                if (y + 1 < img.h) add(index + img.w)
             }
+            if (tail > count) { count = tail; bestCorners = arrayOf(tl, tr, br, bl) }
         }
 
         if (count < total * 0.05f) return null // 밝은 영역이 프레임의 5% 미만
 
-        val quad = Quad(arrayOf(tl, tr, br, bl))
+        val quad = Quad(bestCorners ?: return null)
         val areaRatio = quad.area() / (img.w * img.h).toFloat()
         if (areaRatio < 0.05f || areaRatio > 0.99f) return null
         return Result(quad, areaRatio, threshold)

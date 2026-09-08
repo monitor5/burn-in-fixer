@@ -6,22 +6,26 @@ import com.burnin.scanner.camera.CaptureFrame
 
 /** 선형 휘도(0~1) 그레이스케일 이미지. */
 class GrayImage(val w: Int, val h: Int, val data: FloatArray) {
+    init { requireImageShape(w, h, data.size) }
 
     operator fun get(x: Int, y: Int): Float = data[y * w + x]
 
     /** 이중선형 보간 샘플 (범위 밖은 가장자리 클램프) */
     fun bilinear(fx: Float, fy: Float): Float {
-        val x = fx.coerceIn(0f, w - 1.001f)
-        val y = fy.coerceIn(0f, h - 1.001f)
+        require(fx.isFinite() && fy.isFinite()) { "sample coordinates must be finite" }
+        val x = fx.coerceIn(0f, (w - 1).toFloat())
+        val y = fy.coerceIn(0f, (h - 1).toFloat())
         val x0 = x.toInt()
         val y0 = y.toInt()
         val dx = x - x0
         val dy = y - y0
+        val x1 = (x0 + 1).coerceAtMost(w - 1)
+        val y1 = (y0 + 1).coerceAtMost(h - 1)
         val i = y0 * w + x0
         val a = data[i]
-        val b = data[i + 1]
-        val c = data[i + w]
-        val d = data[i + w + 1]
+        val b = data[y0 * w + x1]
+        val c = data[y1 * w + x0]
+        val d = data[y1 * w + x1]
         return (a * (1 - dx) + b * dx) * (1 - dy) + (c * (1 - dx) + d * dx) * dy
     }
 }
@@ -34,6 +38,11 @@ class RgbImage(
     val g: FloatArray,
     val b: FloatArray,
 ) {
+    init {
+        requireImageShape(w, h, r.size)
+        require(g.size == r.size && b.size == r.size) { "RGB channel size mismatch" }
+    }
+
     fun bilinearChannel(fx: Float, fy: Float, channel: Int): Float {
         val data = when (channel) {
             0 -> r
@@ -41,17 +50,20 @@ class RgbImage(
             2 -> b
             else -> throw IllegalArgumentException("channel must be 0, 1, or 2")
         }
-        val x = fx.coerceIn(0f, w - 1.001f)
-        val y = fy.coerceIn(0f, h - 1.001f)
+        require(fx.isFinite() && fy.isFinite()) { "sample coordinates must be finite" }
+        val x = fx.coerceIn(0f, (w - 1).toFloat())
+        val y = fy.coerceIn(0f, (h - 1).toFloat())
         val x0 = x.toInt()
         val y0 = y.toInt()
         val dx = x - x0
         val dy = y - y0
+        val x1 = (x0 + 1).coerceAtMost(w - 1)
+        val y1 = (y0 + 1).coerceAtMost(h - 1)
         val i = y0 * w + x0
         val a = data[i]
-        val bb = data[i + 1]
-        val c = data[i + w]
-        val d = data[i + w + 1]
+        val bb = data[y0 * w + x1]
+        val c = data[y1 * w + x0]
+        val d = data[y1 * w + x1]
         return (a * (1 - dx) + bb * dx) * (1 - dy) + (c * (1 - dx) + d * dx) * dy
     }
 }
@@ -65,14 +77,14 @@ object ImageOps {
         when (frame.format) {
             ImageFormat.YUV_420_888 -> decodeYuvLinearGray(frame, maxLongEdge)
             ImageFormat.JPEG -> decodeLinearGray(frame.planes[0].bytes, maxLongEdge)
-            else -> decodeLinearGray(frame.planes[0].bytes, maxLongEdge)
+            else -> throw IllegalArgumentException("지원하지 않는 이미지 형식: ${frame.format}")
         }
 
     fun decodeLinearRgb(frame: CaptureFrame, maxLongEdge: Int = 1600): RgbImage =
         when (frame.format) {
             ImageFormat.YUV_420_888 -> decodeYuvLinearRgb(frame, maxLongEdge)
             ImageFormat.JPEG -> decodeLinearRgb(frame.planes[0].bytes, maxLongEdge)
-            else -> decodeLinearRgb(frame.planes[0].bytes, maxLongEdge)
+            else -> throw IllegalArgumentException("지원하지 않는 이미지 형식: ${frame.format}")
         }
 
     /**
@@ -81,6 +93,7 @@ object ImageOps {
      * (분석 그리드가 저주파이므로 충분한 해상도)
      */
     fun decodeLinearGray(jpeg: ByteArray, maxLongEdge: Int = 1600): GrayImage {
+        require(maxLongEdge > 0) { "maxLongEdge must be positive" }
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, bounds)
         var sample = 1
@@ -107,6 +120,7 @@ object ImageOps {
     }
 
     fun decodeLinearRgb(jpeg: ByteArray, maxLongEdge: Int = 1600): RgbImage {
+        require(maxLongEdge > 0) { "maxLongEdge must be positive" }
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, bounds)
         var sample = 1
@@ -150,6 +164,7 @@ object ImageOps {
         val outW = Math.max(1, (frame.width + sample - 1) / sample)
         val outH = Math.max(1, (frame.height + sample - 1) / sample)
         val yPlane = frame.planes[0]
+        validatePlane(yPlane, frame.width, frame.height)
         val out = FloatArray(outW * outH)
         var i = 0
         for (oy in 0 until outH) {
@@ -187,6 +202,9 @@ object ImageOps {
         val vPlane = frame.planes[2]
         val chromaW = (frame.width + 1) / 2
         val chromaH = (frame.height + 1) / 2
+        validatePlane(yPlane, frame.width, frame.height)
+        validatePlane(uPlane, chromaW, chromaH)
+        validatePlane(vPlane, chromaW, chromaH)
         val r = FloatArray(outW * outH)
         val g = FloatArray(outW * outH)
         val b = FloatArray(outW * outH)
@@ -233,14 +251,23 @@ object ImageOps {
     }
 
     private fun yuvSample(width: Int, height: Int, maxLongEdge: Int): Int {
+        require(width > 0 && height > 0 && maxLongEdge > 0)
         var sample = 1
         while (maxOf(width, height) / (sample * 2) >= maxLongEdge) sample *= 2
         return sample
     }
 
+    private fun validatePlane(plane: CaptureFrame.Plane, width: Int, height: Int) {
+        require(plane.rowStride > 0 && plane.pixelStride > 0)
+        val rowBytes = (width - 1L) * plane.pixelStride + 1L
+        require(plane.rowStride >= rowBytes) { "overlapping plane rows" }
+        val required = (height - 1L) * plane.rowStride + rowBytes
+        require(required <= plane.bytes.size) { "truncated plane" }
+    }
+
     private fun planeByte(plane: CaptureFrame.Plane, x: Int, y: Int): Int {
         val index = y * plane.rowStride + x * plane.pixelStride
-        return plane.bytes[index.coerceIn(0, plane.bytes.size - 1)].toInt() and 0xFF
+        return plane.bytes[index].toInt() and 0xFF
     }
 
     private fun videoRangeY(y: Int): Float =
@@ -284,4 +311,8 @@ object ImageOps {
         }
         return RgbImage(w, h, r, g, b)
     }
+}
+
+private fun requireImageShape(w: Int, h: Int, size: Int) {
+    require(w > 0 && h > 0 && w.toLong() * h == size.toLong()) { "image size mismatch" }
 }

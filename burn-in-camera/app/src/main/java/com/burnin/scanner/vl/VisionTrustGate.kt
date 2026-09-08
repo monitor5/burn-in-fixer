@@ -7,6 +7,7 @@ import com.google.mlkit.genai.prompt.GenerateContentRequest
 import com.google.mlkit.genai.prompt.Generation
 import com.google.mlkit.genai.prompt.ImagePart
 import com.google.mlkit.genai.prompt.TextPart
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
@@ -72,7 +73,9 @@ class VisionTrustGate(
             parseDecision(response.candidates.firstOrNull()?.text.orEmpty())
         } catch (e: TimeoutCancellationException) {
             Decision(Status.UNAVAILABLE, 0f, "VL timeout", e.message.orEmpty())
-        } catch (e: Throwable) {
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
             Decision(Status.UNAVAILABLE, 0f, unavailableReason(e), e.toString())
         }
     }
@@ -94,7 +97,11 @@ class VisionTrustGate(
                 }
                 completed || model.checkStatus() == FeatureStatus.AVAILABLE
             }
-        } catch (_: Throwable) {
+        } catch (_: TimeoutCancellationException) {
+            false
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
             false
         }
     }
@@ -123,17 +130,16 @@ class VisionTrustGate(
                 cleaned
             }
             val obj = runCatching { JSONObject(jsonText) }.getOrNull()
-            val statusText = obj?.optString("status")?.lowercase() ?: cleaned.lowercase()
-            val status = when {
-                "trust_screen" in statusText || "screen_defect" in statusText || "burn_in" in statusText ->
-                    Status.TRUST_SCREEN
-                "untrust_capture" in statusText || "camera_artifact" in statusText || "moire" in statusText ||
-                    "flicker" in statusText || "reflection" in statusText || "blur" in statusText ->
-                    Status.UNTRUST_CAPTURE
+            val statusText = obj?.optString("status")?.trim()?.lowercase(java.util.Locale.ROOT)
+                ?: cleaned.lowercase(java.util.Locale.ROOT)
+            val status = when (statusText) {
+                "trust_screen", "screen_defect", "burn_in" -> Status.TRUST_SCREEN
+                "untrust_capture", "camera_artifact", "moire", "flicker", "reflection", "blur" -> Status.UNTRUST_CAPTURE
                 else -> Status.UNCERTAIN
             }
-            val confidence = obj?.optDouble("confidence", 0.5)?.toFloat()
-                ?: if (status == Status.UNCERTAIN) 0.3f else 0.5f
+            val confidence = (obj?.optDouble("confidence", 0.0)?.toFloat()
+                ?: if (status == Status.UNCERTAIN) 0f else 0.5f)
+                .takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 0f
             val reason = obj?.optString("reason")?.takeIf { it.isNotBlank() } ?: cleaned.take(180)
             return Decision(status, confidence.coerceIn(0f, 1f), reason, text)
         }

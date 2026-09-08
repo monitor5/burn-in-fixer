@@ -228,20 +228,9 @@ class ColorCalibrationActivity : Activity() {
     }
 
     private fun computeGains(reference: RgbMean, adjustment: RgbMean): ChannelGains {
-        val eps = 1e-6
-        val desiredR = reference.r / adjustment.r.coerceAtLeast(eps)
-        val desiredG = reference.g / adjustment.g.coerceAtLeast(eps)
-        val desiredB = reference.b / adjustment.b.coerceAtLeast(eps)
-        val normalizer = max(1.0, max(desiredR, max(desiredG, desiredB)))
-        val minGain = 1.0 - MAX_WB_ATTENUATION
-        val raw = doubleArrayOf(desiredR / normalizer, desiredG / normalizer, desiredB / normalizer)
-        val clipped = raw.any { it < minGain }
-        return ChannelGains(
-            r = raw[0].coerceIn(minGain, 1.0),
-            g = raw[1].coerceIn(minGain, 1.0),
-            b = raw[2].coerceIn(minGain, 1.0),
-            clipped = clipped,
-        )
+        val gains = WhiteBalanceMath.compute(doubleArrayOf(reference.r, reference.g, reference.b),
+            doubleArrayOf(adjustment.r, adjustment.g, adjustment.b), MAX_WB_ATTENUATION.toDouble())
+        return ChannelGains(gains.r, gains.g, gains.b, gains.clipped)
     }
 
     private fun detectBrightQuad(img: RgbImage): ScreenDetector.Quad? {

@@ -47,4 +47,23 @@ class ScreenDetectorTest {
         val img = brightRect(400, 300, 190, 140, 210, 160)
         assertNull(ScreenDetector.detect(img))
     }
+    @Test fun isolatedReflectionCannotExpandDetectedScreen() {
+        val img=brightRect(400,300,60,40,340,260)
+        img.data[0]=1f;img.data[img.data.lastIndex]=1f
+        val quad=ScreenDetector.detect(img)!!.quad
+        assertEquals(60f,quad.tl.x,1f);assertEquals(40f,quad.tl.y,1f)
+        assertEquals(339f,quad.br.x,1f);assertEquals(259f,quad.br.y,1f)
+    }
+
+    @Test fun disconnectedSmallHighlightsCannotCombineIntoAScreen() {
+        val img=GrayImage(200,200,FloatArray(40000))
+        for(y in 0 until 200 step 4) for(x in 0 until 200 step 4) img.data[y*200+x]=1f
+        assertNull(ScreenDetector.detect(img))
+    }
+
+    @Test fun nonFiniteImageCannotProduceValidGeometry() {
+        val img=brightRect(200,150,20,20,180,130);img.data[0]=Float.NaN
+        assertNull(ScreenDetector.detect(img))
+    }
+
 }

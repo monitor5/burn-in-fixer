@@ -65,7 +65,7 @@ object CorrectionStore {
         private set
 
     private fun dir(context: Context): File =
-        File(context.filesDir, "profiles/current").apply { mkdirs() }
+        ProfileFiles.recover(File(context.filesDir, "profiles/current"))
 
     fun md5(bytes: ByteArray): String =
         MessageDigest.getInstance("MD5").digest(bytes).joinToString("") { "%02x".format(it) }
@@ -93,7 +93,27 @@ object CorrectionStore {
         sourceDevice: String,
         rgbChecksumMd5: String = "",
         rgbDataBase64: String? = null,
+    ): String? = applyValidated(context, width, height, maxAttenuation, defaultStrengthPct,
+        checksumMd5, dataBase64, sourceDevice, rgbChecksumMd5, rgbDataBase64)
+
+
+    @Synchronized
+    private fun applyValidated(
+        context: Context,
+        width: Int,
+        height: Int,
+        maxAttenuation: Double,
+        defaultStrengthPct: Int,
+        checksumMd5: String,
+        dataBase64: String,
+        sourceDevice: String,
+        rgbChecksumMd5: String = "",
+        rgbDataBase64: String? = null,
+        persist: Boolean = true,
+        restoredCreatedAt: String? = null,
     ): String? {
+        if (width <= 0 || height <= 0 || defaultStrengthPct !in 0..100) return "프로파일 메타데이터 범위 오류"
+        if (rgbDataBase64.isNullOrBlank() && rgbChecksumMd5.isNotEmpty()) return "RGB 데이터 누락"
         val png: ByteArray = try {
             Base64.decode(dataBase64, Base64.DEFAULT)
         } catch (e: Exception) {
@@ -153,20 +173,22 @@ object CorrectionStore {
                 ?: return "RGB PNG 디코드 실패"
         }
 
-        val d = dir(context)
-        File(d, "correction_alpha.png").writeBytes(png)
-        val rgbFile = File(d, "correction_rgb.png")
-        if (rgbPng != null) rgbFile.writeBytes(rgbPng) else rgbFile.delete()
         val m = Meta(
-            width, height, maxAttenuation, defaultStrengthPct, checksumMd5, rgbChecksumMd5,
-            createdAt = java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssZ", java.util.Locale.US)
+            width, height, maxAttenuation, defaultStrengthPct, md5(png), rgbPng?.let { md5(it) }.orEmpty(),
+            createdAt = restoredCreatedAt ?: java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssZ", java.util.Locale.US)
                 .format(java.util.Date()),
             sourceDevice = sourceDevice,
         )
-        File(d, "metadata.json").writeText(m.toJson().toString(2))
-
-        bakedBitmap?.recycle()
-        rgbAttenuationBitmap?.recycle()
+        try {
+            val files = linkedMapOf("correction_alpha.png" to png, "metadata.json" to m.toJson().toString(2).toByteArray(Charsets.UTF_8))
+            if (rgbPng != null) files["correction_rgb.png"] = rgbPng
+            if (persist) ProfileFiles.replace(dir(context), files)
+        } catch (e: Exception) {
+            baked.recycle()
+            rgbBitmap?.recycle()
+            return "프로파일 저장 실패: ${e.message}"
+        }
+        // Views may still be drawing the previous bitmap; let its last owner release it.
         meta = m
         bakedBitmap = baked
         rgbAttenuationBitmap = rgbBitmap
@@ -191,29 +213,17 @@ object CorrectionStore {
     }
 
     /** 앱 재시작 시 저장된 프로파일을 다시 적재한다. */
+    @Synchronized
     fun loadFromDisk(context: Context): Boolean {
         return try {
             val d = dir(context)
-            val metaFile = File(d, "metadata.json")
-            val pngFile = File(d, "correction_alpha.png")
-            if (!metaFile.exists() || !pngFile.exists()) return false
-            val m = Meta.fromJson(JSONObject(metaFile.readText()))
-            val src = BitmapFactory.decodeFile(pngFile.absolutePath) ?: return false
-            val baked = bake(src, m.maxAttenuation)
-            src.recycle()
-            val rgbFile = File(d, "correction_rgb.png")
-            val rgb = if (rgbFile.exists()) {
-                BitmapFactory.decodeFile(rgbFile.absolutePath)?.copy(Bitmap.Config.ARGB_8888, false)
-            } else {
-                null
-            }
-            bakedBitmap?.recycle()
-            rgbAttenuationBitmap?.recycle()
-            meta = m
-            bakedBitmap = baked
-            rgbAttenuationBitmap = rgb
-            AppLog.i("저장된 보정 프로파일 적재: ${m.width}x${m.height}, RGB ${rgb != null}")
-            true
+            val m = Meta.fromJson(JSONObject(File(d, "metadata.json").readText()))
+            val png = File(d, "correction_alpha.png").readBytes()
+            val rgb = File(d, "correction_rgb.png").takeIf { it.exists() }?.readBytes()
+            applyValidated(context, m.width, m.height, m.maxAttenuation, m.defaultStrengthPct,
+                m.checksumMd5, Base64.encodeToString(png, Base64.NO_WRAP), m.sourceDevice,
+                m.rgbChecksumMd5, rgb?.let { Base64.encodeToString(it, Base64.NO_WRAP) },
+                persist = false, restoredCreatedAt = m.createdAt) == null
         } catch (e: Exception) {
             AppLog.i("프로파일 적재 실패: ${e.message}")
             false

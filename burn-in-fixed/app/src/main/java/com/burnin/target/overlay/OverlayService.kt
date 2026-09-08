@@ -14,6 +14,7 @@ import android.os.IBinder
 import android.provider.Settings
 import android.view.WindowManager
 import android.widget.ImageView
+import com.burnin.target.DeviceRole
 import com.burnin.target.correction.CorrectionStore
 import com.burnin.target.util.AppLog
 
@@ -37,6 +38,7 @@ class OverlayService : Service() {
 
         /** 시작 요청. 반환값: null = 요청됨, 문자열 = 불가 사유 */
         fun requestStart(context: Context, strengthPct: Int): String? {
+            if (DeviceRole.isReference(context)) return "대조설비에는 보정을 적용할 수 없음"
             if (CorrectionStore.bakedBitmap == null && !CorrectionStore.loadFromDisk(context)) {
                 return "적재된 보정맵 없음"
             }
@@ -67,7 +69,7 @@ class OverlayService : Service() {
         startForeground(NOTI_ID, buildNotification())
 
         val bmp = CorrectionStore.bakedBitmap
-        if (bmp == null || !Settings.canDrawOverlays(this)) {
+        if (bmp == null || DeviceRole.isReference(this) || !Settings.canDrawOverlays(this)) {
             AppLog.i("오버레이 시작 불가 (맵 또는 권한 없음)")
             stopSelf()
             return START_NOT_STICKY
@@ -111,6 +113,7 @@ class OverlayService : Service() {
                 stopSelf()
             }
         } else {
+            overlayView?.setImageBitmap(bmp)
             overlayView?.imageAlpha = strength * 255 / 100
             AppLog.i("오버레이 강도 변경: $strength%")
         }

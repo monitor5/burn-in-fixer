@@ -59,7 +59,7 @@ object WhiteBalanceStore {
         private set
 
     private fun dir(context: Context): File =
-        File(context.filesDir, "profiles/white_balance").apply { mkdirs() }
+        ProfileFiles.recover(File(context.filesDir, "profiles/white_balance"))
 
     fun applyFromBase64(
         context: Context,
@@ -72,7 +72,27 @@ object WhiteBalanceStore {
         redGain: Double,
         greenGain: Double,
         blueGain: Double,
+    ): String? = applyValidated(context, width, height, maxAttenuation, checksumMd5,
+        dataBase64, sourceDevice, redGain, greenGain, blueGain)
+
+
+    @Synchronized
+    private fun applyValidated(
+        context: Context,
+        width: Int,
+        height: Int,
+        maxAttenuation: Double,
+        checksumMd5: String,
+        dataBase64: String,
+        sourceDevice: String,
+        redGain: Double,
+        greenGain: Double,
+        blueGain: Double,
+        persist: Boolean = true,
+        restoredCreatedAt: String? = null,
     ): String? {
+        if (width <= 0 || height <= 0 || listOf(redGain, greenGain, blueGain).any { !it.isFinite() || it !in 0.0..1.0 }) return "화이트밸런스 메타데이터 범위 오류"
+
         val png = try {
             Base64.decode(dataBase64, Base64.DEFAULT)
         } catch (e: Exception) {
@@ -102,8 +122,8 @@ object WhiteBalanceStore {
             width = width,
             height = height,
             maxAttenuation = maxAttenuation,
-            checksumMd5 = checksumMd5,
-            createdAt = java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssZ", java.util.Locale.US)
+            checksumMd5 = CorrectionStore.md5(png),
+            createdAt = restoredCreatedAt ?: java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssZ", java.util.Locale.US)
                 .format(java.util.Date()),
             sourceDevice = sourceDevice,
             redGain = redGain,
@@ -111,11 +131,15 @@ object WhiteBalanceStore {
             blueGain = blueGain,
         )
 
-        val d = dir(context)
-        File(d, "white_balance_rgb.png").writeBytes(png)
-        File(d, "metadata.json").writeText(m.toJson().toString(2))
-
-        rgbAttenuationBitmap?.recycle()
+        try {
+            if (persist) ProfileFiles.replace(dir(context), mapOf(
+                "white_balance_rgb.png" to png,
+                "metadata.json" to m.toJson().toString(2).toByteArray(Charsets.UTF_8),
+            ))
+        } catch (e: Exception) {
+            bmp.recycle()
+            return "화이트밸런스 저장 실패: ${e.message}"
+        }
         rgbAttenuationBitmap = bmp
         meta = m
         AppLog.i(
@@ -125,32 +149,27 @@ object WhiteBalanceStore {
         return null
     }
 
+    @Synchronized
     fun loadFromDisk(context: Context): Boolean {
         return try {
             val d = dir(context)
-            val metaFile = File(d, "metadata.json")
-            val pngFile = File(d, "white_balance_rgb.png")
-            if (!metaFile.exists() || !pngFile.exists()) return false
-            val m = Meta.fromJson(JSONObject(metaFile.readText()))
-            val bmp = BitmapFactory.decodeFile(pngFile.absolutePath)
-                ?.copy(Bitmap.Config.ARGB_8888, false)
-                ?: return false
-            rgbAttenuationBitmap?.recycle()
-            rgbAttenuationBitmap = bmp
-            meta = m
-            AppLog.i("저장된 화이트밸런스 적재: R ${fmt(m.redGain)}, G ${fmt(m.greenGain)}, B ${fmt(m.blueGain)}")
-            true
+            val m = Meta.fromJson(JSONObject(File(d, "metadata.json").readText()))
+            val png = File(d, "white_balance_rgb.png").readBytes()
+            applyValidated(context, m.width, m.height, m.maxAttenuation, m.checksumMd5,
+                Base64.encodeToString(png, Base64.NO_WRAP), m.sourceDevice, m.redGain, m.greenGain,
+                m.blueGain, persist = false, restoredCreatedAt = m.createdAt) == null
         } catch (e: Exception) {
             AppLog.i("화이트밸런스 적재 실패: ${e.message}")
             false
         }
     }
 
+    @Synchronized
     fun clear(context: Context) {
-        rgbAttenuationBitmap?.recycle()
+        // Publish an empty generation before dropping memory so a failed clear cannot resurrect old files.
+        ProfileFiles.replace(dir(context), emptyMap())
         rgbAttenuationBitmap = null
         meta = null
-        runCatching { dir(context).deleteRecursively() }
         AppLog.i("화이트밸런스 삭제")
     }
 

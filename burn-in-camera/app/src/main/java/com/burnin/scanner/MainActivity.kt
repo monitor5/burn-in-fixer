@@ -30,6 +30,7 @@ import org.json.JSONObject
 class MainActivity : Activity() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private var logListener: ((String) -> Unit)? = null
     private lateinit var editIp: EditText
     private lateinit var editReferenceIp: EditText
     private lateinit var txtTarget: TextView
@@ -50,10 +51,12 @@ class MainActivity : Activity() {
         val txtLog = findViewById<TextView>(R.id.txtLog)
         val scrollLog = findViewById<ScrollView>(R.id.scrollLog)
 
-        AppLog.listener = { text ->
+        logListener = { text ->
             txtLog.text = text
             scrollLog.post { scrollLog.fullScroll(ScrollView.FOCUS_DOWN) }
         }
+
+        AppLog.listener = logListener
 
         val prefs = getSharedPreferences("app", MODE_PRIVATE)
         editIp.setText(prefs.getString("last_adjust_ip", prefs.getString("last_ip", "")))
@@ -181,6 +184,8 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        if (AppLog.listener === logListener) AppLog.listener = null
+        logListener = null
         scope.cancel()
         super.onDestroy()
     }

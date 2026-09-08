@@ -14,43 +14,51 @@ import java.net.Socket
  */
 class ControlClient(private val host: String, private val port: Int = Protocol.PORT) {
 
-    private var socket: Socket? = null
+    private val requestLock = Any()
+    @Volatile private var socket: Socket? = null
     private var reader: BufferedReader? = null
     private var writer: BufferedWriter? = null
 
-    @Synchronized
-    fun connect(timeoutMs: Int = 4000) {
+    fun connect(timeoutMs: Int = 4000) = synchronized(requestLock) {
+        require(timeoutMs > 0)
         close()
         val s = Socket()
-        s.tcpNoDelay = true
-        s.connect(InetSocketAddress(host, port), timeoutMs)
-        s.soTimeout = 20_000
-        reader = BufferedReader(InputStreamReader(s.getInputStream(), Charsets.UTF_8), 1 shl 16)
-        writer = BufferedWriter(OutputStreamWriter(s.getOutputStream(), Charsets.UTF_8), 1 shl 16)
-        socket = s
+        socket = s // close() can interrupt a connect in progress, too.
+        try {
+            s.tcpNoDelay = true
+            s.connect(InetSocketAddress(host, port), timeoutMs)
+            s.soTimeout = 20_000
+            reader = BufferedReader(InputStreamReader(s.getInputStream(), Charsets.UTF_8), 1 shl 16)
+            writer = BufferedWriter(OutputStreamWriter(s.getOutputStream(), Charsets.UTF_8), 1 shl 16)
+        } catch (e: Exception) {
+            close()
+            throw e
+        }
     }
 
     val isConnected: Boolean
-        get() = socket?.isConnected == true && socket?.isClosed == false
+        get() = socket?.let { it.isConnected && !it.isClosed } == true
 
-    /**
-     * 요청 한 줄을 보내고 응답 한 줄을 기다린다.
-     * 응답의 ok=false 면 IllegalStateException(에러 메시지)를 던진다.
-     */
-    @Synchronized
-    fun request(msg: JSONObject, timeoutMs: Int = 20_000): JSONObject {
+    /** A failed exchange invalidates the stream so a late ACK cannot satisfy the next request. */
+    fun request(msg: JSONObject, timeoutMs: Int = 20_000): JSONObject = synchronized(requestLock) {
+        require(timeoutMs > 0)
+        val cmd = msg.getString("cmd")
         val s = socket ?: throw IllegalStateException("연결되지 않음")
-        s.soTimeout = timeoutMs
-        val w = writer!!
-        w.write(msg.toString())
-        w.write("\n")
-        w.flush()
-        val line = reader!!.readLine() ?: throw IllegalStateException("연결이 끊어짐")
-        val reply = JSONObject(line)
-        if (!reply.optBoolean("ok", false)) {
-            throw IllegalStateException(reply.optString("error", "알 수 없는 오류"))
+        try {
+            s.soTimeout = timeoutMs
+            val w = writer ?: throw IllegalStateException("연결되지 않음")
+            w.write(msg.toString())
+            w.write("\n")
+            w.flush()
+            val line = reader!!.readLine() ?: throw IllegalStateException("연결이 끊어짐")
+            val reply = JSONObject(line)
+            check(reply.optString("cmd") == cmd) { "응답 명령 불일치" }
+            check(reply.optBoolean("ok", false)) { reply.optString("error", "알 수 없는 오류") }
+            reply
+        } catch (e: Exception) {
+            close()
+            throw e
         }
-        return reply
     }
 
     fun command(cmd: String, vararg pairs: Pair<String, Any>): JSONObject {
@@ -62,13 +70,12 @@ class ControlClient(private val host: String, private val port: Int = Protocol.P
     fun showPattern(name: String): JSONObject =
         request(JSONObject().put("cmd", Protocol.CMD_SHOW_PATTERN).put("pattern", name))
 
-    @Synchronized
     fun close() {
+        // Do not take requestLock here: closing must unblock an in-flight readLine().
+        // Keep reader/writer references until the next serialized connect replaces them.
         runCatching { socket?.close() }
-        socket = null
-        reader = null
-        writer = null
     }
+
 }
 
 /** 화면 간 공유 연결 상태 (MainActivity → MeasurementActivity). */

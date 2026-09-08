@@ -61,7 +61,7 @@ object PatternBus {
             h != null -> h.applyPattern(spec, done)
             SystemClock.elapsedRealtime() > deadline -> {
                 AppLog.i("경고: 패턴 화면 실행 대기 시간 초과")
-                done.run()
+                // No frame was committed. Let ControlServer report its bounded timeout.
             }
             else -> main.postDelayed({ waitForHost(spec, done, deadline) }, 50)
         }

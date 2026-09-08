@@ -337,26 +337,8 @@ class CaptureController(context: Context, private val textureView: TextureView) 
         refreshHz: Float,
         exposureRange: Range<Long>?,
         isoRange: Range<Int>?,
-    ): Pair<Long, Int> {
-        if (refreshHz < 1f || exposureNs <= 0L) return exposureNs to iso
-        val periodNs = Math.round(1e9 / refreshHz)
-        if (periodNs <= 0L) return exposureNs to iso
-
-        fun candidate(cycles: Long): Pair<Long, Int>? {
-            if (cycles < 1) return null
-            val quantized = cycles * periodNs
-            if (exposureRange != null && quantized !in exposureRange.lower..exposureRange.upper) return null
-            val compensated = Math.round(iso.toDouble() * exposureNs / quantized)
-                .toInt()
-                .coerceInRange(isoRange)
-            val brightnessRatio = compensated.toDouble() * quantized / (iso.toDouble() * exposureNs)
-            if (brightnessRatio > 1.15 || brightnessRatio < 0.85) return null
-            return quantized to compensated
-        }
-
-        val up = (exposureNs + periodNs - 1) / periodNs
-        return candidate(up) ?: candidate(exposureNs / periodNs) ?: (exposureNs to iso)
-    }
+    ): Pair<Long, Int> = ExposurePolicy.quantize(exposureNs, iso, refreshHz,
+        exposureRange?.let { it.lower..it.upper }, isoRange?.let { it.lower..it.upper })
 
     suspend fun captureFrames(count: Int, interFrameDelayMs: Long = 150): List<CaptureFrame> {
         val list = ArrayList<CaptureFrame>(count)
@@ -376,15 +358,18 @@ class CaptureController(context: Context, private val textureView: TextureView) 
         )
         r.setOnImageAvailableListener({ rd ->
             val image = rd.acquireLatestImage() ?: return@setOnImageAvailableListener
-            val frame = try {
-                image.toCaptureFrame()
+            try {
+                val frame = image.toCaptureFrame()
+                if (cont.isActive) cont.resume(frame)
+            } catch (e: Exception) {
+                if (cont.isActive) cont.resumeWithException(e)
             } finally {
                 image.close()
+                rd.setOnImageAvailableListener(null, null)
             }
-            rd.setOnImageAvailableListener(null, null)
-            if (cont.isActive) cont.resume(frame)
         }, handler)
 
+        cont.invokeOnCancellation { handler.post { runCatching { r.setOnImageAvailableListener(null, null) } } }
         val req = device!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
             addTarget(r.surface)
             applyMeasurementControls(this)
@@ -560,7 +545,7 @@ class CaptureController(context: Context, private val textureView: TextureView) 
     ) {
         manager.openCamera(id, object : CameraDevice.StateCallback() {
             override fun onOpened(camera: CameraDevice) {
-                if (cont.isActive) cont.resume(camera)
+                CameraResourceDelivery.deliver(cont, camera) { it.close() }
             }
             override fun onDisconnected(camera: CameraDevice) {
                 camera.close()
@@ -606,9 +591,10 @@ class CaptureController(context: Context, private val textureView: TextureView) 
         suspendCancellableCoroutine { cont ->
             camera.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(s: CameraCaptureSession) {
-                    if (cont.isActive) cont.resume(s)
+                    CameraResourceDelivery.deliver(cont, s) { it.close() }
                 }
                 override fun onConfigureFailed(s: CameraCaptureSession) {
+                    s.close()
                     if (cont.isActive) cont.resumeWithException(IllegalStateException("세션 구성 실패"))
                 }
             }, handler)
@@ -649,6 +635,7 @@ class CaptureController(context: Context, private val textureView: TextureView) 
      * 논리 멀티카메라 동시 세션: 각 출력 스트림을 setPhysicalCameraId로
      * 초광각/표준/망원 물리 카메라에 라우팅한다 (API 28+).
      */
+    @androidx.annotation.RequiresApi(28)
     private suspend fun createTriSession(
         tri: CameraEnumerator.TriSelection,
         previewSurface: Surface,
@@ -675,9 +662,10 @@ class CaptureController(context: Context, private val textureView: TextureView) 
             Executor { handler.post(it) },
             object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(s: CameraCaptureSession) {
-                    if (cont.isActive) cont.resume(s)
+                    CameraResourceDelivery.deliver(cont, s) { it.close() }
                 }
                 override fun onConfigureFailed(s: CameraCaptureSession) {
+                    s.close()
                     if (cont.isActive) {
                         cont.resumeWithException(IllegalStateException("동시 3각 세션 구성 실패"))
                     }
