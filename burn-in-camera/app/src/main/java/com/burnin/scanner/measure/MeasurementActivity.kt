@@ -19,6 +19,7 @@ import com.burnin.scanner.analysis.DotGridDetector
 import com.burnin.scanner.analysis.GrayImage
 import com.burnin.scanner.analysis.Homography
 import com.burnin.scanner.analysis.ImageOps
+import com.burnin.scanner.analysis.MultiViewFusion
 import com.burnin.scanner.analysis.RgbImage
 import com.burnin.scanner.analysis.ScreenDetector
 import com.burnin.scanner.camera.CameraEnumerator
@@ -85,6 +86,7 @@ class MeasurementActivity : Activity() {
         private const val FLICKER_ZERO_RELATIVE_RANGE = 0.045f
         private const val FLICKER_INTER_FRAME_DELAY_MS = 1_200L
         private const val VL_REGION_CONFIDENCE_THRESHOLD = 0.55f
+        private const val AMBIGUOUS_RECAPTURE_WARN = 0.02f
         private const val VL_REGION_MIN_AREA = 96
         private const val VL_RESTORED_CONFIDENCE_FLOOR = 0.85f
 
@@ -451,6 +453,8 @@ class MeasurementActivity : Activity() {
             grayAvg,
             homography,
             lumaBefore,
+            confidence70Single,
+            dotGrid?.rmsResidualPx,
             screenW,
             screenH,
             gw,
@@ -469,6 +473,14 @@ class MeasurementActivity : Activity() {
                 "3각 교차 일치도 평균 ${pct(cross.meanAgreement)} " +
                     "(${cross.roles.joinToString("+")}) — 불일치 구간은 gain 반영 제외"
             )
+            log(
+                "교차 융합: 품질 가중 강건 합의 — 교차 검증 범위 ${pct(cross.crossCheckedFraction)}, " +
+                    "재촬영 후보 ${pct(cross.ambiguousFraction)}, 공통 해상도 반경 ${cross.commonRadius}셀, " +
+                    "기존 방식 평균 ${pct(cross.legacyMeanAgreement)} (평균 차이 ${pct(cross.legacyDifference)})"
+            )
+            if (cross.ambiguousFraction > AMBIGUOUS_RECAPTURE_WARN) {
+                log("경고: 품질이 좋은 화각끼리 불일치하는 구간이 많음 — 반사·정합을 점검하고 재촬영 권장")
+            }
             cap.physicalExposureSummary(refreshHz)?.let { log("물리 카메라 노출: $it") }
         }
         val blackGrid = withContext(Dispatchers.Default) {
@@ -1168,6 +1180,7 @@ class MeasurementActivity : Activity() {
             .put("crossAgreementMean", (cross?.meanAgreement ?: 1f).toDouble())
             .put("crossRoles", JSONArray(cross?.roles ?: emptyList<String>()))
             .put("crossRoleStats", statsMapJson(cross?.roleStats ?: emptyMap()))
+            .put("crossFusion", cross?.fusionJson ?: JSONObject())
             .put("vlTrustGate", cross?.vlDecisions?.isNotEmpty() == true)
             .put("vlTrustDecisions", vlDecisionJson(cross?.vlDecisions ?: emptyList()))
             .put("physicalExposures", cap.physicalExposureSummary(refreshHz) ?: "")
@@ -1649,6 +1662,12 @@ class MeasurementActivity : Activity() {
         val agreement: FloatArray,
         val roles: List<String>,
         val meanAgreement: Float,
+        val legacyMeanAgreement: Float,
+        val legacyDifference: Float,
+        val crossCheckedFraction: Float,
+        val ambiguousFraction: Float,
+        val commonRadius: Int,
+        val fusionJson: JSONObject,
         val roleStats: LinkedHashMap<String, Analyzer.Stats>,
         val files: LinkedHashMap<String, ByteArray>,
         val notes: List<String>,
@@ -1657,7 +1676,9 @@ class MeasurementActivity : Activity() {
 
     /**
      * 동시 촬영된 보조 화각(초광각/망원)을 각자 검출·방향판별·정합·flat-field 후
-     * 정규화 그리드로 만들고, 메인과의 screen-space 재현성 confidence를 계산한다.
+     * 화면 좌표 휘도 + 위치별 품질 + 유효 영역으로 만들고, 메인과 겹치는 영역에서
+     * 상대 배율을 맞춘 뒤 품질 가중 강건 합의로 screen-space 재현성 confidence를 계산한다
+     * ([MultiViewFusion]). 기존 자체 중앙값 정규화 + 최대-최소 방식은 비교용으로만 기록한다.
      * 낮은 재현성 구간은 촬영계 성분으로 의심하되, Gemini Nano VL이 사용 가능하면
      * 해당 crop이 실제 화면 결함인지 보조 판정해 과도한 마스킹을 완화한다.
      * 역해석용으로 화각별 평균 프레임 PNG와 편차 히트맵을 세션 폴더에 남긴다.
@@ -1669,6 +1690,8 @@ class MeasurementActivity : Activity() {
         mainGray: GrayImage,
         mainHomography: Homography,
         mainLuma: FloatArray,
+        mainConfidence: FloatArray,
+        mainDotGridRmsPx: Float?,
         screenW: Int,
         screenH: Int,
         gw: Int,
@@ -1679,6 +1702,21 @@ class MeasurementActivity : Activity() {
 
         val norms = ArrayList<FloatArray>()
         norms += withContext(Dispatchers.Default) { Analyzer.normalizeByMedian(mainLuma) }
+        val views = ArrayList<MultiViewFusion.View>()
+        views += withContext(Dispatchers.Default) {
+            fusionView(
+                CameraEnumerator.ROLE_MAIN,
+                mainLuma,
+                listOf(mainConfidence),
+                mainHomography,
+                mainGray,
+                MultiViewFusion.registrationQuality(mainDotGridRmsPx),
+                screenW,
+                screenH,
+                gw,
+                gh,
+            )
+        }
         val okRoles = ArrayList<String>()
         val roleStats = LinkedHashMap<String, Analyzer.Stats>()
         val files = LinkedHashMap<String, ByteArray>()
@@ -1721,8 +1759,30 @@ class MeasurementActivity : Activity() {
                 val ff = withContext(Dispatchers.Default) { Analyzer.radialFlatField(raw, gw, gh) }
                 val grid = withContext(Dispatchers.Default) { Analyzer.applyFlatField(raw, ff) }
                 val st = Analyzer.stats(grid)
+                val baseConfidence = withContext(Dispatchers.Default) {
+                    val blackGrid = roleBlack?.let {
+                        Analyzer.lumaGrid(it, null, h, screenW, screenH, gw, gh)
+                    }
+                    Analyzer.confidenceGrid(raw, blackGrid, strayWarn = 0.05f)
+                }
+                val stability = temporalLumaConfidence(grayStore, roleBlack, h, screenW, screenH, gw, gh)
+                val view = withContext(Dispatchers.Default) {
+                    fusionView(
+                        role,
+                        grid,
+                        listOf(baseConfidence, stability),
+                        h,
+                        roleGray,
+                        MultiViewFusion.registrationQuality(null),
+                        screenW,
+                        screenH,
+                        gw,
+                        gh,
+                    )
+                }
                 roleStats[role] = st
                 norms += withContext(Dispatchers.Default) { Analyzer.normalizeByMedian(grid) }
+                views += view
                 okRoles += role
                 roleImages[role] = roleGray
                 roleHomographies[role] = h
@@ -1741,11 +1801,25 @@ class MeasurementActivity : Activity() {
             }
         }
 
-        var agreement = if (okRoles.isEmpty()) {
+        val legacyAgreement = if (okRoles.isEmpty()) {
             FloatArray(gw * gh) { 1f } // 전부 제외 → 중립 (메인 단독과 동일)
         } else {
             withContext(Dispatchers.Default) { Analyzer.crossAgreementConfidence(norms, gw, gh) }
         }
+        val fusion = withContext(Dispatchers.Default) { MultiViewFusion.fuse(views, gw, gh) }
+        fusion.excluded.forEach { (role, reason) -> notes += "교차 융합 제외: $role — $reason" }
+        for (nv in fusion.views) {
+            if (nv.role == CameraEnumerator.ROLE_MAIN) continue
+            notes += "교차 융합: ${nv.role} — 겹침 ${pct(nv.overlapFraction)}, 상대 배율 ${fmt(nv.scale)}"
+        }
+        if (okRoles.isNotEmpty()) {
+            val fusedForMap = FloatArray(gw * gh) { i ->
+                fusion.fused[i].takeIf { it > 0f } ?: mainLuma[i]
+            }
+            files["deviation_fused_before.png"] =
+                withContext(Dispatchers.Default) { Analyzer.deviationHeatmapPng(fusedForMap, gw, gh) }
+        }
+        var agreement = fusion.agreement
         val vlDecisions = ArrayList<VisionTrustGate.Decision>()
         if (okRoles.isNotEmpty()) {
             val regions = withContext(Dispatchers.Default) {
@@ -1804,15 +1878,81 @@ class MeasurementActivity : Activity() {
                 }
             }
         }
+        val legacyMean = Analyzer.meanConfidence(legacyAgreement)
+        val legacyDifference = MultiViewFusion.meanAbsDifference(legacyAgreement, fusion.agreement)
+        val fusionJson = JSONObject()
+            .put("method", "overlap-normalized quality-weighted Huber consensus")
+            .put("legacyAgreementMean", legacyMean.toDouble())
+            .put("robustAgreementMean", fusion.meanAgreement.toDouble())
+            .put("legacyMeanAbsDifference", legacyDifference.toDouble())
+            .put("crossCheckedFraction", fusion.crossCheckedFraction.toDouble())
+            .put("ambiguousFraction", fusion.ambiguousFraction.toDouble())
+            .put("commonRadiusCells", fusion.commonRadius)
+            .put(
+                "views",
+                JSONObject().also { json ->
+                    fusion.views.forEach { nv ->
+                        json.put(
+                            nv.role,
+                            JSONObject()
+                                .put("scale", nv.scale.toDouble())
+                                .put("overlapFraction", nv.overlapFraction.toDouble())
+                                .put("meanQuality", Analyzer.meanConfidence(nv.quality).toDouble()),
+                        )
+                    }
+                },
+            )
+            .put("excluded", JSONObject(fusion.excluded as Map<*, *>))
         return CrossResult(
             agreement = agreement,
             roles = listOf(CameraEnumerator.ROLE_MAIN) + okRoles,
             meanAgreement = Analyzer.meanConfidence(agreement),
+            legacyMeanAgreement = legacyMean,
+            legacyDifference = legacyDifference,
+            crossCheckedFraction = fusion.crossCheckedFraction,
+            ambiguousFraction = fusion.ambiguousFraction,
+            commonRadius = fusion.commonRadius,
+            fusionJson = fusionJson,
             roleStats = roleStats,
             files = files,
             notes = notes,
             vlDecisions = vlDecisions,
         )
+    }
+
+    /**
+     * 한 화각의 융합 입력: 유효 영역(이미지 경계 안), 셀당 카메라 픽셀 수 기반 해상도 품질,
+     * 전달받은 SNR/클리핑/프레임 안정도 품질, 정합 품질 스칼라를 곱해 위치별 가중치를 만든다.
+     */
+    private fun fusionView(
+        role: String,
+        signal: FloatArray,
+        qualityMaps: List<FloatArray>,
+        h: Homography,
+        image: GrayImage,
+        registrationQuality: Float,
+        screenW: Int,
+        screenH: Int,
+        gw: Int,
+        gh: Int,
+    ): MultiViewFusion.View {
+        val valid = MultiViewFusion.coverageMask(h, image.w, image.h, screenW, screenH, gw, gh)
+        val density = MultiViewFusion.cameraPixelsPerCell(h, screenW, screenH, gw, gh)
+        val quality = MultiViewFusion.combineQuality(
+            gw * gh,
+            qualityMaps + listOf(MultiViewFusion.resolutionQuality(density)),
+            registrationQuality,
+            valid,
+        )
+        // density는 16셀 블록 단위로 같은 값이므로 블록 대표값만 모아 중앙값을 구한다.
+        val samples = ArrayList<Float>()
+        for (y in 0 until gh step 16) for (x in 0 until gw step 16) {
+            val i = y * gw + x
+            if (valid[i]) samples += density[i]
+        }
+        samples.sort()
+        val medianDensity = if (samples.isEmpty()) Float.NaN else samples[samples.size / 2]
+        return MultiViewFusion.View(role, signal, quality, valid, medianDensity)
     }
 
     /**

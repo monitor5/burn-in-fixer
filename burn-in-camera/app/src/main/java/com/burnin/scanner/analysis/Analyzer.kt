@@ -908,7 +908,7 @@ object Analyzer {
 
     /** 가로/세로 분리 슬라이딩 윈도 박스 블러. 반경이 커져도 O(w·h)로 동작하며,
      *  가장자리는 실제 포함된 픽셀 수로 나눠 기존 3x3 구현과 같은 경계 동작을 유지한다. */
-    private fun boxBlur(src: FloatArray, w: Int, h: Int, radius: Int = 1): FloatArray {
+    internal fun boxBlur(src: FloatArray, w: Int, h: Int, radius: Int = 1): FloatArray {
         if (radius < 1) return src.clone()
         val tmp = FloatArray(src.size)
         for (y in 0 until h) {
@@ -972,7 +972,7 @@ object Analyzer {
         return out
     }
 
-    private fun confidenceRamp(value: Float, okAt: Float, zeroAt: Float): Float {
+    internal fun confidenceRamp(value: Float, okAt: Float, zeroAt: Float): Float {
         if (value <= okAt) return 1f
         if (value >= zeroAt) return 0f
         return (1f - (value - okAt) / (zeroAt - okAt)).coerceIn(0f, 1f)
