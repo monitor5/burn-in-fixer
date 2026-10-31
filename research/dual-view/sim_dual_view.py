@@ -41,6 +41,18 @@ def panel(kind, depth=0.06):
     if "edge" in kind:                                   # 가장자리 방사형 열화 5%
         r = np.sqrt((X / (SCREEN_W / 2))**2 + (Y / (SCREEN_H / 2))**2) / np.sqrt(2)
         p += np.log(1 - 0.05 * r**2)
+    if "ui" in kind:                                     # 글씨·게임 버튼 번인 (고정 UI)
+        m = np.zeros_like(X, bool)
+        for row in range(3):                             # 글씨: 1mm 획, 3줄 × 12자
+            y0 = -50 + row * 8
+            for ch in range(12):
+                x0 = -28 + ch * 4.6
+                m |= (np.abs(Y - y0) < 0.5) & (X > x0) & (X < x0 + 3)
+                m |= (np.abs(X - x0) < 0.5) & (Y > y0) & (Y < y0 + 5)
+        for cx, cy, r in ((22, 55, 7), (8, 62, 5), (-22, 55, 9)):  # 원형 버튼(링)
+            d = np.sqrt((X - cx)**2 + (Y - cy)**2)
+            m |= np.abs(d - r) < 0.8
+        p[m] += np.log(1 - depth * 0.5)
     if "blob" in kind:                                   # 국소 얼룩 2개
         p += np.log(1 - 0.04 * np.exp(-((X - 15)**2 + (Y + 30)**2) / 30))
         p += np.log(1 - 0.03 * np.exp(-((X + 20)**2 + (Y - 40)**2) / 60))
@@ -288,6 +300,7 @@ CONFIGS = {
 SCENES = {
     "번인 없음 (거짓 결함 확인)": "",
     "상태바+내비바 6% + 얼룩": "bars blob",
+    "글씨·게임 버튼 3% (1~1.6mm 획)": "ui",
     "상태바+내비바 6% + 그라데이션 4%": "bars grad",
     "중앙 원형 열화 3%": "center",
     "가장자리 방사형 열화 5%": "edge",
