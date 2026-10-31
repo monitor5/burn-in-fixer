@@ -29,7 +29,7 @@ internal data class Rgb(val r: Double, val g: Double, val b: Double) {
     operator fun plus(o: Rgb) = Rgb(r + o.r, g + o.g, b + o.b)
     operator fun minus(o: Rgb) = Rgb(r - o.r, g - o.g, b - o.b)
     operator fun times(s: Double) = Rgb(r * s, g * s, b * s)
-    operator fun get(i: Int): Double = when (i) { 0 -> r; 1 -> g; 2 -> b; else -> throw IndexOutOfBoundsException(i) }
+    operator fun get(i: Int): Double = when (i) { 0 -> r; 1 -> g; 2 -> b; else -> throw IndexOutOfBoundsException("channel $i") }
     fun dot(o: Rgb) = r * o.r + g * o.g + b * o.b
     fun max() = maxOf(r, g, b)
     fun isFinite() = r.isFinite() && g.isFinite() && b.isFinite()
