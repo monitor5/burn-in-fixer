@@ -15,6 +15,7 @@ import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.RggbChannelVector
 import android.hardware.camera2.params.SessionConfiguration
+import android.hardware.camera2.params.TonemapCurve
 import android.media.Image
 import android.media.ImageReader
 import android.os.Build
@@ -24,6 +25,8 @@ import android.util.Range
 import android.util.Size
 import android.view.Surface
 import android.view.TextureView
+import com.burnin.scanner.analysis.CameraToneCurve
+import com.burnin.scanner.analysis.ImageOps
 import java.util.concurrent.Executor
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
@@ -125,6 +128,15 @@ class CaptureController(context: Context, private val textureView: TextureView) 
     private var manualAwbGains: RggbChannelVector? = null
     private var manualFocusDistance: Float? = null
 
+    /** 측정 촬영에 지정하는 톤커브. 세션 시작 시 기기 지원에 따라 고르고, 결과가 다르면 ASSUMED로 내린다. */
+    @Volatile
+    var toneMode: CameraToneCurve.Mode = CameraToneCurve.Mode.ASSUMED
+        private set
+    private val toneCurve by lazy {
+        val pts = CameraToneCurve.curvePoints()
+        TonemapCurve(pts, pts, pts)
+    }
+
     var aeLocked = false
         private set
 
@@ -177,6 +189,9 @@ class CaptureController(context: Context, private val textureView: TextureView) 
             cameraId = tri.openId
             characteristics = manager.getCameraCharacteristics(tri.main.physicalId ?: tri.openId)
         }
+
+        setToneMode(selectToneMode(manager.getCameraCharacteristics(cameraId)))
+        setupNotes += "측정 톤커브: ${toneMode.label}"
 
         val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
             ?: throw IllegalStateException("스트림 설정 없음")
@@ -410,8 +425,64 @@ class CaptureController(context: Context, private val textureView: TextureView) 
         session!!.capture(req.build(), previewCallback, handler)
     }
 
+    /**
+     * 알려진 톤커브 우선순위: CONTRAST_CURVE(제어점 수 충분) → GAMMA_VALUE → PRESET_CURVE sRGB → 기본(ASSUMED).
+     * 모두 [ImageOps] 디코더가 정확한 역함수를 가진다 ([CameraToneCurve]).
+     */
+    private fun selectToneMode(ch: CameraCharacteristics): CameraToneCurve.Mode {
+        val modes = ch.get(CameraCharacteristics.TONEMAP_AVAILABLE_TONE_MAP_MODES)?.toSet().orEmpty()
+        val maxPoints = ch.get(CameraCharacteristics.TONEMAP_MAX_CURVE_POINTS) ?: 0
+        return when {
+            CameraMetadata.TONEMAP_MODE_CONTRAST_CURVE in modes && maxPoints >= CameraToneCurve.POINTS ->
+                CameraToneCurve.Mode.CONTRAST_CURVE
+            CameraMetadata.TONEMAP_MODE_GAMMA_VALUE in modes -> CameraToneCurve.Mode.GAMMA_VALUE
+            CameraMetadata.TONEMAP_MODE_PRESET_CURVE in modes -> CameraToneCurve.Mode.PRESET_SRGB
+            else -> CameraToneCurve.Mode.ASSUMED
+        }
+    }
+
+    private fun setToneMode(mode: CameraToneCurve.Mode) {
+        toneMode = mode
+        ImageOps.toneMode = mode
+    }
+
+    private fun requestedTonemapMode(mode: CameraToneCurve.Mode): Int? = when (mode) {
+        CameraToneCurve.Mode.CONTRAST_CURVE -> CameraMetadata.TONEMAP_MODE_CONTRAST_CURVE
+        CameraToneCurve.Mode.GAMMA_VALUE -> CameraMetadata.TONEMAP_MODE_GAMMA_VALUE
+        CameraToneCurve.Mode.PRESET_SRGB -> CameraMetadata.TONEMAP_MODE_PRESET_CURVE
+        CameraToneCurve.Mode.ASSUMED -> null
+    }
+
+    private fun applyToneControls(builder: CaptureRequest.Builder) {
+        val mode = toneMode
+        val cameraMode = requestedTonemapMode(mode) ?: return
+        builder.set(CaptureRequest.TONEMAP_MODE, cameraMode)
+        when (mode) {
+            CameraToneCurve.Mode.CONTRAST_CURVE -> builder.set(CaptureRequest.TONEMAP_CURVE, toneCurve)
+            CameraToneCurve.Mode.GAMMA_VALUE -> builder.set(CaptureRequest.TONEMAP_GAMMA, CameraToneCurve.GAMMA.toFloat())
+            CameraToneCurve.Mode.PRESET_SRGB ->
+                builder.set(CaptureRequest.TONEMAP_PRESET_CURVE, CameraMetadata.TONEMAP_PRESET_CURVE_SRGB)
+            CameraToneCurve.Mode.ASSUMED -> Unit
+        }
+    }
+
+    /**
+     * 측정 요청에 지정한 톤맵 모드를 HAL이 실제로 적용했는지 CaptureResult로 확인한다.
+     * 다르게 보고하면 디코더를 기본 곡선 근사(ASSUMED)로 내리고 진단 노트에 남긴다.
+     */
+    private fun verifyToneResult(request: CaptureRequest, result: TotalCaptureResult) {
+        val requested = request.get(CaptureRequest.TONEMAP_MODE) ?: return
+        if (requested != requestedTonemapMode(toneMode)) return
+        val applied = result.get(CaptureResult.TONEMAP_MODE) ?: return
+        if (applied != requested) {
+            setupNotes += "경고: 톤맵 모드 요청 $requested, 결과 $applied — 기본 곡선 근사(x^2.2)로 되돌림"
+            setToneMode(CameraToneCurve.Mode.ASSUMED)
+        }
+    }
+
     private fun applyMeasurementControls(builder: CaptureRequest.Builder) {
         builder.set(CaptureRequest.FLASH_MODE, CameraMetadata.FLASH_MODE_OFF)
+        applyToneControls(builder)
         if (manualLocked) {
             builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
             builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
@@ -522,6 +593,7 @@ class CaptureController(context: Context, private val textureView: TextureView) 
             request: CaptureRequest,
             result: TotalCaptureResult,
         ) {
+            verifyToneResult(request, result)
             latestExposureTimeNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: latestExposureTimeNs
             latestSensitivityIso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: latestSensitivityIso
             latestAwbGains = result.get(CaptureResult.COLOR_CORRECTION_GAINS) ?: latestAwbGains

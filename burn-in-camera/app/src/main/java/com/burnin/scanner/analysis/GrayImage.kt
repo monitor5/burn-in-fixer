@@ -70,8 +70,31 @@ class RgbImage(
 
 object ImageOps {
 
-    /** sRGB 역감마(≈2.2) 룩업 테이블 */
-    private val LINEAR_LUT = FloatArray(256) { v -> Math.pow(v / 255.0, 2.2).toFloat() }
+    /**
+     * 측정 프레임에 적용된 카메라 톤커브. [com.burnin.scanner.camera.CaptureController]가 세션 시작 시
+     * 지정한 곡선으로 설정하고, CaptureResult가 다른 모드를 보고하면 [CameraToneCurve.Mode.ASSUMED]로 내린다.
+     * 디코더는 이 곡선의 역함수로 선형화한다.
+     */
+    @Volatile
+    var toneMode: CameraToneCurve.Mode = CameraToneCurve.Mode.ASSUMED
+        set(value) {
+            if (field == value) return
+            field = value
+            luts = buildLuts(value)
+        }
+
+    private class Luts(val linear: FloatArray, val yLinear: FloatArray)
+
+    private fun buildLuts(mode: CameraToneCurve.Mode) = Luts(
+        FloatArray(256) { v -> CameraToneCurve.toLinear(v / 255.0, mode).toFloat() },
+        FloatArray(256) { v -> CameraToneCurve.toLinear(videoRangeY(v).toDouble(), mode).toFloat() },
+    )
+
+    @Volatile
+    private var luts = buildLuts(CameraToneCurve.Mode.ASSUMED)
+
+    /** 카메라 출력 코드값(0~255) → 선형 신호 룩업 테이블 (현재 [toneMode]) */
+    private val LINEAR_LUT: FloatArray get() = luts.linear
 
     fun decodeLinearGray(frame: CaptureFrame, maxLongEdge: Int = 1600): GrayImage =
         when (frame.format) {
@@ -109,11 +132,12 @@ object ImageOps {
         bmp.recycle()
 
         val out = FloatArray(w * h)
+        val lut = LINEAR_LUT
         for (i in pixels.indices) {
             val p = pixels[i]
-            val r = LINEAR_LUT[(p shr 16) and 0xFF]
-            val g = LINEAR_LUT[(p shr 8) and 0xFF]
-            val b = LINEAR_LUT[p and 0xFF]
+            val r = lut[(p shr 16) and 0xFF]
+            val g = lut[(p shr 8) and 0xFF]
+            val b = lut[p and 0xFF]
             out[i] = 0.2126f * r + 0.7152f * g + 0.0722f * b
         }
         return GrayImage(w, h, out)
@@ -138,19 +162,18 @@ object ImageOps {
         val r = FloatArray(w * h)
         val g = FloatArray(w * h)
         val b = FloatArray(w * h)
+        val lut = LINEAR_LUT
         for (i in pixels.indices) {
             val p = pixels[i]
-            r[i] = LINEAR_LUT[(p shr 16) and 0xFF]
-            g[i] = LINEAR_LUT[(p shr 8) and 0xFF]
-            b[i] = LINEAR_LUT[p and 0xFF]
+            r[i] = lut[(p shr 16) and 0xFF]
+            g[i] = lut[(p shr 8) and 0xFF]
+            b[i] = lut[p and 0xFF]
         }
         return RgbImage(w, h, r, g, b)
     }
 
-    /** 8-bit 비디오 레인지 Y' → 선형 휘도 룩업 (블록 평균을 선형 도메인에서 하기 위함) */
-    private val Y_LINEAR_LUT = FloatArray(256) { v ->
-        Math.pow(videoRangeY(v).toDouble(), 2.2).toFloat()
-    }
+    /** 8-bit 비디오 레인지 Y' → 선형 휘도 룩업 (블록 평균을 선형 도메인에서 하기 위함, 현재 [toneMode]) */
+    private val Y_LINEAR_LUT: FloatArray get() = luts.yLinear
 
     /**
      * sample×sample 블록 평균 다운샘플. 이전의 N픽셀 건너뛰기 점 샘플링은 센서 격자와
@@ -166,6 +189,7 @@ object ImageOps {
         val yPlane = frame.planes[0]
         validatePlane(yPlane, frame.width, frame.height)
         val out = FloatArray(outW * outH)
+        val yLut = Y_LINEAR_LUT
         var i = 0
         for (oy in 0 until outH) {
             val y0 = oy * sample
@@ -178,7 +202,7 @@ object ImageOps {
                     val rowBase = y * yPlane.rowStride
                     for (x in x0 until x1) {
                         val index = rowBase + x * yPlane.pixelStride
-                        acc += Y_LINEAR_LUT[yPlane.bytes[index].toInt() and 0xFF]
+                        acc += yLut[yPlane.bytes[index].toInt() and 0xFF]
                     }
                 }
                 out[i++] = acc / ((y1 - y0) * (x1 - x0))
@@ -241,9 +265,10 @@ object ImageOps {
                 val rp = (yy + 1.5748f * cr).coerceIn(0f, 1f)
                 val gp = (yy - 0.1873f * cb - 0.4681f * cr).coerceIn(0f, 1f)
                 val bp = (yy + 1.8556f * cb).coerceIn(0f, 1f)
-                r[i] = Math.pow(rp.toDouble(), 2.2).toFloat()
-                g[i] = Math.pow(gp.toDouble(), 2.2).toFloat()
-                b[i] = Math.pow(bp.toDouble(), 2.2).toFloat()
+                val mode = toneMode
+                r[i] = CameraToneCurve.toLinear(rp.toDouble(), mode).toFloat()
+                g[i] = CameraToneCurve.toLinear(gp.toDouble(), mode).toFloat()
+                b[i] = CameraToneCurve.toLinear(bp.toDouble(), mode).toFloat()
                 i++
             }
         }

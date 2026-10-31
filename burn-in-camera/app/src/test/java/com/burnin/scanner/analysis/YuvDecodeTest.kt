@@ -13,6 +13,16 @@ class YuvDecodeTest {
         val g=ImageOps.decodeLinearGray(f)
         assertArrayEquals(floatArrayOf(0f,1f,Math.pow(110.0/219,2.2).toFloat(),0f),g.data,1e-6f)
     }
+    @Test fun decoderFollowsTheRequestedCameraToneCurve() {
+        val f=frame(2,2,listOf(plane(intArrayOf(16,235,99,126,16),3)))
+        try {
+            ImageOps.toneMode=CameraToneCurve.Mode.CONTRAST_CURVE
+            val expected=CameraToneCurve.toLinear(110.0/219,CameraToneCurve.Mode.CONTRAST_CURVE).toFloat()
+            assertArrayEquals(floatArrayOf(0f,1f,expected,0f),ImageOps.decodeLinearGray(f).data,1e-6f)
+            assertNotEquals(Math.pow(110.0/219,2.2).toFloat(),expected,1e-5f)
+        } finally { ImageOps.toneMode=CameraToneCurve.Mode.ASSUMED }
+        assertEquals(Math.pow(110.0/219,2.2).toFloat(),ImageOps.decodeLinearGray(f).data[2],1e-6f)
+    }
     @Test fun blockAverageIsComputedAfterLinearization() {
         val f=frame(2,2,listOf(plane(intArrayOf(16,235,235,16),2)))
         val g=ImageOps.decodeLinearGray(f,1)
