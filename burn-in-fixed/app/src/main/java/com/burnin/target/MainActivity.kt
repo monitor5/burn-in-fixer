@@ -13,6 +13,7 @@ import android.widget.Button
 import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
+import com.burnin.target.correction.ColorProfileStore
 import com.burnin.target.correction.CorrectionStore
 import com.burnin.target.correction.WhiteBalanceStore
 import com.burnin.target.net.ControlServer
@@ -67,6 +68,7 @@ class MainActivity : Activity() {
             startActivity(Intent(this, PatternActivity::class.java))
         }
         findViewById<Button>(R.id.btnPreview).setOnClickListener { openPreview() }
+        findViewById<Button>(R.id.btnColorProfile).setOnClickListener { toggleColorProfile() }
         findViewById<Button>(R.id.btnOverlayOn).setOnClickListener { enableOverlay() }
         findViewById<Button>(R.id.btnOverlayOff).setOnClickListener {
             OverlayService.requestStop(this)
@@ -91,6 +93,7 @@ class MainActivity : Activity() {
 
         CorrectionStore.loadFromDisk(this)
         WhiteBalanceStore.loadFromDisk(this)
+        ColorProfileStore.loadFromDisk(this)
         ControlServer.start(this)
         showDisclaimerOnce()
         AppLog.i("대상 기기 앱 시작")
@@ -134,7 +137,15 @@ class MainActivity : Activity() {
         else "보정 프로파일: ${m.width}x${m.height}, 최대 감쇠 ${(m.maxAttenuation * 100).toInt()}%, ${m.createdAt}"
         val wbText = if (wb == null) "화이트밸런스: 없음"
         else "화이트밸런스: R ${fmtGain(wb.redGain)}, G ${fmtGain(wb.greenGain)}, B ${fmtGain(wb.blueGain)}"
-        txtProfile.text = "$correctionText\n$wbText"
+        val cp = ColorProfileStore.meta
+        val cpText = if (cp == null) "색감 프로파일: 없음"
+        else "색감 프로파일: 기준 ${cp.referenceDevice.ifEmpty { "?" }}, LUT ${cp.lutSize}³, ${if (cp.enabled) "ON" else "OFF"}"
+        txtProfile.text = "$correctionText\n$wbText\n$cpText"
+        findViewById<Button>(R.id.btnColorProfile).text = when {
+            cp == null -> "색감 보정: 프로파일 없음"
+            cp.enabled -> "색감 보정 끄기"
+            else -> "색감 보정 켜기"
+        }
     }
 
     private fun setRole(role: String) {
@@ -159,6 +170,22 @@ class MainActivity : Activity() {
         }
         PatternBus.setCorrection(true, null)
         PatternBus.showPattern(this, PatternSpec.parse("gray70")!!) { }
+    }
+
+    /** 색감 프로파일은 번인 보정과 별개로 켜고 끈다. 앱 자체 렌더링(패턴 화면)에만 적용된다. */
+    private fun toggleColorProfile() {
+        if (DeviceRole.isReference(this)) {
+            AppLog.i("대조설비는 색감 보정을 사용하지 않습니다")
+            return
+        }
+        val cp = ColorProfileStore.meta ?: run {
+            AppLog.i("색감 프로파일이 없습니다 — Scanner의 [색감 맞추기]로 먼저 측정하세요")
+            return
+        }
+        val error = ColorProfileStore.setEnabled(this, !cp.enabled)
+        if (error != null) AppLog.i(error)
+        PatternBus.refresh()
+        refreshStatus()
     }
 
     private fun enableOverlay() {

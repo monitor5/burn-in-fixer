@@ -11,15 +11,13 @@ import android.view.WindowManager
 import android.widget.Button
 import android.widget.TextView
 import com.burnin.scanner.R
-import com.burnin.scanner.analysis.Analyzer
 import com.burnin.scanner.analysis.ImageOps
-import com.burnin.scanner.analysis.RgbImage
 import com.burnin.scanner.analysis.ScreenDetector
-import com.burnin.scanner.analysis.Vec2
 import com.burnin.scanner.camera.CaptureController
 import com.burnin.scanner.net.ControlClient
 import com.burnin.scanner.net.Protocol
 import com.burnin.scanner.net.Session
+import com.burnin.scanner.report.ReportStore
 import com.burnin.scanner.util.AppLog
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -28,25 +26,33 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
 import java.security.MessageDigest
-import kotlin.math.max
-import kotlin.math.sqrt
 
 /**
- * 대조설비의 원본 흰색과 조정설비의 기존 번인 보정 ON 상태 흰색을 비교해
- * 조정설비에 추가 RGB 화이트밸런스 레이어를 전송한다.
+ * 색감 맞추기: 대조설비(A급 기준 기기)의 색감에 조정설비(번인 보정 대상)를 맞춘다.
+ *
+ * 1. 두 화면을 같은 고정 노출·WB 카메라로 번갈아 촬영 (한 화면 점등, 다른 화면 검정)
+ * 2. 검정 + R/G/B 램프 + 회색 램프로 두 기기 화면 모델 적합 → 17³ 3D LUT
+ * 3. 프로파일 적용 후 회색 계조를 다시 재서 post 곡선을 closed-loop 보정
+ * 4. 적합에 쓰지 않은 검증색(held-out)으로 보정 전/후 근사 ΔE00 보고, 리포트 저장
+ *
+ * 색 프로파일은 번인 보정맵과 별도로 저장되고 Target에서 따로 켜고 끈다. 앱 자체 렌더링에만 적용된다.
  */
 class ColorCalibrationActivity : Activity() {
 
     companion object {
         private const val WHITE_PATTERN = "white70"
         private const val SETTLE_MS = 2_500L
-        private const val SWITCH_SETTLE_MS = 700L
-        private const val MAX_WB_ATTENUATION = 0.20f
-        private const val CENTER_SAMPLE_START = 0.35f
-        private const val CENTER_SAMPLE_END = 0.65f
-        private const val CENTER_SAMPLE_STEPS = 40
+        private const val SWITCH_SETTLE_MS = 600L
+        private const val FRAMES_PER_PATCH = 2
+        private const val DECODE_LONG_EDGE = 1600
+        private const val TARGET_PEAK = 0.55
+        private const val MIN_PEAK = 0.20
+        private const val MAX_PEAK = 0.80
+        private const val REFINE_ITERATIONS = 2
+        private const val DRIFT_WARN = 0.03
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -56,15 +62,11 @@ class ColorCalibrationActivity : Activity() {
     private lateinit var btnStart: Button
     private lateinit var btnToggle: Button
     private val resultLog = StringBuilder()
+    private var profileEnabled = true
+    /** 근사 Lab의 기준 흰색 = 목표 흰색(기준 기기 실측 흰색 × scale). */
+    private var labWhite = Rgb(1.0, 1.0, 1.0)
 
-    private data class RgbMean(val r: Double, val g: Double, val b: Double) {
-        fun chroma(): RgbMean {
-            val sum = (r + g + b).coerceAtLeast(1e-9)
-            return RgbMean(r / sum, g / sum, b / sum)
-        }
-    }
-
-    private data class ChannelGains(val r: Double, val g: Double, val b: Double, val clipped: Boolean)
+    private class Quads(val ref: ScreenDetector.Quad, val adj: ScreenDetector.Quad)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -75,13 +77,16 @@ class ColorCalibrationActivity : Activity() {
         txtResult = findViewById(R.id.txtResult)
         btnStart = findViewById(R.id.btnStart)
         btnToggle = findViewById(R.id.btnToggle)
-        btnStart.text = "화이트밸런스 시작"
+        btnStart.text = "색감 맞추기 시작"
+        btnToggle.text = "색감 보정 ON/OFF"
         btnToggle.isEnabled = false
 
         btnStart.setOnClickListener {
             btnStart.isEnabled = false
-            scope.launch { runCalibrationSafely() }
+            btnToggle.isEnabled = false
+            scope.launch { runSafely() }
         }
+        btnToggle.setOnClickListener { scope.launch { toggleProfile() } }
 
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             status("카메라 권한 없음 — 홈 화면에서 권한을 허용하세요")
@@ -94,8 +99,9 @@ class ColorCalibrationActivity : Activity() {
                 val c = CaptureController(this@ColorCalibrationActivity, findViewById<TextureView>(R.id.preview))
                 c.start()
                 capture = c
-                status("카메라 준비 완료 — 두 설비가 보이면 [화이트밸런스 시작]")
+                status("카메라 준비 완료 — 두 기기 화면이 모두 보이면 [색감 맞추기 시작]")
                 log("카메라: ${c.captureSize.width}x${c.captureSize.height} ${c.captureFormatText}, ${c.hardwareLevelText()}")
+                log("두 기기의 밝기 슬라이더·색상 모드·화면 보호 필터를 같게 맞추고 주변광을 끄세요.")
             } catch (e: Exception) {
                 status("카메라 초기화 실패: ${e.message}")
                 btnStart.isEnabled = false
@@ -103,234 +109,265 @@ class ColorCalibrationActivity : Activity() {
         }
     }
 
-    private suspend fun runCalibrationSafely() {
+    private suspend fun runSafely() {
         try {
-            runCalibration()
+            runMatch()
         } catch (e: Exception) {
-            status("화이트밸런스 실패: ${e.message}")
+            status("색감 맞추기 실패: ${e.message}")
             log("실패: ${e.stackTraceToString().lineSequence().firstOrNull() ?: e.message}")
         } finally {
             btnStart.isEnabled = true
         }
     }
 
-    private suspend fun runCalibration() {
+    private suspend fun runMatch() {
         val adjust = Session.client ?: error("조정설비가 연결되지 않았습니다")
-        val reference = Session.referenceClient ?: error("대조설비가 연결되지 않았습니다")
+        val reference = Session.referenceClient ?: error("대조설비(A급 기준 기기)가 연결되지 않았습니다")
         val cap = capture ?: error("카메라가 준비되지 않았습니다")
-        val screenW = Session.screenWidth
-        val screenH = Session.screenHeight
-        if (screenW <= 0 || screenH <= 0) error("조정설비 해상도를 알 수 없습니다")
+        val startedAt = System.currentTimeMillis()
+        resultLog.setLength(0)
+        log("기준: ${Session.referenceName} / 조정: ${Session.targetName}")
 
-        status("기존 화이트밸런스 제거, 조정설비 번인 보정 ON...")
+        status("이전 색 프로파일·화이트밸런스 제거, 번인 보정 ON...")
         withContext(Dispatchers.IO) {
+            runCatching { adjust.command(Protocol.CMD_CLEAR_COLOR_PROFILE) }
+                .onFailure { AppLog.i("색 프로파일 초기화 생략: ${it.message}") }
+            // 색 프로파일이 흰점까지 포함하므로 구 화이트밸런스 레이어와 겹치지 않게 지운다.
             runCatching { adjust.command(Protocol.CMD_CLEAR_WHITE_BALANCE) }
                 .onFailure { AppLog.i("화이트밸런스 초기화 생략: ${it.message}") }
             runCatching { adjust.command(Protocol.CMD_ENABLE_CORRECTION, "strength" to 100) }
-                .onFailure { AppLog.i("기존 번인 보정 ON 실패/없음: ${it.message}") }
+                .onFailure { log("번인 보정맵 없음/OFF 상태로 측정: ${it.message}") }
             reference.showPattern(WHITE_PATTERN)
             adjust.showPattern(WHITE_PATTERN)
         }
         delay(SETTLE_MS)
-        val lockText = cap.lockMeasurementControls(Session.screenRefreshRate)
-        log("카메라 고정: $lockText")
+        log("카메라 고정: ${cap.lockMeasurementControls(Session.screenRefreshRate)}")
 
-        status("대조설비 원본 흰색 측정...")
-        val refMean = captureSingleLitMean(
-            whiteClient = reference,
-            darkClient = adjust,
-            whiteName = "대조설비",
-            keepAdjustmentCorrectionOn = false,
-        )
-        log("대조설비 중앙 RGB: ${fmt(refMean.r)}, ${fmt(refMean.g)}, ${fmt(refMean.b)}")
+        status("화면 위치 검출...")
+        val quads = detectQuads(adjust, reference)
 
-        status("조정설비 보정 ON 흰색 측정...")
-        val adjustMean = captureSingleLitMean(
-            whiteClient = adjust,
-            darkClient = reference,
-            whiteName = "조정설비",
-            keepAdjustmentCorrectionOn = true,
-        )
-        log("조정설비 중앙 RGB(기존 보정 ON): ${fmt(adjustMean.r)}, ${fmt(adjustMean.g)}, ${fmt(adjustMean.b)}")
+        status("노출 조정...")
+        adjustExposure(cap, adjust, reference, quads)
 
-        val gains = computeGains(refMean, adjustMean)
-        if (gains.clipped) {
-            log("필요 감쇠가 ${pct(MAX_WB_ATTENUATION)} 한도를 넘은 채널이 있어 한도 내로 제한했습니다.")
+        val white = ColorPatchPlan.Patch("gray255", 255, 255, 255, ColorPatchPlan.Role.GRAY)
+        val nativePatches = ColorPatchPlan.fitPatches() + ColorPatchPlan.VALIDATION
+        val refNative = LinkedHashMap<String, Rgb>()
+        val adjNative = LinkedHashMap<String, Rgb>()
+        nativePatches.forEachIndexed { i, p ->
+            status("원본 측정 ${i + 1}/${nativePatches.size}: ${p.id}")
+            refNative[p.id] = measure(reference, adjust, p.pattern, quads.ref)
+            adjNative[p.id] = measure(adjust, reference, p.pattern, quads.adj)
         }
-        log("화이트밸런스 gain: R ${fmt(gains.r)}, G ${fmt(gains.g)}, B ${fmt(gains.b)}")
 
-        status("화이트밸런스 레이어 전송...")
-        val png = withContext(Dispatchers.Default) {
-            val r = FloatArray(4) { gains.r.toFloat() }
-            val g = FloatArray(4) { gains.g.toFloat() }
-            val b = FloatArray(4) { gains.b.toFloat() }
-            Analyzer.toRgbAttenuationPng(r, g, b, 2, 2, screenW, screenH, MAX_WB_ATTENUATION)
+        status("화면 모델 적합...")
+        val refModel = fitModel(refNative)
+        val adjModel = fitModel(adjNative)
+        val matcher = ColorMatcher(refModel, adjModel, refNative.getValue(white.id), adjNative.getValue(white.id))
+        labWhite = matcher.targetFromMeasured(refNative.getValue(white.id))
+        log("상대 밝기 배율 scale ${fmt3(matcher.scale)} (조정 기기가 기준 흰색을 낼 수 있는 최대 배율)")
+        var lut = withContext(Dispatchers.Default) { matcher.bakeLut() }
+        sendProfile(adjust, lut, matcher.scale)
+
+        val grays = ColorPatchPlan.LEVELS
+        val refGray = grays.map { refNative.getValue("gray$it") }
+        val refineLog = JSONArray()
+        repeat(REFINE_ITERATIONS) { iter ->
+            val adjGray = grays.mapIndexed { i, v ->
+                status("회색 계조 보정 ${iter + 1}/$REFINE_ITERATIONS: ${i + 1}/${grays.size}")
+                measure(adjust, reference, ColorPatchPlan.patternName(v, v, v), quads.adj)
+            }
+            val err = grays.indices.map { deltaE(matcher, refGray[it], adjGray[it] - adjModel.black) }
+            refineLog.put(JSONObject().put("iteration", iter).put("grayMeanDeltaE00", err.average()))
+            log("회색 보정 ${iter + 1}: 적용 중 회색 평균 ΔE00 ${fmt2(err.average())}")
+            lut = withContext(Dispatchers.Default) { matcher.refinePost(lut, grays, refGray, adjGray) }
+            sendProfile(adjust, lut, matcher.scale)
         }
+
+        val evalPatches = ColorPatchPlan.grayPatches() + ColorPatchPlan.VALIDATION
+        val adjAfter = LinkedHashMap<String, Rgb>()
+        evalPatches.forEachIndexed { i, p ->
+            status("최종 검증 ${i + 1}/${evalPatches.size}: ${p.id}")
+            adjAfter[p.id] = measure(adjust, reference, p.pattern, quads.adj)
+        }
+
+        status("drift 확인...")
+        val refWhiteEnd = measure(reference, adjust, white.pattern, quads.ref)
+        val refWhiteStart = refNative.getValue(white.id)
+        val drift = (refWhiteEnd.luma() - refWhiteStart.luma()) / refWhiteStart.luma()
+        log("기준 흰색 drift ${pct(drift)}" + if (kotlin.math.abs(drift) > DRIFT_WARN) " — 측정 중 화면/카메라가 변했습니다. 결과를 신뢰하기 어렵습니다." else "")
+
+        // 보정 전: 조정 기기 원본을 흰색 휘도 비로만 맞춰 비교(상대 일치 기준), 보정 후: 프로파일 적용 실측
+        val adjWhiteSignal = adjNative.getValue(white.id) - adjModel.black
+        val targetWhite = matcher.targetFromMeasured(refWhiteStart)
+        val beforeNorm = targetWhite.luma() / adjWhiteSignal.luma()
+        val rows = JSONArray()
+        val before = HashMap<String, Double>()
+        val after = HashMap<String, Double>()
+        for (p in evalPatches) {
+            val refV = refNative.getValue(p.id)
+            val b = deltaE(matcher, refV, (adjNative.getValue(p.id) - adjModel.black) * beforeNorm)
+            val a = deltaE(matcher, refV, adjAfter.getValue(p.id) - adjModel.black)
+            before[p.id] = b
+            after[p.id] = a
+            rows.put(JSONObject().put("id", p.id).put("role", p.role.name).put("code", JSONArray(listOf(p.r, p.g, p.b)))
+                .put("ref", rgbJson(refV)).put("adjBefore", rgbJson(adjNative.getValue(p.id)))
+                .put("adjAfter", rgbJson(adjAfter.getValue(p.id)))
+                .put("deltaE00Before", b).put("deltaE00After", a))
+        }
+        fun summary(ids: List<String>, m: Map<String, Double>) = ids.map { m.getValue(it) }.let { v ->
+            JSONObject().put("mean", v.average()).put("max", v.max()).put("p90", v.sorted()[((v.size - 1) * 0.9).toInt()])
+        }
+        val validationIds = ColorPatchPlan.VALIDATION.map { it.id }
+        val grayIds = ColorPatchPlan.grayPatches().map { it.id }
+        val vb = summary(validationIds, before); val va = summary(validationIds, after)
+        val gb = summary(grayIds, before); val ga = summary(grayIds, after)
+        log("검증색(held-out) 근사 ΔE00: 평균 ${fmt2(vb.getDouble("mean"))} → ${fmt2(va.getDouble("mean"))}, 최대 ${fmt2(vb.getDouble("max"))} → ${fmt2(va.getDouble("max"))}")
+        log("회색 계조 근사 ΔE00: 평균 ${fmt2(gb.getDouble("mean"))} → ${fmt2(ga.getDouble("mean"))}")
+        val worst = validationIds.maxBy { after.getValue(it) }
+        log("가장 큰 잔차: $worst (${fmt2(after.getValue(worst))}). 채도 높은 색은 조정 기기 gamut 밖이면 덜 맞습니다.")
+
+        val matrix = GlobalMatrixFit.fit(lut)
+        val adbCommand = GlobalMatrixFit.surfaceFlingerCommand(matrix)
+
+        val lutBytes = lut.encode()
+        val report = JSONObject()
+            .put("type", "color_match")
+            .put("referenceDevice", Session.referenceName)
+            .put("adjustmentDevice", Session.targetName)
+            .put("scannerDevice", "${Build.MANUFACTURER} ${Build.MODEL}")
+            .put("camera", cap.manualExposureText())
+            .put("durationSec", (System.currentTimeMillis() - startedAt) / 1000.0)
+            .put("scale", matcher.scale)
+            .put("lut", JSONObject().put("size", lut.size).put("format", ColorLut.FORMAT).put("checksumMd5", md5(lutBytes)))
+            .put("referencePrimaries", JSONArray(refModel.primaries.map { rgbJson(it) }))
+            .put("adjustmentPrimaries", JSONArray(adjModel.primaries.map { rgbJson(it) }))
+            .put("referenceWhiteDrift", drift)
+            .put("refinement", refineLog)
+            .put("summary", JSONObject()
+                .put("validationBefore", vb).put("validationAfter", va)
+                .put("grayBefore", gb).put("grayAfter", ga))
+            .put("patches", rows)
+            .put("fitMeasurements", JSONArray(ColorPatchPlan.fitPatches().map { p ->
+                JSONObject().put("id", p.id).put("ref", rgbJson(refNative.getValue(p.id))).put("adj", rgbJson(adjNative.getValue(p.id)))
+            }))
+            .put("experimentalGlobalMatrix", JSONObject()
+                .put("rowMajorLinear", JSONArray(matrix.toList()))
+                .put("adbCommand", adbCommand)
+                .put("note", "앱 밖 전역 적용용 3x3 근사. 자동 실행하지 않음. 적용 공간·행렬 순서는 기기별 검증 필요. 해제: service call SurfaceFlinger 1015 i32 0"))
+            .put("limitations", JSONArray(listOf(
+                "카메라 RGB 기준 일치: 발광 스펙트럼이 다른 패널은 육안 일치가 보장되지 않음(metamerism)",
+                "ΔE00은 카메라 RGB를 선형 sRGB로 가정한 근사값",
+                "두 기기 위치의 비네팅 차이 때문에 절대 밝기는 맞추지 않고 상대 밝기만 맞춤",
+                "프로파일은 Target 앱 자체 렌더링에만 적용됨",
+            )))
         withContext(Dispatchers.IO) {
-            adjust.request(
-                JSONObject()
-                    .put("cmd", Protocol.CMD_APPLY_WHITE_BALANCE)
-                    .put("width", screenW)
-                    .put("height", screenH)
-                    .put("maxAttenuation", MAX_WB_ATTENUATION.toDouble())
-                    .put("checksumMd5", md5(png))
-                    .put("sourceDevice", "${Build.MANUFACTURER} ${Build.MODEL}")
-                    .put("redGain", gains.r)
-                    .put("greenGain", gains.g)
-                    .put("blueGain", gains.b)
-                    .put("data", Base64.encodeToString(png, Base64.NO_WRAP)),
-                timeoutMs = 120_000,
-            )
-            adjust.command(Protocol.CMD_ENABLE_CORRECTION, "strength" to 100)
-        }
-
-        status("적용 후 색 차이 확인...")
-        val adjustedAfter = captureSingleLitMean(
-            whiteClient = adjust,
-            darkClient = reference,
-            whiteName = "조정설비 적용 후",
-            keepAdjustmentCorrectionOn = true,
-        )
-        val error = chromaError(refMean, adjustedAfter)
-        log("적용 후 중앙 RGB: ${fmt(adjustedAfter.r)}, ${fmt(adjustedAfter.g)}, ${fmt(adjustedAfter.b)}")
-        log("적용 후 색좌표 오차: ${fmt(error)}")
-
-        withContext(Dispatchers.IO) {
+            val dir = ReportStore.newSessionDir(this@ColorCalibrationActivity)
+            ReportStore.save(dir, report, mapOf("color_lut.bin" to lutBytes))
+            log("리포트 저장: ${dir.absolutePath}")
             reference.showPattern(WHITE_PATTERN)
             adjust.showPattern(WHITE_PATTERN)
         }
-        status("화이트밸런스 완료 — 기존 번인 보정 위에 RGB 레이어 적용됨")
+        profileEnabled = true
+        btnToggle.isEnabled = true
+        status("색감 맞추기 완료 — [색감 보정 ON/OFF]로 두 기기를 비교하세요")
     }
 
-    private suspend fun captureSingleLitMean(
-        whiteClient: ControlClient,
-        darkClient: ControlClient,
-        whiteName: String,
-        keepAdjustmentCorrectionOn: Boolean,
-    ): RgbMean {
+    private suspend fun detectQuads(adjust: ControlClient, reference: ControlClient): Quads {
+        val ref = detectQuad(reference, adjust, "대조설비")
+        val adj = detectQuad(adjust, reference, "조정설비")
+        require(!ColorSampling.overlaps(ref, adj)) { "두 기기 화면이 같은 위치로 검출되었습니다. 두 화면이 모두 프레임에 들어오게 배치하세요" }
+        log("화면 검출: 대조설비 $ref, 조정설비 $adj")
+        return Quads(ref, adj)
+    }
+
+    private suspend fun detectQuad(lit: ControlClient, dark: ControlClient, name: String): ScreenDetector.Quad {
         withContext(Dispatchers.IO) {
-            darkClient.showPattern("black")
-            if (keepAdjustmentCorrectionOn) {
-                runCatching { whiteClient.command(Protocol.CMD_ENABLE_CORRECTION, "strength" to 100) }
-            }
-            whiteClient.showPattern(WHITE_PATTERN)
+            dark.showPattern("black")
+            lit.showPattern(WHITE_PATTERN)
         }
         delay(SWITCH_SETTLE_MS)
-
         val frame = capture!!.captureSingleFrame()
-        val rgb = withContext(Dispatchers.Default) {
-            ImageOps.decodeLinearRgb(frame, maxLongEdge = Int.MAX_VALUE)
-        }
-        val quad = detectBrightQuad(rgb)
-            ?: error("$whiteName 화면을 찾지 못했습니다")
-        log("$whiteName 검출: ${quad}")
-        return meanCenterRgb(rgb, quad)
+        return withContext(Dispatchers.Default) {
+            ColorSampling.detectBrightQuad(ImageOps.decodeLinearRgb(frame, DECODE_LONG_EDGE))
+        } ?: error("$name 화면을 찾지 못했습니다")
     }
 
-    private fun computeGains(reference: RgbMean, adjustment: RgbMean): ChannelGains {
-        val gains = WhiteBalanceMath.compute(doubleArrayOf(reference.r, reference.g, reference.b),
-            doubleArrayOf(adjustment.r, adjustment.g, adjustment.b), MAX_WB_ATTENUATION.toDouble())
-        return ChannelGains(gains.r, gains.g, gains.b, gains.clipped)
-    }
-
-    private fun detectBrightQuad(img: RgbImage): ScreenDetector.Quad? {
-        val bins = IntArray(1024)
-        var maxV = 1e-6f
-        for (i in img.r.indices) {
-            val y = luma(img, i)
-            if (y > maxV) maxV = y
-        }
-        val scale = 1023f / maxV
-        for (i in img.r.indices) {
-            bins[(luma(img, i) * scale).toInt().coerceIn(0, 1023)]++
-        }
-        val total = img.r.size
-        var cum = 0
-        var p99 = maxV
-        for (b in 0 until 1024) {
-            cum += bins[b]
-            if (cum >= total * 0.99f) {
-                p99 = b / scale
-                break
+    /** 흰색(255)에서 두 화면 중 밝은 쪽 최대 채널이 TARGET_PEAK 근처가 되게 노출을 맞춘다 (포화·신호 부족 방지). */
+    private suspend fun adjustExposure(cap: CaptureController, adjust: ControlClient, reference: ControlClient, quads: Quads) {
+        val white = ColorPatchPlan.patternName(255, 255, 255)
+        repeat(4) {
+            val peak = maxOf(measure(reference, adjust, white, quads.ref).max(), measure(adjust, reference, white, quads.adj).max())
+            if (peak in MIN_PEAK..MAX_PEAK) {
+                log("노출 확인: 흰색 최대 채널 ${fmt3(peak)} (${cap.manualExposureText()})")
+                return
             }
-        }
-        if (p99 < 0.005f) return null
-        val threshold = p99 * 0.30f
-
-        var minSum = Float.MAX_VALUE
-        var maxSum = -Float.MAX_VALUE
-        var minDiff = Float.MAX_VALUE
-        var maxDiff = -Float.MAX_VALUE
-        val tl = Vec2()
-        val tr = Vec2()
-        val br = Vec2()
-        val bl = Vec2()
-        var count = 0
-        var i = 0
-        for (y in 0 until img.h) {
-            for (x in 0 until img.w) {
-                if (luma(img, i) > threshold) {
-                    count++
-                    val s = (x + y).toFloat()
-                    val d = (x - y).toFloat()
-                    if (s < minSum) { minSum = s; tl.set(x.toFloat(), y.toFloat()) }
-                    if (s > maxSum) { maxSum = s; br.set(x.toFloat(), y.toFloat()) }
-                    if (d > maxDiff) { maxDiff = d; tr.set(x.toFloat(), y.toFloat()) }
-                    if (d < minDiff) { minDiff = d; bl.set(x.toFloat(), y.toFloat()) }
-                }
-                i++
+            if (!cap.scaleManualExposure(TARGET_PEAK / peak, Session.screenRefreshRate)) {
+                log("노출을 더 조정할 수 없습니다 (흰색 최대 채널 ${fmt3(peak)}). 밝기 슬라이더나 거리를 바꿔 다시 시도하세요")
+                require(peak > 0.02) { "카메라 신호가 너무 약합니다" }
+                return
             }
+            delay(500)
         }
-        if (count < total * 0.03f) return null
-        val quad = ScreenDetector.Quad(arrayOf(tl, tr, br, bl))
-        val areaRatio = quad.area() / total.toFloat()
-        if (areaRatio < 0.03f || areaRatio > 0.95f) return null
-        return quad
     }
 
-    private fun meanCenterRgb(img: RgbImage, quad: ScreenDetector.Quad): RgbMean {
-        var r = 0.0
-        var g = 0.0
-        var b = 0.0
-        var count = 0
-        val start = CENTER_SAMPLE_START
-        val span = CENTER_SAMPLE_END - CENTER_SAMPLE_START
-        for (yi in 0 until CENTER_SAMPLE_STEPS) {
-            val v = start + span * (yi + 0.5f) / CENTER_SAMPLE_STEPS
-            for (xi in 0 until CENTER_SAMPLE_STEPS) {
-                val u = start + span * (xi + 0.5f) / CENTER_SAMPLE_STEPS
-                val p = quadPoint(quad, u, v)
-                r += img.bilinearChannel(p.x, p.y, 0).toDouble()
-                g += img.bilinearChannel(p.x, p.y, 1).toDouble()
-                b += img.bilinearChannel(p.x, p.y, 2).toDouble()
-                count++
+    private suspend fun measure(lit: ControlClient, dark: ControlClient, pattern: String, quad: ScreenDetector.Quad): Rgb {
+        withContext(Dispatchers.IO) {
+            dark.showPattern("black")
+            lit.showPattern(pattern)
+        }
+        delay(SWITCH_SETTLE_MS)
+        val frames = capture!!.captureFrames(FRAMES_PER_PATCH, interFrameDelayMs = 60)
+        return withContext(Dispatchers.Default) {
+            frames.map { ColorSampling.meanCenterRgb(ImageOps.decodeLinearRgb(it, DECODE_LONG_EDGE), quad) }
+                .reduce { acc, v -> acc + v } * (1.0 / frames.size)
+        }
+    }
+
+    private fun fitModel(values: Map<String, Rgb>): DisplayModel {
+        val patches = ColorPatchPlan.fitPatches()
+        val roles = listOf(ColorPatchPlan.Role.RAMP_R, ColorPatchPlan.Role.RAMP_G, ColorPatchPlan.Role.RAMP_B)
+        val ramps = roles.mapIndexed { k, role ->
+            patches.filter { it.role == role }.map { p -> intArrayOf(p.r, p.g, p.b)[k] to values.getValue(p.id) }
+        }
+        return DisplayModel.fit(values.getValue(ColorPatchPlan.BLACK.id), ramps)
+    }
+
+    /** 목표(기준 실측 × scale)와 조정 기기 신호(black 제외)의 근사 ΔE00. Lab 기준 흰색 = 목표 흰색. */
+    private fun deltaE(matcher: ColorMatcher, refMeasured: Rgb, adjSignal: Rgb): Double =
+        ColorDifference.deltaE2000(matcher.targetFromMeasured(refMeasured), adjSignal, labWhite)
+
+    private suspend fun sendProfile(adjust: ControlClient, lut: ColorLut, scale: Double) {
+        val bytes = withContext(Dispatchers.Default) { lut.encode() }
+        withContext(Dispatchers.IO) {
+            adjust.request(
+                JSONObject()
+                    .put("cmd", Protocol.CMD_APPLY_COLOR_PROFILE)
+                    .put("lutSize", lut.size)
+                    .put("format", ColorLut.FORMAT)
+                    .put("checksumMd5", md5(bytes))
+                    .put("sourceDevice", "${Build.MANUFACTURER} ${Build.MODEL}")
+                    .put("referenceDevice", Session.referenceName)
+                    .put("scale", scale)
+                    .put("data", Base64.encodeToString(bytes, Base64.NO_WRAP)),
+                timeoutMs = 60_000,
+            )
+        }
+    }
+
+    private suspend fun toggleProfile() {
+        val adjust = Session.client ?: return
+        profileEnabled = !profileEnabled
+        runCatching {
+            withContext(Dispatchers.IO) {
+                adjust.command(Protocol.CMD_SET_COLOR_PROFILE, "enabled" to profileEnabled)
+                Session.referenceClient?.showPattern(WHITE_PATTERN)
+                adjust.showPattern(WHITE_PATTERN)
             }
-        }
-        return RgbMean(r / count, g / count, b / count)
+        }.onSuccess { status("조정설비 색감 보정 ${if (profileEnabled) "ON" else "OFF"}") }
+            .onFailure { status("전환 실패: ${it.message}") }
     }
 
-    private fun quadPoint(quad: ScreenDetector.Quad, u: Float, v: Float): Vec2 {
-        val topX = quad.tl.x * (1f - u) + quad.tr.x * u
-        val topY = quad.tl.y * (1f - u) + quad.tr.y * u
-        val bottomX = quad.bl.x * (1f - u) + quad.br.x * u
-        val bottomY = quad.bl.y * (1f - u) + quad.br.y * u
-        return Vec2(
-            topX * (1f - v) + bottomX * v,
-            topY * (1f - v) + bottomY * v,
-        )
-    }
-
-    private fun luma(img: RgbImage, i: Int): Float =
-        0.2126f * img.r[i] + 0.7152f * img.g[i] + 0.0722f * img.b[i]
-
-    private fun chromaError(a: RgbMean, b: RgbMean): Double {
-        val ca = a.chroma()
-        val cb = b.chroma()
-        val dr = ca.r - cb.r
-        val dg = ca.g - cb.g
-        val db = ca.b - cb.b
-        return sqrt(dr * dr + dg * dg + db * db)
-    }
+    private fun rgbJson(c: Rgb) = JSONArray(listOf(c.r, c.g, c.b))
 
     private fun status(msg: String) {
         txtStatus.text = msg
@@ -346,9 +383,9 @@ class ColorCalibrationActivity : Activity() {
     private fun md5(bytes: ByteArray): String =
         MessageDigest.getInstance("MD5").digest(bytes).joinToString("") { "%02x".format(it) }
 
-    private fun fmt(v: Double): String = String.format(java.util.Locale.US, "%.5f", v)
-
-    private fun pct(v: Float): String = String.format(java.util.Locale.US, "%.1f%%", v * 100f)
+    private fun fmt2(v: Double): String = String.format(java.util.Locale.US, "%.2f", v)
+    private fun fmt3(v: Double): String = String.format(java.util.Locale.US, "%.3f", v)
+    private fun pct(v: Double): String = String.format(java.util.Locale.US, "%+.1f%%", v * 100)
 
     override fun onDestroy() {
         capture?.close()

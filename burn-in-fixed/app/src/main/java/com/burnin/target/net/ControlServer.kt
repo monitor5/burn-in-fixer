@@ -5,6 +5,7 @@ import android.graphics.Point
 import android.os.Build
 import android.view.WindowManager
 import com.burnin.target.DeviceRole
+import com.burnin.target.correction.ColorProfileStore
 import com.burnin.target.correction.CorrectionStore
 import com.burnin.target.correction.WhiteBalanceStore
 import com.burnin.target.overlay.OverlayService
@@ -113,6 +114,13 @@ object ControlServer {
                     .put("redGain", wb?.redGain ?: 1.0)
                     .put("greenGain", wb?.greenGain ?: 1.0)
                     .put("blueGain", wb?.blueGain ?: 1.0))
+                val cp = ColorProfileStore.meta
+                reply.put("colorProfile", JSONObject()
+                    .put("loaded", cp != null)
+                    .put("enabled", cp?.enabled ?: false)
+                    .put("lutSize", cp?.lutSize ?: 0)
+                    .put("referenceDevice", cp?.referenceDevice ?: "")
+                    .put("createdAt", cp?.createdAt ?: ""))
                 if (cmd == Protocol.CMD_HELLO) {
                     AppLog.i("HELLO 수신 (${DeviceRole.label(role)}, 화면 ${p.x}x${p.y})")
                 }
@@ -185,6 +193,44 @@ object ControlServer {
                 }
                 WhiteBalanceStore.clear(context)
                 PatternBus.setCorrection(PatternBus.correctionEnabled, null)
+            }
+
+            Protocol.CMD_APPLY_COLOR_PROFILE -> {
+                if (role == Protocol.ROLE_REFERENCE) {
+                    return err(cmd, "대조설비는 색 프로파일을 적용하지 않습니다")
+                }
+                val error = ColorProfileStore.applyFromBase64(
+                    context = context,
+                    lutSize = msg.getInt("lutSize"),
+                    format = msg.optString("format", ""),
+                    checksumMd5 = msg.optString("checksumMd5", ""),
+                    dataBase64 = msg.getString("data"),
+                    sourceDevice = msg.optString("sourceDevice", "scanner"),
+                    referenceDevice = msg.optString("referenceDevice", ""),
+                    scale = msg.optDouble("scale", 1.0),
+                )
+                if (error != null) {
+                    AppLog.i("색 프로파일 거부: $error")
+                    return err(cmd, error)
+                }
+                PatternBus.refresh()
+            }
+
+            Protocol.CMD_SET_COLOR_PROFILE -> {
+                if (role == Protocol.ROLE_REFERENCE) {
+                    return err(cmd, "대조설비는 색 프로파일을 사용하지 않습니다")
+                }
+                val error = ColorProfileStore.setEnabled(context, msg.optBoolean("enabled", true))
+                if (error != null) return err(cmd, error)
+                PatternBus.refresh()
+            }
+
+            Protocol.CMD_CLEAR_COLOR_PROFILE -> {
+                if (role == Protocol.ROLE_REFERENCE) {
+                    return err(cmd, "대조설비는 색 프로파일을 사용하지 않습니다")
+                }
+                ColorProfileStore.clear(context)
+                PatternBus.refresh()
             }
 
             Protocol.CMD_ENABLE_CORRECTION -> {

@@ -9,6 +9,7 @@ package com.burnin.target.pattern
  *  - "dotgrid"  : 도트 그리드 (렌즈 왜곡 캘리브레이션용)
  *  - "sparse70_b1_p4_x0_y3" : 희소 점등. block×block 픽셀 블록만 pitch 간격으로 켠다(밝기 70%).
  *    블록 좌상단은 (x·block + i·pitch, y·block + j·pitch). 글씨 획 단위 번인 측광용.
+ *  - "rgb-RRGGBB" : 임의 코드값 단색 (색감 측정 패치, 16진수)
  */
 data class PatternSpec(
     val name: String,
@@ -57,9 +58,14 @@ data class PatternSpec(
             return PatternSpec(name, Kind.SPARSE, rgb(v, v, v), block = block, pitch = pitch, phaseX = px, phaseY = py)
         }
 
+        private val rgbRegex = Regex("^rgb-([0-9a-f]{6})$")
+
         /** 패턴 이름 문자열을 해석한다. 알 수 없는 이름이면 null. */
         fun parse(raw: String): PatternSpec? {
             val name = raw.trim().lowercase()
+            rgbRegex.matchEntire(name)?.let { m ->
+                return solid(name, (0xFF shl 24) or m.groupValues[1].toInt(16))
+            }
             solidRegex.matchEntire(name)?.let { m ->
                 val base = m.groupValues[1]
                 val pct = (m.groupValues[2].toIntOrNull() ?: 100).coerceIn(0, 100)

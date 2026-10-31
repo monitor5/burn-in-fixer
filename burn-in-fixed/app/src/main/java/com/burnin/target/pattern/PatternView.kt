@@ -7,6 +7,7 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Rect
 import android.view.View
+import com.burnin.target.correction.ColorLut
 import kotlin.math.min
 
 /**
@@ -58,6 +59,14 @@ class PatternView(context: Context) : View(context) {
             invalidate()
         }
 
+    /** 기준 기기 색감 일치 LUT. 번인 보정 ON/OFF와 독립적으로 단색 패턴에만 적용된다. */
+    var colorLut: ColorLut? = null
+        set(value) {
+            field = value
+            clearSolidCache()
+            invalidate()
+        }
+
     var correctionEnabled: Boolean = false
         set(value) {
             field = value
@@ -97,11 +106,12 @@ class PatternView(context: Context) : View(context) {
             PatternSpec.Kind.SOLID -> {
                 val rgb = correctionRgbBitmap
                 val wb = whiteBalanceRgbBitmap
+                val base = colorLut?.transformArgb(spec.color) ?: spec.color
                 if (correctionEnabled && (rgb != null || wb != null)) {
-                    canvas.drawBitmap(correctedSolidBitmap(spec.color, w, h, rgb, wb), 0f, 0f, null)
+                    canvas.drawBitmap(correctedSolidBitmap(base, w, h, rgb, wb), 0f, 0f, null)
                     usedCorrectionRgbSolid = rgb != null
                 } else {
-                    canvas.drawColor(spec.color)
+                    canvas.drawColor(base)
                 }
             }
 

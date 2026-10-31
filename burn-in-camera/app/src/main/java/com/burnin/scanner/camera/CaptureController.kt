@@ -327,6 +327,38 @@ class CaptureController(context: Context, private val textureView: TextureView) 
     }
 
     /**
+     * 수동 고정 상태에서 총 노출량(노출 시간 × ISO)을 factor배로 바꾼다. 노출 시간은 계속
+     * 주사 주기의 정수배로 유지한다. 수동 고정이 아니거나 범위 한계로 거의 바뀌지 않으면 false.
+     * (색감 측정에서 흰색 포화/신호 부족을 피하려고 사용)
+     */
+    fun scaleManualExposure(factor: Double, displayRefreshHz: Float = 60f): Boolean {
+        val exposure = manualExposureTimeNs
+        val iso = manualSensitivityIso
+        if (!manualLocked || exposure == null || iso == null || !factor.isFinite() || factor <= 0.0) return false
+        val exposureRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+        val isoRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+        // ISO를 먼저 바꾸고, ISO 한계에 걸리면 남은 비율만큼 노출 시간을 바꾼다.
+        val desiredIso = (iso * factor).coerceIn(1.0, Int.MAX_VALUE.toDouble())
+        val newIso = Math.round(desiredIso).toInt().coerceInRange(isoRange)
+        val remaining = factor * iso / newIso
+        val (newExposure, quantIso) = quantizeExposureToRefresh(
+            Math.round(exposure * remaining).coerceAtLeast(1L).coerceInRange(exposureRange),
+            newIso, displayRefreshHz, exposureRange, isoRange,
+        )
+        val achieved = newExposure.toDouble() * quantIso / (exposure.toDouble() * iso)
+        if (Math.abs(achieved - 1.0) < 0.02) return false
+        manualExposureTimeNs = newExposure
+        manualSensitivityIso = quantIso
+        applyMeasurementControls(previewBuilder)
+        session?.setRepeatingRequest(previewBuilder.build(), previewCallback, handler)
+        return true
+    }
+
+    /** 현재 수동 노출 설명 (리포트용). */
+    fun manualExposureText(): String =
+        if (manualLocked) "ISO $manualSensitivityIso, ${manualExposureTimeNs}ns" else "AE/AWB lock"
+
+    /**
      * 노출을 주사 주기(1/refreshHz)의 정수배로 양자화하고, 총 노출량이 유지되도록 ISO를
      * 반비례 보상한다. 우선 올림(노출↑·ISO↓, 노이즈도 감소)을 시도하고, ISO 하한이나
      * 노출 상한에 걸려 밝기가 15% 이상 달라지면 내림을 시도하며, 둘 다 불가하면 원값 유지.

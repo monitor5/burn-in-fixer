@@ -64,4 +64,13 @@ class PatternSpecTest {
         assertNull(PatternSpec.parse("sparse70_b3_p3_x0_y0"))   // 블록끼리 붙음
         assertNull(PatternSpec.parse("sparse70_b0_p4_x0_y0"))
     }
+
+    @Test
+    fun parsesArbitraryRgbPatches() {
+        assertEquals(0xFFFF8000.toInt(), PatternSpec.parse("rgb-ff8000")!!.color)
+        assertEquals(0xFF0A0B0C.toInt(), PatternSpec.parse("RGB-0A0B0C")!!.color)
+        assertEquals(PatternSpec.Kind.SOLID, PatternSpec.parse("rgb-000000")!!.kind)
+        assertNull(PatternSpec.parse("rgb-ff80"))
+        assertNull(PatternSpec.parse("rgb-gg0000"))
+    }
 }

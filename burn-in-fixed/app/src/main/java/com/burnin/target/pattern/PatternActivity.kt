@@ -6,6 +6,7 @@ import android.os.Bundle
 import android.view.View
 import android.view.WindowManager
 import com.burnin.target.DeviceRole
+import com.burnin.target.correction.ColorProfileStore
 import com.burnin.target.correction.CorrectionStore
 import com.burnin.target.correction.WhiteBalanceStore
 import com.burnin.target.util.AppLog
@@ -111,6 +112,7 @@ class PatternActivity : Activity(), PatternBus.Host {
         view.whiteBalanceRgbBitmap = WhiteBalanceStore.rgbAttenuationBitmap
         view.whiteBalanceMaxAttenuation = WhiteBalanceStore.meta?.maxAttenuation ?: 0.10
         view.correctionEnabled = !DeviceRole.isReference(this) && PatternBus.correctionEnabled
+        view.colorLut = if (DeviceRole.isReference(this)) null else ColorProfileStore.activeLut
         view.strengthPct = PatternBus.strengthPct
     }
 

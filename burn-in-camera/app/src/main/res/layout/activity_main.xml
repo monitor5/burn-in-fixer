@@ -99,7 +99,7 @@
         android:layout_height="wrap_content"
         android:layout_marginTop="6dp"
         android:enabled="false"
-        android:text="화이트밸런스 캘리브레이션" />
+        android:text="색감 맞추기 (대조설비 기준)" />
 
     <TextView
         android:layout_width="match_parent"

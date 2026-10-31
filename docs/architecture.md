@@ -60,9 +60,14 @@ Target 프로토콜에서 `maxAttenuation`을 생략하면 번인 맵 기본값�
 | `ENABLE_OVERLAY`, `DISABLE_OVERLAY` | 선택 `strength` | 시스템 알파 오버레이 |
 | `APPLY_WHITE_BALANCE` | `width`, `height`, `maxAttenuation`, `checksumMd5`, `data`, 선택 `redGain`, `greenGain`, `blueGain`, `sourceDevice` | 별도 화이트밸런스 RGB 레이어 |
 | `CLEAR_WHITE_BALANCE` | — | 화이트밸런스 제거 |
+| `APPLY_COLOR_PROFILE` | `lutSize`, `format`(`rgb3d-u16be-v1`), `checksumMd5`, `data`, 선택 `scale`, `sourceDevice`, `referenceDevice` | 기준 기기 색감 일치 3D LUT 저장·적용(ON) |
+| `SET_COLOR_PROFILE` | `enabled` | 색 프로파일만 ON/OFF (번인 보정과 독립) |
+| `CLEAR_COLOR_PROFILE` | — | 색 프로파일 제거 |
 | `END_SESSION` | — | 패턴 화면 종료 |
 
 대조설비(reference)는 보정·화이트밸런스·오버레이 적용 명령을 거부하고 패턴을 무보정으로 표시합니다.
+
+`SHOW_PATTERN`은 `rgb-RRGGBB`(16진수) 임의 코드값 단색도 받습니다. 색 프로파일 데이터는 big-endian uint16 `[size³×3 LUT, 인덱스 ((r·N)+g)·N+b] + [3×256 post 곡선]`이며, 적용 순서는 원래 색 → 색 LUT → 번인 RGB/알파 감쇠 → (구) 화이트밸런스입니다. 단색 패턴에만 적용합니다.
 
 그레이 맵 값 `v`는 감쇠 파라미터 `v / 255 × maxAttenuation`을 의미합니다. RGB 맵은 각 채널이 해당 감쇠를 나타냅니다. 이는 출력에 쓰는 코드값·알파 모델의 정의이며 물리 휘도 교정 단위가 아닙니다.
 

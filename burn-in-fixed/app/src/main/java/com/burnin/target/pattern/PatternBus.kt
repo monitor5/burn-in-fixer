@@ -76,6 +76,11 @@ object PatternBus {
         }
     }
 
+    /** 보정 상태는 그대로 두고 프로파일(색 LUT 등) 변경만 화면에 반영한다. */
+    fun refresh() {
+        main.post { host?.applyCorrectionState() }
+    }
+
     fun endSession() {
         main.post { host?.closeSelf() }
     }
