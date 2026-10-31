@@ -4,11 +4,24 @@ import com.burnin.scanner.analysis.Analyzer
 import com.burnin.scanner.analysis.ScreenDetector
 
 internal object MeasurementPolicy {
-    fun score(stats: Analyzer.Stats, rmsLimit: Float, p95Limit: Float): Float {
+    /**
+     * 1 이하가 합격. 셀 단위 RMS/P95는 면적이 작은 띠 결함을 희석하므로 블록 평균 최대 편차
+     * ([Analyzer.blockMaxDev])도 함께 본다. blockDev를 생략하면 기존 두 지표만 쓴다.
+     */
+    fun score(
+        stats: Analyzer.Stats,
+        rmsLimit: Float,
+        p95Limit: Float,
+        blockDev: Float? = null,
+        blockLimit: Float = Float.POSITIVE_INFINITY,
+    ): Float {
         require(rmsLimit.isFinite() && rmsLimit > 0f && p95Limit.isFinite() && p95Limit > 0f)
+        require(blockDev == null || (blockLimit.isFinite() && blockLimit > 0f))
         if (!stats.median.isFinite() || stats.median <= 1e-4f ||
             !stats.rmsDev.isFinite() || stats.rmsDev < 0f || !stats.p95Dev.isFinite() || stats.p95Dev < 0f) return Float.POSITIVE_INFINITY
-        return maxOf(stats.rmsDev / rmsLimit, stats.p95Dev / p95Limit)
+        if (blockDev != null && (!blockDev.isFinite() || blockDev < 0f)) return Float.POSITIVE_INFINITY
+        val cellScore = maxOf(stats.rmsDev / rmsLimit, stats.p95Dev / p95Limit)
+        return if (blockDev == null) cellScore else maxOf(cellScore, blockDev / blockLimit)
     }
 
     fun geometryStable(reference: ScreenDetector.Quad, current: ScreenDetector.Quad, tolerancePx: Float = 4f): Boolean =

@@ -144,7 +144,7 @@ class PipelineTest {
         val det = ScreenDetector.detect(before)!!
         val h = Analyzer.buildHomography(det.quad, screenW, screenH)!!
         val lumaBefore = Analyzer.lumaGrid(before, null, h, screenW, screenH, gw, gh)
-        val target = Analyzer.stats(lumaBefore).p10
+        val target = Analyzer.correctionTarget(lumaBefore, gw, gh, maxAtt)
 
         // 초기 맵을 의도적으로 절반만 보정된 상태로 약화 (첫 보정이 부족했던 상황)
         val full = Analyzer.gainGrid(lumaBefore, gw, gh, maxAtt)

@@ -19,9 +19,15 @@ import java.io.ByteArrayOutputStream
 object Analyzer {
     const val SCREEN_SAMPLE_MARGIN = 0f
     const val EDGE_RAMP_FRACTION = 0f
-    private const val FLAT_FIELD_OUTLIER_OK = 0.04f
-    private const val FLAT_FIELD_OUTLIER_REJECT = 0.12f
     private const val FLAT_FIELD_MAX_DEVIATION = 0.18f
+    private const val FLAT_FIELD_IRLS_ITERATIONS = 8
+    private const val FLAT_FIELD_QUADRATIC_ITERATIONS = 3
+    private const val FLAT_FIELD_TUKEY_C = 4.685f
+    private const val FLAT_FIELD_MIN_SCALE = 0.002f
+
+    /** 블록 통계의 긴 변 방향 블록 수. 2400px 화면이면 40px 블록(상태바 높이의 절반 이하). */
+    const val BLOCKS_ALONG_LONG_EDGE = 60
+    private const val TARGET_BLOCK_PERCENTILE = 0.01f
 
 
     data class Stats(
@@ -277,100 +283,147 @@ object Analyzer {
 
     /**
      * 카메라 비네팅/플랫필드 근사. 별도 적분구/무한균일 광원이 없는 현장 측정이므로,
-     * gray 기준 프레임에서 반지름별 저주파 성분만 추정한다. 2-pass outlier 억제로
-     * 번인/얼룩이 렌즈 비네팅으로 흡수되는 것을 줄이고, 과한 현장 보정은 제한한다.
+     * gray 기준 프레임에서 반지름에 대한 매끄러운 저차 모델 c0 + c1·ρ² + c2·ρ⁴만 추정한다.
+     *
+     * 반지름 bin별 평균은 세로로 긴 화면에서 바깥 bin이 상태바·내비바 띠로만 채워져
+     * 그 띠의 번인을 비네팅으로 흡수한다. 그래서 블록 평균(노이즈 억제)에 Tukey IRLS를 적용하고,
+     * 처음 몇 회는 ρ²만 맞춘 뒤 ρ⁴를 연다. 국소 결함은 이상치로 빠지지만, 화면 전체에 걸친
+     * 매끄러운 방사형 패널 열화는 단일 촬영으로 비네팅과 구분할 수 없다(외부 flat-field 필요).
      */
-    fun radialFlatField(luma: FloatArray, gw: Int, gh: Int, bins: Int = 64): FloatArray {
-        require(luma.size == gw * gh) { "grid size mismatch" }
+    fun radialFlatField(luma: FloatArray, gw: Int, gh: Int): FloatArray {
+        require(gw > 0 && gh > 0 && luma.size == gw * gh) { "grid size mismatch" }
         val median = stats(luma).median.coerceAtLeast(1e-5f)
-        val cx = (gw - 1) * 0.5f
-        val cy = (gh - 1) * 0.5f
-        val maxR = Math.sqrt((cx * cx + cy * cy).toDouble()).coerceAtLeast(1e-5)
-
-        fun radialBin(x: Int, y: Int): Int {
-            val dx = x - cx
-            val dy = y - cy
-            return ((Math.sqrt((dx * dx + dy * dy).toDouble()) / maxR) * (bins - 1))
-                .toInt()
-                .coerceIn(0, bins - 1)
+        val cx = (gw - 1) * 0.5
+        val cy = (gh - 1) * 0.5
+        val maxR2 = (cx * cx + cy * cy).coerceAtLeast(1e-10)
+        val blocks = blockGrid(luma, gw, gh)
+        val n = blocks.means.size
+        val rho2 = DoubleArray(n)
+        val y = DoubleArray(n)
+        for (i in 0 until n) {
+            val dx = blocks.centerX[i] - cx
+            val dy = blocks.centerY[i] - cy
+            rho2[i] = (dx * dx + dy * dy) / maxR2
+            y[i] = (blocks.means[i] / median).toDouble()
         }
-
-        fun smoothProfile(profile: FloatArray, passes: Int = 3) {
-            repeat(passes) {
-                val copy = profile.clone()
-                for (i in profile.indices) {
-                    var acc = 0f
-                    var n = 0
-                    for (d in -2..2) {
-                        val j = i + d
-                        if (j in profile.indices) {
-                            acc += copy[j]
-                            n++
-                        }
-                    }
-                    profile[i] = acc / n
-                }
+        val weight = DoubleArray(n) { 1.0 }
+        val residual = DoubleArray(n)
+        var coef = doubleArrayOf(1.0, 0.0, 0.0)
+        for (iter in 0 until FLAT_FIELD_IRLS_ITERATIONS) {
+            val quartic = iter >= FLAT_FIELD_QUADRATIC_ITERATIONS
+            coef = fitEvenRadial(rho2, y, weight, blocks.counts, quartic) ?: break
+            for (i in 0 until n) residual[i] = y[i] - evalEvenRadial(coef, rho2[i])
+            val absSorted = DoubleArray(n) { Math.abs(residual[it]) }.apply { sort() }
+            val scale = maxOf(1.4826 * absSorted[n / 2], FLAT_FIELD_MIN_SCALE.toDouble()) * FLAT_FIELD_TUKEY_C
+            for (i in 0 until n) {
+                val u = residual[i] / scale
+                weight[i] = if (Math.abs(u) < 1.0) (1 - u * u) * (1 - u * u) else 0.0
             }
         }
-
-        val sum = DoubleArray(bins)
-        val count = IntArray(bins)
-        for (y in 0 until gh) {
-            for (x in 0 until gw) {
-                val b = radialBin(x, y)
-                sum[b] += (luma[y * gw + x] / median).toDouble()
-                count[b]++
-            }
-        }
-        val profile = FloatArray(bins) { i ->
-            if (count[i] > 0) (sum[i] / count[i]).toFloat() else 1f
-        }
-        smoothProfile(profile)
-
-        val robustSum = DoubleArray(bins)
-        val robustWeight = DoubleArray(bins)
-        for (y in 0 until gh) {
-            for (x in 0 until gw) {
-                val b = radialBin(x, y)
-                val normalized = luma[y * gw + x] / median
-                val expected = profile[b].coerceAtLeast(1e-5f)
-                val residual = normalized / expected - 1f
-                val absResidual = Math.abs(residual)
-                val weight = when {
-                    absResidual <= FLAT_FIELD_OUTLIER_OK -> 1.0
-                    absResidual >= FLAT_FIELD_OUTLIER_REJECT -> 0.0
-                    else -> 1.0 -
-                        (absResidual - FLAT_FIELD_OUTLIER_OK) /
-                        (FLAT_FIELD_OUTLIER_REJECT - FLAT_FIELD_OUTLIER_OK)
-                }
-                if (weight > 0.0) {
-                    robustSum[b] += normalized.toDouble() * weight
-                    robustWeight[b] += weight
-                }
-            }
-        }
-        for (i in profile.indices) {
-            if (robustWeight[i] > 0.0) profile[i] = (robustSum[i] / robustWeight[i]).toFloat()
-        }
-        smoothProfile(profile, passes = 4)
 
         val out = FloatArray(luma.size)
-        for (y in 0 until gh) {
-            val dy = y - cy
-            for (x in 0 until gw) {
-                val dx = x - cx
-                val f = (Math.sqrt((dx * dx + dy * dy).toDouble()) / maxR * (bins - 1))
-                    .toFloat()
-                    .coerceIn(0f, bins - 1.001f)
-                val i0 = f.toInt()
-                val t = f - i0
-                val a = profile[i0]
-                val b = profile[(i0 + 1).coerceAtMost(bins - 1)]
-                out[y * gw + x] = (a * (1 - t) + b * t)
+        for (gy in 0 until gh) {
+            val dy = gy - cy
+            for (gx in 0 until gw) {
+                val dx = gx - cx
+                out[gy * gw + gx] = evalEvenRadial(coef, (dx * dx + dy * dy) / maxR2).toFloat()
                     .coerceIn(1f - FLAT_FIELD_MAX_DEVIATION, 1f + FLAT_FIELD_MAX_DEVIATION)
             }
         }
         return out
+    }
+
+    private fun evalEvenRadial(c: DoubleArray, rho2: Double): Double = c[0] + c[1] * rho2 + c[2] * rho2 * rho2
+
+    /** 가중 최소제곱 [1, ρ², (ρ⁴)] 적합. 특이 행렬이면 null. */
+    private fun fitEvenRadial(
+        rho2: DoubleArray,
+        y: DoubleArray,
+        weight: DoubleArray,
+        counts: IntArray,
+        quartic: Boolean,
+    ): DoubleArray? {
+        val k = if (quartic) 3 else 2
+        val a = Array(k) { DoubleArray(k + 1) }
+        for (i in rho2.indices) {
+            val w = weight[i] * counts[i]
+            if (w <= 0.0) continue
+            val f = doubleArrayOf(1.0, rho2[i], rho2[i] * rho2[i])
+            for (r in 0 until k) {
+                a[r][k] += w * f[r] * y[i]
+                for (c in 0 until k) a[r][c] += w * f[r] * f[c]
+            }
+        }
+        for (col in 0 until k) {
+            val pivot = (col until k).maxByOrNull { Math.abs(a[it][col]) }!!
+            if (Math.abs(a[pivot][col]) < 1e-12) return null
+            val tmp = a[col]; a[col] = a[pivot]; a[pivot] = tmp
+            for (r in 0 until k) {
+                if (r == col) continue
+                val factor = a[r][col] / a[col][col]
+                for (c in col..k) a[r][c] -= factor * a[col][c]
+            }
+        }
+        val out = DoubleArray(3)
+        for (r in 0 until k) out[r] = a[r][k] / a[r][r]
+        return out
+    }
+
+    /** 긴 변 기준 [BLOCKS_ALONG_LONG_EDGE]개 정사각 블록의 평균. 가장자리 블록은 실제 셀 수로 나눈다. */
+    class BlockGrid(
+        val blockSize: Int,
+        val means: FloatArray,
+        val counts: IntArray,
+        val centerX: DoubleArray,
+        val centerY: DoubleArray,
+    )
+
+    fun blockGrid(grid: FloatArray, gw: Int, gh: Int, blocksAlongLongEdge: Int = BLOCKS_ALONG_LONG_EDGE): BlockGrid {
+        require(gw > 0 && gh > 0 && grid.size == gw * gh) { "grid size mismatch" }
+        require(blocksAlongLongEdge > 0)
+        val bs = Math.round(maxOf(gw, gh).toFloat() / blocksAlongLongEdge).coerceAtLeast(1)
+        val bw = (gw + bs - 1) / bs
+        val bh = (gh + bs - 1) / bs
+        val sums = DoubleArray(bw * bh)
+        val counts = IntArray(bw * bh)
+        for (y in 0 until gh) {
+            val row = (y / bs) * bw
+            for (x in 0 until gw) {
+                val b = row + x / bs
+                sums[b] += grid[y * gw + x].toDouble()
+                counts[b]++
+            }
+        }
+        val centerX = DoubleArray(bw * bh) { b -> ((b % bw) * bs + minOf((b % bw + 1) * bs, gw) - 1) * 0.5 }
+        val centerY = DoubleArray(bw * bh) { b -> ((b / bw) * bs + minOf((b / bw + 1) * bs, gh) - 1) * 0.5 }
+        return BlockGrid(bs, FloatArray(bw * bh) { (sums[it] / counts[it]).toFloat() }, counts, centerX, centerY)
+    }
+
+    /**
+     * 블록 평균의 중앙값 대비 최대 상대 편차. 셀 단위 RMS/P95는 면적이 작은 번인을 희석하거나
+     * (P95는 면적 5% 미만을 정의상) 무시하므로, 상태바처럼 좁은 띠 결함을 보는 국소 지표로 쓴다.
+     */
+    fun blockMaxDev(grid: FloatArray, gw: Int, gh: Int): Float {
+        require(grid.all { it.isFinite() && it >= 0f }) { "signal must be finite and nonnegative" }
+        val median = stats(grid).median
+        val means = blockGrid(grid, gw, gh).means
+        var maxDev = 0f
+        for (m in means) maxDev = maxOf(maxDev, Math.abs(m / median - 1f))
+        return maxDev
+    }
+
+    /**
+     * 감쇠 보정의 목표 휘도. 블록 평균의 하위 1%(노이즈에 강하고 좁은 번인 띠도 포함)를 쓰되,
+     * 정상 영역을 maxAtt보다 더 낮추는 목표는 의미가 없으므로 median·(1-maxAtt)를 하한으로 둔다.
+     * 셀 단위 p10은 번인 면적이 10% 미만이면 정상 밝기에 걸려 보정이 거의 일어나지 않았다.
+     */
+    fun correctionTarget(luma: FloatArray, gw: Int, gh: Int, maxAtt: Float): Float {
+        requireGrid(luma, gw, gh)
+        requireAttenuation(maxAtt)
+        val median = stats(luma).median
+        val means = blockGrid(luma, gw, gh).means.apply { sort() }
+        val low = means[(means.size * TARGET_BLOCK_PERCENTILE).toInt().coerceIn(0, means.size - 1)]
+        return maxOf(low, median * (1f - maxAtt))
     }
 
     fun edgeFalloff(luma: FloatArray, gw: Int, gh: Int, bandFraction: Float = 0.06f): Float {
@@ -771,8 +824,7 @@ object Analyzer {
         require(smoothRadius >= 0)
         requireConfidence(confidence)
         if (confidence != null) require(confidence.size == luma.size) { "confidence grid size mismatch" }
-        val st = stats(luma)
-        val target = st.p10
+        val target = correctionTarget(luma, gw, gh, maxAtt)
         val gain = FloatArray(luma.size)
         for (i in luma.indices) {
             val raw = (target / luma[i].coerceAtLeast(1e-5f)).coerceIn(1f - maxAtt, 1f)

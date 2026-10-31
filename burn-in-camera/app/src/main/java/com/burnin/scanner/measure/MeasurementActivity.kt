@@ -74,6 +74,7 @@ class MeasurementActivity : Activity() {
         private const val MAX_ATTENUATION = 0.10f
         private const val PASS_RMS = 0.015f      // 합격: 잔여 RMS ≤ 1.5%
         private const val PASS_P95 = 0.035f      // 합격: P95 편차 ≤ 3.5%
+        private const val PASS_BLOCK = 0.02f     // 합격: 블록 평균 최대 편차 ≤ 2% (좁은 띠 번인)
         private const val MAX_ITERATIONS = 24    // 품질 우선 반복 상한
         private const val STAGNATION_LIMIT = 4
         private const val DIVERGENCE_LIMIT = 3
@@ -137,6 +138,8 @@ class MeasurementActivity : Activity() {
         val aggregateGain: FloatArray?,
         val confidences: LinkedHashMap<String, FloatArray>,
         val channelGains: LinkedHashMap<Int, FloatArray>,
+        /** 패턴별 보정 목표 휘도 (includeGain 측정에서만 채운다) */
+        val targets: LinkedHashMap<String, Float>,
         val meanRms: Float,
         val maxStrayRatio: Float,
         val signalValid: Boolean,
@@ -476,7 +479,7 @@ class MeasurementActivity : Activity() {
         }
         val blackStats = Analyzer.stats(blackGrid)
         val statsBefore = Analyzer.stats(lumaBefore)
-        val target = statsBefore.p10
+        val target = Analyzer.correctionTarget(lumaBefore, gw, gh, MAX_ATTENUATION)
         val strayRatio = blackStats.median / statsBefore.median
         log(
             "카메라 flat-field 보정: radial max ${pct(Analyzer.flatFieldStrength(flatField))}, " +
@@ -496,7 +499,7 @@ class MeasurementActivity : Activity() {
         }
         log(
             "보정 전: RMS편차 ${pct(statsBefore.rmsDev)}, P95 ${pct(statsBefore.p95Dev)}, " +
-                "최대 ${pct(statsBefore.maxDev)}"
+                "최대 ${pct(statsBefore.maxDev)}, 블록 최대 ${pct(Analyzer.blockMaxDev(lumaBefore, gw, gh))}"
         )
 
         // ── 5. 저휘도 맵 측정: gray25도 보정맵에 혼합 ─────────────
@@ -520,7 +523,7 @@ class MeasurementActivity : Activity() {
             if (cross == null) single else Analyzer.combineConfidence(single, cross.agreement)
         }
         val lowStatsBefore = Analyzer.stats(lumaLowBefore)
-        val lowTarget = lowStatsBefore.p10
+        val lowTarget = Analyzer.correctionTarget(lumaLowBefore, gw, gh, MAX_ATTENUATION)
         val lowStrayRatio = blackStats.median / lowStatsBefore.median
         val lowSignalValid = lowStrayRatio <= LOW_LIGHT_STRAY_WARN
         val lowLightWeight = if (lowSignalValid) LOW_LIGHT_GAIN_WEIGHT else LOW_LIGHT_WEAK_GAIN_WEIGHT
@@ -671,8 +674,10 @@ class MeasurementActivity : Activity() {
             bestLowRgbRms != Float.MAX_VALUE -> bestLowRgbRms
             else -> rgb30.meanRms
         }
-        val finalGray70Passed = finalStatsAfter?.let { uniformityPassed(it) } == true
-        val finalLowPassed = finalLowStatsAfter?.let { uniformityPassed(it) } == true
+        val finalGray70Passed = finalStatsAfter != null && finalLumaAfter != null &&
+            uniformityPassed(finalStatsAfter, finalLumaAfter, gw, gh)
+        val finalLowPassed = finalLowStatsAfter != null && finalLowLumaAfter != null &&
+            uniformityPassed(finalLowStatsAfter, finalLowLumaAfter, gw, gh)
         val finalUniformityPassed = finalGray70Passed && finalLowPassed
         val improvement = MeasurementPolicy.improvement(statsBefore.rmsDev, finalRms)
         val lowImprovement = MeasurementPolicy.improvement(lowStatsBefore.rmsDev, finalLowRms)
@@ -703,7 +708,11 @@ class MeasurementActivity : Activity() {
             )
         }
         log("개선율 ${pct(improvement.toFloat())}, 평균 밝기 손실 ${pct(brightnessLoss.toFloat())}")
-        log("판정: $verdict (gray70/$LOW_LIGHT_PATTERN 모두 RMS ≤ ${pct(PASS_RMS)}, P95 ≤ ${pct(PASS_P95)})")
+        finalLumaAfter?.let { log("gray70 블록 최대 편차: 보정 후 ${pct(Analyzer.blockMaxDev(it, gw, gh))}") }
+        log(
+            "판정: $verdict (gray70/$LOW_LIGHT_PATTERN 모두 RMS ≤ ${pct(PASS_RMS)}, P95 ≤ ${pct(PASS_P95)}, " +
+                "블록 최대 ≤ ${pct(PASS_BLOCK)})"
+        )
 
         // ── 9. 리포트 저장 ──────────────────────────────────────
         status("10/10 리포트 저장...")
@@ -807,7 +816,10 @@ class MeasurementActivity : Activity() {
         } ?: grayMixedGain
         gain = Analyzer.limitGainByConfidence(gain, confidence70, MAX_ATTENUATION)
         val baselineLowStats = Analyzer.stats(lumaLowBefore)
-        val baselineScore = maxOf(uniformityScore(statsBefore), uniformityScore(baselineLowStats)) * (1f - lowRgbWeight) +
+        val baselineScore = maxOf(
+            uniformityScore(statsBefore, lumaBefore, gw, gh),
+            uniformityScore(baselineLowStats, lumaLowBefore, gw, gh),
+        ) * (1f - lowRgbWeight) +
             (if (rgb30.stats.isNotEmpty()) rgb30.meanRms / PASS_RMS else 0f) * lowRgbWeight
         val selection = MeasurementPolicy.Selection(FloatArray(gain.size) { 1f }, baselineScore)
         var bestRms = statsBefore.rmsDev
@@ -821,9 +833,7 @@ class MeasurementActivity : Activity() {
         val iterRmsList = ArrayList<Float>()
         val iterLowRmsList = ArrayList<Float>()
         val iterLowRgbRmsList = ArrayList<Float>()
-        val rgb30Targets = LinkedHashMap<String, Float>().apply {
-            rgb30.stats.forEach { (pattern, st) -> put(pattern, st.p10) }
-        }
+        val rgb30Targets = LinkedHashMap(rgb30.targets)
 
         withContext(Dispatchers.IO) { client.showPattern("gray70") }
         var iter = 0
@@ -888,10 +898,12 @@ class MeasurementActivity : Activity() {
                 emptyRgbMeasurement()
             }
             val rgb30AfterMeanRms = rgb30After.meanRms
-            val gray70Passed = uniformityPassed(st)
-            val lowLightPassed = uniformityPassed(lowSt)
+            val grayScore70 = uniformityScore(st, lumaAfter, gw, gh)
+            val grayScoreLow = uniformityScore(lowSt, lumaLowAfter, gw, gh)
+            val gray70Passed = grayScore70 <= 1f
+            val lowLightPassed = grayScoreLow <= 1f
             val bothGrayPassed = gray70Passed && lowLightPassed
-            val grayScore = maxOf(uniformityScore(st), uniformityScore(lowSt))
+            val grayScore = maxOf(grayScore70, grayScoreLow)
             val rgbScore = if (rgb30After.stats.isNotEmpty()) {
                 rgb30AfterMeanRms / PASS_RMS
             } else {
@@ -1184,6 +1196,12 @@ class MeasurementActivity : Activity() {
             .put("improvementRatio", improvement)
             .put("passRmsThreshold", PASS_RMS.toDouble())
             .put("passP95Threshold", PASS_P95.toDouble())
+            .put("passBlockMaxThreshold", PASS_BLOCK.toDouble())
+            .put("blockSizePx", Analyzer.blockGrid(lumaBefore, gw, gh).blockSize)
+            .put("blockMaxDevBefore", Analyzer.blockMaxDev(lumaBefore, gw, gh).toDouble())
+            .put("blockMaxDevAfter", Analyzer.blockMaxDev(finalLumaAfter ?: lumaBefore, gw, gh).toDouble())
+            .put("lowLightBlockMaxDevBefore", Analyzer.blockMaxDev(lumaLowBefore, gw, gh).toDouble())
+            .put("lowLightBlockMaxDevAfter", Analyzer.blockMaxDev(finalLowLumaAfter ?: lumaLowBefore, gw, gh).toDouble())
             .put("gray70UniformityPassed", finalGray70Passed)
             .put("lowLightPattern", LOW_LIGHT_PATTERN)
             .put("lowLightRmsBefore", lowStatsBefore.rmsDev.toDouble())
@@ -1302,11 +1320,11 @@ class MeasurementActivity : Activity() {
         return (s / a.size).toFloat()
     }
 
-    private fun uniformityPassed(stats: Analyzer.Stats): Boolean =
-        uniformityScore(stats) <= 1f
+    private fun uniformityPassed(stats: Analyzer.Stats, grid: FloatArray, gw: Int, gh: Int): Boolean =
+        uniformityScore(stats, grid, gw, gh) <= 1f
 
-    private fun uniformityScore(stats: Analyzer.Stats): Float =
-        MeasurementPolicy.score(stats, PASS_RMS, PASS_P95)
+    private fun uniformityScore(stats: Analyzer.Stats, grid: FloatArray, gw: Int, gh: Int): Float =
+        MeasurementPolicy.score(stats, PASS_RMS, PASS_P95, Analyzer.blockMaxDev(grid, gw, gh), PASS_BLOCK)
 
     private suspend fun measureRgbPatterns(
         client: ControlClient,
@@ -1331,6 +1349,7 @@ class MeasurementActivity : Activity() {
         val heatmaps = LinkedHashMap<String, ByteArray>()
         val confidences = LinkedHashMap<String, FloatArray>()
         val channelGains = LinkedHashMap<Int, FloatArray>()
+        val targets = LinkedHashMap<String, Float>()
         val gains = ArrayList<FloatArray>()
         var maxStrayRatio = 0f
 
@@ -1384,6 +1403,7 @@ class MeasurementActivity : Activity() {
                     }
                     gains += gain
                     channelGains[channel] = gain
+                    targets[pattern] = Analyzer.correctionTarget(grid, gw, gh, MAX_ATTENUATION)
                 }
             } finally {
                 if (!includeGain && !keepGrids) {
@@ -1407,6 +1427,7 @@ class MeasurementActivity : Activity() {
             aggregateGain = aggregateGain,
             confidences = confidences,
             channelGains = channelGains,
+            targets = targets,
             meanRms = meanRms,
             maxStrayRatio = maxStrayRatio,
             signalValid = stats.isNotEmpty() && maxStrayRatio <= LOW_LIGHT_STRAY_WARN,
@@ -1444,6 +1465,7 @@ class MeasurementActivity : Activity() {
             aggregateGain = null,
             confidences = LinkedHashMap(),
             channelGains = LinkedHashMap(),
+            targets = LinkedHashMap(),
             meanRms = 0f,
             maxStrayRatio = 0f,
             signalValid = false,
