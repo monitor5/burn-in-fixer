@@ -44,4 +44,13 @@ class PatternViewTest {
         val p=pixel(v);assertEquals(229,Color.red(p));assertTrue(Color.blue(p) in 182..184)
         alpha.recycle();wb.recycle()
     }
+    @Test fun sparsePatternIsPixelExactWithoutAntialiasing() {
+        val v=PatternView(RuntimeEnvironment.getApplication()).apply{layout(0,0,8,8);spec=PatternSpec.parse("sparse70_b1_p4_x1_y2")!!}
+        val out=Bitmap.createBitmap(8,8,Bitmap.Config.ARGB_8888);v.draw(Canvas(out))
+        for (y in 0 until 8) for (x in 0 until 8) {
+            val lit=(x-1)>=0&&(y-2)>=0&&(x-1)%4==0&&(y-2)%4==0
+            assertEquals("($x,$y)", if (lit) 0xFFB3B3B3.toInt() else Color.BLACK, out.getPixel(x,y))
+        }
+        out.recycle()
+    }
 }

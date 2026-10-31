@@ -40,9 +40,14 @@ internal object MeasurementPolicy {
         var score = baselineScore; private set
         var isBaseline = true; private set
         init { require(baselineScore.isFinite() && baselineScore >= 0f) }
-        fun correctionMap(channelGains: Map<Int, FloatArray>, channelWeight: Float): CorrectionMap =
+        fun correctionMap(
+            channelGains: Map<Int, FloatArray>,
+            channelWeight: Float,
+            detail: FloatArray? = null,
+            maxAttenuation: Float = 1f,
+        ): CorrectionMap =
             CorrectionMap(gain, if (isBaseline) emptyMap() else channelGains,
-                if (isBaseline) 0f else channelWeight, isBaseline)
+                if (isBaseline) 0f else channelWeight, isBaseline, detail, maxAttenuation)
 
         fun consider(candidate: FloatArray, candidateScore: Float): Boolean {
             require(candidate.size == gain.size && candidate.all { it.isFinite() && it in 0f..1f })

@@ -86,6 +86,8 @@ class PatternView(context: Context) : View(context) {
     private var solidCacheWhiteBalanceRgb: Bitmap? = null
     private var solidCacheCorrectionMaxAttenuation: Double = -1.0
     private var solidCacheWhiteBalanceMaxAttenuation: Double = -1.0
+    private var sparseCache: Bitmap? = null
+    private var sparseCacheSpec: PatternSpec? = null
 
     override fun onDraw(canvas: Canvas) {
         val w = width
@@ -130,6 +132,11 @@ class PatternView(context: Context) : View(context) {
                         }
                     }
                 }
+            }
+
+            PatternSpec.Kind.SPARSE -> {
+                canvas.drawColor(Color.BLACK)
+                if (w > 0 && h > 0) canvas.drawBitmap(sparseBitmap(spec, w, h), 0f, 0f, null)
             }
 
             PatternSpec.Kind.DOTGRID -> {
@@ -261,6 +268,27 @@ class PatternView(context: Context) : View(context) {
         return bmp
     }
 
+    /**
+     * 희소 점등 패턴은 픽셀 단위로 정확해야 하므로 안티에일리어싱 없는 비트맵을 직접 채운다.
+     * 뷰가 실제 화면 해상도와 1:1이어야 의미가 있다 (디스플레이 해상도 축소 모드에서는 블록이 번진다).
+     */
+    private fun sparseBitmap(spec: PatternSpec, w: Int, h: Int): Bitmap {
+        sparseCache?.let { cached ->
+            if (sparseCacheSpec == spec && cached.width == w && cached.height == h) return cached
+        }
+        sparseCache?.recycle()
+        val pixels = IntArray(w * h) { Color.BLACK }
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                if (spec.sparseLit(x, y)) pixels[y * w + x] = spec.color
+            }
+        }
+        val bmp = Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888)
+        sparseCache = bmp
+        sparseCacheSpec = spec
+        return bmp
+    }
+
     private fun scaledMap(src: Bitmap?, w: Int, h: Int): Bitmap? {
         if (src == null) return null
         return if (src.width == w && src.height == h) src else Bitmap.createScaledBitmap(src, w, h, true)
@@ -275,6 +303,9 @@ class PatternView(context: Context) : View(context) {
 
     override fun onDetachedFromWindow() {
         clearSolidCache()
+        sparseCache?.recycle()
+        sparseCache = null
+        sparseCacheSpec = null
         super.onDetachedFromWindow()
     }
 }

@@ -21,6 +21,7 @@ import com.burnin.scanner.analysis.Homography
 import com.burnin.scanner.analysis.ImageOps
 import com.burnin.scanner.analysis.RgbImage
 import com.burnin.scanner.analysis.ScreenDetector
+import com.burnin.scanner.analysis.SparseSpotPhotometry
 import com.burnin.scanner.camera.CameraEnumerator
 import com.burnin.scanner.camera.CaptureFrameCodec
 import com.burnin.scanner.camera.CaptureController
@@ -72,6 +73,12 @@ class MeasurementActivity : Activity() {
         private const val LOW_RGB_GAIN_WEIGHT = 0.18f
         private const val LOW_RGB_WEAK_GAIN_WEIGHT = 0.06f
         private const val MAX_ATTENUATION = 0.10f
+        /** 희소 점등 측광(글씨 획 단위 고주파 층) 사용 여부 */
+        private const val STROKE_DETAIL_ENABLED = true
+        private const val SPARSE_FRAMES_PER_PATTERN = 8
+        private const val SPARSE_BLACK_FRAMES = 8
+        private const val SPARSE_INTER_FRAME_DELAY_MS = 150L
+        private const val SPARSE_SETTLE_MS = 600L
         private const val PASS_RMS = 0.015f      // 합격: 잔여 RMS ≤ 1.5%
         private const val PASS_P95 = 0.035f      // 합격: P95 편차 ≤ 3.5%
         private const val PASS_BLOCK = 0.02f     // 합격: 블록 평균 최대 편차 ≤ 2% (좁은 띠 번인)
@@ -108,6 +115,7 @@ class MeasurementActivity : Activity() {
     private var triSelection: CameraEnumerator.TriSelection? = null
     private var measuring = false
     private var correctionOn = true
+    private var strokeDetailReport: JSONObject? = null
     private val resultLog = StringBuilder()
     private val visionTrustGateHolder = lazy { VisionTrustGate() }
     private val visionTrustGate by visionTrustGateHolder
@@ -143,6 +151,13 @@ class MeasurementActivity : Activity() {
         val meanRms: Float,
         val maxStrayRatio: Float,
         val signalValid: Boolean,
+    )
+
+    /** 희소 점등 측광 결과: 화면 픽셀 단위 고주파 감쇠 층과, 저해상도 재측정 보정용 평균 감쇠 */
+    private class StrokeDetail(
+        val gain: FloatArray,
+        val compensation: FloatArray,
+        val report: JSONObject,
     )
 
     private data class CorrectionIterations(
@@ -502,6 +517,14 @@ class MeasurementActivity : Activity() {
                 "최대 ${pct(statsBefore.maxDev)}, 블록 최대 ${pct(Analyzer.blockMaxDev(lumaBefore, gw, gh))}"
         )
 
+        // ── 4.5 희소 점등 측광: 글씨 획·버튼 테두리 단위 고주파 층 ──────
+        val strokeDetail = if (STROKE_DETAIL_ENABLED) {
+            measureStrokeDetail(client, cap, homography, screenW, screenH, gw, gh, smoothRadius, confidence70, lumaBefore)
+        } else {
+            null
+        }
+        strokeDetailReport = strokeDetail?.report
+
         // ── 5. 저휘도 맵 측정: gray25도 보정맵에 혼합 ─────────────
         status("5/10 $LOW_LIGHT_PATTERN 저휘도 촬영 (${LOW_LIGHT_FRAMES}장)...")
         val lowBeforeCapture = capturePatternGray(client, cap, LOW_LIGHT_PATTERN, LOW_LIGHT_FRAMES)
@@ -629,9 +652,10 @@ class MeasurementActivity : Activity() {
             lowTarget = lowTarget,
             flatField = flatField,
             smoothRadius = smoothRadius,
+            strokeDetail = strokeDetail,
         )
         val bestMap = correction.bestMap
-        val bestGain = bestMap.gain
+        val bestGain = bestMap.effectiveGain
         val bestRms = correction.bestRms
         val bestLowRms = correction.bestLowRms
         val bestLowRgbRms = correction.bestLowRgbRms
@@ -799,6 +823,7 @@ class MeasurementActivity : Activity() {
         lowTarget: Float,
         flatField: FloatArray,
         smoothRadius: Int,
+        strokeDetail: StrokeDetail?,
     ): CorrectionIterations {
         val gray70Gain = withContext(Dispatchers.Default) {
             Analyzer.gainGrid(lumaBefore, gw, gh, MAX_ATTENUATION, confidence70, smoothRadius)
@@ -840,7 +865,11 @@ class MeasurementActivity : Activity() {
         while (iter < MAX_ITERATIONS) {
             iter++
             status("7/10 반복 $iter/$MAX_ITERATIONS — 보정맵 전송·적용...")
-            applyGainMap(client, CorrectionMap(gain, rgb30.channelGains, lowRgbWeight), gw, gh, screenW, screenH)
+            applyGainMap(
+                client,
+                CorrectionMap(gain, rgb30.channelGains, lowRgbWeight, detail = strokeDetail?.gain, maxAttenuation = MAX_ATTENUATION),
+                gw, gh, screenW, screenH,
+            )
             lastAppliedIsBest = false
 
             status("8/10 반복 $iter/$MAX_ITERATIONS — gray70/$LOW_LIGHT_PATTERN/RGB30 재촬영·평가...")
@@ -855,7 +884,7 @@ class MeasurementActivity : Activity() {
                 Analyzer.lumaGrid(afterAvg, blackAvg, hAfter, screenW, screenH, gw, gh)
             }
             val lumaAfter = withContext(Dispatchers.Default) {
-                Analyzer.applyFlatField(lumaAfterRaw, flatField)
+                compensateDetail(Analyzer.applyFlatField(lumaAfterRaw, flatField), strokeDetail)
             }
             val baseConfidenceAfter = withContext(Dispatchers.Default) {
                 Analyzer.confidenceGrid(lumaAfterRaw, blackFullGrid, strayWarn = 0.05f)
@@ -873,7 +902,7 @@ class MeasurementActivity : Activity() {
                 Analyzer.lumaGrid(lowAfterAvg, blackAvg, hAfter, screenW, screenH, gw, gh)
             }
             val lumaLowAfter = withContext(Dispatchers.Default) {
-                Analyzer.applyFlatField(lumaLowAfterRaw, flatField)
+                compensateDetail(Analyzer.applyFlatField(lumaLowAfterRaw, flatField), strokeDetail)
             }
             val baseConfidenceLowAfter = withContext(Dispatchers.Default) {
                 Analyzer.confidenceGrid(lumaLowAfterRaw, blackFullGrid, strayWarn = LOW_LIGHT_STRAY_WARN)
@@ -990,7 +1019,7 @@ class MeasurementActivity : Activity() {
             gain = Analyzer.limitGainByConfidence(gain, confidence70, MAX_ATTENUATION)
         }
 
-        val bestMap = selection.correctionMap(rgb30.channelGains, lowRgbWeight)
+        val bestMap = selection.correctionMap(rgb30.channelGains, lowRgbWeight, strokeDetail?.gain, MAX_ATTENUATION)
         if (!lastAppliedIsBest) {
             status("9/10 최적 반복 맵으로 롤백 적용...")
             applyGainMap(client, bestMap, gw, gh, screenW, screenH)
@@ -1238,6 +1267,7 @@ class MeasurementActivity : Activity() {
             .put("baselineSelected", bestMap.isBaseline)
             .put("rgbChannelCorrectionMap", bestRgbPng != null)
             .put("estimatedBrightnessLoss", brightnessLoss)
+            .put("strokeDetail", strokeDetailReport ?: JSONObject().put("used", false))
             .put("maxAttenuation", MAX_ATTENUATION.toDouble())
             .put("rgbChannels", rgb70Json)
             .put("rgb70Channels", rgb70Json)
@@ -1522,6 +1552,171 @@ class MeasurementActivity : Activity() {
         val capture = capturePatternGray(client, cap, pattern, frameCount, settleMs)
         capture.frameStore.delete()
         return capture.average
+    }
+
+    /**
+     * 희소 점등 측광 ([SparseSpotPhotometry]). 메인 카메라 풀해상도 프레임에서 켜진 블록마다 국소 정합·
+     * 광량 적분을 해서 화면 픽셀 단위 휘도를 얻고, 전면 측정 경로의 스무딩 커널과 상보적인 고주파 층만
+     * 돌려준다. 카메라 해상도가 모자라거나 실패하면 null (기존 저주파 보정만 수행).
+     */
+    private suspend fun measureStrokeDetail(
+        client: ControlClient,
+        cap: CaptureController,
+        homography: Homography,
+        screenW: Int,
+        screenH: Int,
+        gw: Int,
+        gh: Int,
+        smoothRadius: Int,
+        confidence: FloatArray,
+        reference: FloatArray,
+    ): StrokeDetail? {
+        if (gw != screenW || gh != screenH) {
+            log("희소 점등 측광 건너뜀: 보정맵이 화면 해상도와 1:1이 아님 (${gw}x$gh)")
+            return null
+        }
+        return try {
+            status("4/10 희소 점등 측광 준비: black 풀해상도 촬영...")
+            withContext(Dispatchers.IO) { client.showPattern("black") }
+            delay(SPARSE_SETTLE_MS)
+            val blackStore = captureFrameStore(cap, SPARSE_BLACK_FRAMES, SPARSE_INTER_FRAME_DELAY_MS)
+            val black = try {
+                averageFullResFromStore(blackStore)
+            } finally {
+                blackStore.delete()
+            }
+            val sample = ImageOps.downsampleFactor(black.w, black.h)
+            val hFull = homography.withImageAffine(sample.toDouble(), (sample - 1) / 2.0)
+            val camPerScreen = SparseSpotPhotometry.cameraPxPerScreenPx(hFull, screenW, screenH)
+            val plan = SparseSpotPhotometry.plan(camPerScreen)
+            if (plan == null) {
+                log(
+                    "희소 점등 측광 건너뜀: 화면 1px당 카메라 ${fmt(camPerScreen)}px — 획 단위 측정에 부족 " +
+                        "(카메라를 더 가까이 두거나 망원 화각 사용)"
+                )
+                return null
+            }
+            log("희소 점등 측광: 화면 1px당 카메라 ${fmt(camPerScreen)}px (풀해상도 ${black.w}x${black.h}), $plan")
+            val layouts = ArrayList<SparseSpotPhotometry.PhaseLayout>()
+            for ((index, phase) in plan.phases().withIndex()) {
+                status("4/10 희소 점등 측광 ${index + 1}/${plan.patternCount}...")
+                withContext(Dispatchers.IO) { client.showPattern(plan.patternName(phase.first, phase.second)) }
+                delay(SPARSE_SETTLE_MS)
+                val store = captureFrameStore(cap, SPARSE_FRAMES_PER_PATTERN, SPARSE_INTER_FRAME_DELAY_MS)
+                try {
+                    var layout: SparseSpotPhotometry.PhaseLayout? = null
+                    for (file in store.files) {
+                        val frame = withContext(Dispatchers.Default) {
+                            fullResMinusBlack(readCaptureFrame(file), black)
+                        }
+                        withContext(Dispatchers.Default) {
+                            val current = layout ?: SparseSpotPhotometry.locate(
+                                frame, hFull, screenW, screenH, plan, phase.first, phase.second,
+                            ).also { layout = it }
+                            SparseSpotPhotometry.accumulate(frame, current)
+                        }
+                    }
+                    layout?.let { layouts += it }
+                } finally {
+                    store.delete()
+                }
+            }
+            withContext(Dispatchers.IO) { client.showPattern("gray70") }
+            withContext(Dispatchers.Default) {
+                buildStrokeDetail(layouts, plan, camPerScreen, screenW, screenH, smoothRadius, confidence, reference)
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            log("희소 점등 측광 실패 — 저주파 보정만 진행: ${e.message}")
+            runCatching { withContext(Dispatchers.IO) { client.showPattern("gray70") } }
+            null
+        }
+    }
+
+    private fun buildStrokeDetail(
+        layouts: List<SparseSpotPhotometry.PhaseLayout>,
+        plan: SparseSpotPhotometry.Plan,
+        camPerScreen: Float,
+        screenW: Int,
+        screenH: Int,
+        smoothRadius: Int,
+        confidence: FloatArray,
+        reference: FloatArray,
+    ): StrokeDetail? {
+        // 위상별로 블록 배정이 피치 단위로 밀렸는지 전면 측정 맵과 비교해 바로잡고 합친다
+        val (map, lags) = SparseSpotPhotometry.assembleAligned(layouts, screenW, screenH, reference, 3 * plan.pitch)
+        if (map.validFraction < 0.5f) {
+            log("희소 점등 측광 무효: 측정된 픽셀 ${pct(map.validFraction)} — 정합/초점/차광 확인")
+            return null
+        }
+        val shifted = lags.count { it[0] != 0 || it[1] != 0 }
+        if (shifted > 0) log("희소 점등 측광: ${shifted}개 위상에서 피치 단위 배정 오류를 전면 맵 기준으로 바로잡음")
+        // 전면 경로: 카메라 샘플링(≈smoothRadius) + gainGrid 박스 블러(smoothRadius) — 그보다 한 칸 넓게 잘라
+        // 저주파는 기존 반복 루프가, 그 위 고주파는 이 층이 맡는다.
+        val lowPassRadius = maxOf(1, smoothRadius) + 1
+        val ratio = SparseSpotPhotometry.detailRatio(map, lowPassRadius)
+        val q = SparseSpotPhotometry.detailReference(map, lowPassRadius)
+        val gain = SparseSpotPhotometry.detailGain(ratio, map.valid, q, confidence)
+        val compensation = SparseSpotPhotometry.lowFrequencyCompensation(gain, ratio, screenW, screenH, lowPassRadius)
+        var attSum = 0.0
+        var attMax = 0f
+        for (g in gain) {
+            attSum += 1.0 - g
+            attMax = maxOf(attMax, 1f - g)
+        }
+        val meanAtt = (attSum / gain.size).toFloat()
+        log(
+            "희소 점등 측광 완료: 측정 픽셀 ${pct(map.validFraction)}, 고주파 기준 ${fmt(q)}, " +
+                "고주파 층 평균 감쇠 ${pct(meanAtt)} / 최대 ${pct(attMax)} (스무딩 없이 픽셀 단위 적용)"
+        )
+        val report = JSONObject()
+            .put("used", true)
+            .put("block", plan.block)
+            .put("pitch", plan.pitch)
+            .put("patterns", plan.patternCount)
+            .put("framesPerPattern", SPARSE_FRAMES_PER_PATTERN)
+            .put("cameraPxPerScreenPx", camPerScreen.toDouble())
+            .put("validFraction", map.validFraction.toDouble())
+            .put("phasesRealigned", shifted)
+            .put("lowPassRadius", lowPassRadius)
+            .put("reference", q.toDouble())
+            .put("meanAttenuation", meanAtt.toDouble())
+            .put("maxAttenuation", attMax.toDouble())
+        return StrokeDetail(gain, compensation, report)
+    }
+
+    /** 고주파 층을 켠 상태의 저해상도 재측정에서 층의 평균 감쇠를 되돌린다 (저주파 루프가 이를 상쇄하지 않도록). */
+    private fun compensateDetail(luma: FloatArray, detail: StrokeDetail?): FloatArray {
+        val comp = detail?.compensation ?: return luma
+        if (comp.size != luma.size) return luma
+        return FloatArray(luma.size) { (luma[it] / comp[it].coerceAtLeast(0.5f)).coerceAtLeast(1e-5f) }
+    }
+
+    /** 풀해상도 선형 휘도 평균 (black 측정용). 프레임을 하나씩 디코드해 메모리를 아낀다. */
+    private suspend fun averageFullResFromStore(store: CaptureFrameStore): GrayImage =
+        withContext(Dispatchers.Default) {
+            var acc: FloatArray? = null
+            var w = 0
+            var h = 0
+            for (file in store.files) {
+                val img = ImageOps.decodeLinearGray(readCaptureFrame(file), maxLongEdge = Int.MAX_VALUE)
+                val dst = acc ?: FloatArray(img.data.size).also { acc = it; w = img.w; h = img.h }
+                require(img.w == w && img.h == h) { "프레임 크기 불일치" }
+                for (i in dst.indices) dst[i] += img.data[i]
+            }
+            val dst = acc ?: throw IllegalStateException("프레임 없음")
+            val n = store.files.size.toFloat()
+            for (i in dst.indices) dst[i] /= n
+            GrayImage(w, h, dst)
+        }
+
+    private fun fullResMinusBlack(frame: CaptureFrame, black: GrayImage): SparseSpotPhotometry.Frame {
+        val img = ImageOps.decodeLinearGray(frame, maxLongEdge = Int.MAX_VALUE)
+        require(img.w == black.w && img.h == black.h) { "black/희소 프레임 크기 불일치" }
+        val data = img.data
+        for (i in data.indices) data[i] -= black.data[i]
+        return SparseSpotPhotometry.Frame(img.w, img.h, data)
     }
 
     private suspend fun capturePatternGray(

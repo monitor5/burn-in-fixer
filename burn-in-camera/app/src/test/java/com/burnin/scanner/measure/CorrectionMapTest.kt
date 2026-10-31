@@ -44,6 +44,24 @@ class CorrectionMapTest {
         assertEquals(128, Color.blue(pixel))
         bitmap.recycle()
     }
+    @Test fun detailLayerMultipliesSelectedGainButNeverBaseline() {
+        val baseline = MeasurementPolicy.Selection(floatArrayOf(1f, 1f), 1f)
+            .correctionMap(emptyMap(), 0f, detail = floatArrayOf(.97f, 1f), maxAttenuation = .1f)
+        assertFalse(baseline.hasDetail)
+        assertArrayEquals(floatArrayOf(1f, 1f), baseline.effectiveGain, 0f)
+        val selection = MeasurementPolicy.Selection(floatArrayOf(1f, 1f), 2f)
+        assertTrue(selection.consider(floatArrayOf(.95f, .92f), 1f))
+        val map = selection.correctionMap(emptyMap(), 0f, detail = floatArrayOf(.97f, .95f), maxAttenuation = .1f)
+        assertTrue(map.hasDetail)
+        assertEquals(.95f * .97f, map.effectiveGain[0], 1e-6f)
+        assertEquals(.9f, map.effectiveGain[1], 1e-6f) // .92 × .95 = .874 → 감쇠 상한 10%
+        assertArrayEquals(floatArrayOf(.95f, .92f), map.gain, 0f)
+        val bytes = map.alphaPng(2, 1, 2, 1, .1f)
+        val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)!!
+        assertEquals(255, Color.red(bitmap.getPixel(1, 0)))
+        bitmap.recycle()
+    }
+
     @Test fun actualBaselineTransmissionMatchesArtifactAndKeepsCorrectionDisabled() = kotlinx.coroutines.runBlocking {
         val selected = MeasurementPolicy.Selection(floatArrayOf(1f), 1f)
             .correctionMap(mapOf(0 to floatArrayOf(.95f)), .5f)

@@ -15,6 +15,22 @@ class Homography private constructor(private val m: DoubleArray) {
         out[1] = (m[3] * u + m[4] * v + m[5]) / w
     }
 
+    /**
+     * 이미지 좌표에 등방 배율과 오프셋을 더한 호모그래피: x' = scale·x + offset.
+     * 다운샘플 디코드(블록 평균, 픽셀 중심 규약)에서 구한 정합을 풀해상도 프레임에 옮길 때 쓴다.
+     * 블록 크기 s의 다운샘플이면 scale = s, offset = (s - 1) / 2.
+     */
+    fun withImageAffine(scale: Double, offset: Double): Homography {
+        require(scale.isFinite() && scale > 0.0 && offset.isFinite())
+        return Homography(
+            doubleArrayOf(
+                scale * m[0] + offset * m[6], scale * m[1] + offset * m[7], scale * m[2] + offset,
+                scale * m[3] + offset * m[6], scale * m[4] + offset * m[7], scale * m[5] + offset,
+                m[6], m[7],
+            )
+        )
+    }
+
     companion object {
         /**
          * src(화면) 4점 → dst(이미지) 4점 대응으로 호모그래피 계산.

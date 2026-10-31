@@ -250,6 +250,12 @@ object ImageOps {
         return RgbImage(outW, outH, r, g, b)
     }
 
+    /**
+     * [decodeLinearGray]가 긴 변 [maxLongEdge]에 맞추려고 쓰는 정수 다운샘플 배율 (YUV 블록 평균,
+     * JPEG inSampleSize 공통). 다운샘플 영상의 좌표 x는 풀해상도 좌표 x·s + (s-1)/2에 해당한다.
+     */
+    fun downsampleFactor(width: Int, height: Int, maxLongEdge: Int = 1600): Int = yuvSample(width, height, maxLongEdge)
+
     private fun yuvSample(width: Int, height: Int, maxLongEdge: Int): Int {
         require(width > 0 && height > 0 && maxLongEdge > 0)
         var sample = 1

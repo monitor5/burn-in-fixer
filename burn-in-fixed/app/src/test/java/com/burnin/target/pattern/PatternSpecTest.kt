@@ -40,4 +40,28 @@ class PatternSpecTest {
         assertNull(PatternSpec.parse("rainbow"))
         assertNull(PatternSpec.parse(""))
     }
+
+    @Test
+    fun parsesSparsePatternsAndLitPixels() {
+        val spec = PatternSpec.parse("sparse70_b1_p4_x3_y1")!!
+        assertEquals(PatternSpec.Kind.SPARSE, spec.kind)
+        assertEquals(0xFFB3B3B3.toInt(), spec.color)
+        assertEquals(true, spec.sparseLit(3, 1))
+        assertEquals(true, spec.sparseLit(7, 5))
+        assertEquals(false, spec.sparseLit(4, 1))
+        assertEquals(false, spec.sparseLit(2, 1))
+        val blocks = PatternSpec.parse("sparse70_b2_p6_x1_y2")!!
+        assertEquals(true, blocks.sparseLit(2, 4))
+        assertEquals(true, blocks.sparseLit(3, 5))
+        assertEquals(false, blocks.sparseLit(4, 4))
+        assertEquals(true, blocks.sparseLit(8, 10))
+    }
+
+    @Test
+    fun rejectsInvalidSparsePatterns() {
+        assertNull(PatternSpec.parse("sparse70_b1_p4_x4_y0"))   // 위상 범위 초과
+        assertNull(PatternSpec.parse("sparse70_b2_p5_x0_y0"))   // pitch가 block의 배수가 아님
+        assertNull(PatternSpec.parse("sparse70_b3_p3_x0_y0"))   // 블록끼리 붙음
+        assertNull(PatternSpec.parse("sparse70_b0_p4_x0_y0"))
+    }
 }
