@@ -69,7 +69,7 @@ Target 프로토콜에서 `maxAttenuation`을 생략하면 번인 맵 기본값�
 
 `SHOW_PATTERN`은 `rgb-RRGGBB`(16진수) 임의 코드값 단색도 받습니다. 색 프로파일 데이터는 big-endian uint16 `[size³×3 LUT, 인덱스 ((r·N)+g)·N+b] + [3×256 post 곡선]`이며, 적용 순서는 원래 색 → 색 LUT → 번인 RGB/알파 감쇠 → (구) 화이트밸런스입니다. 단색 패턴에만 적용합니다.
 
-그레이 맵 값 `v`는 감쇠 파라미터 `v / 255 × maxAttenuation`을 의미합니다. RGB 맵은 각 채널이 해당 감쇠를 나타냅니다. 이는 출력에 쓰는 코드값·알파 모델의 정의이며 물리 휘도 교정 단위가 아닙니다.
+그레이 맵 값 `v`는 선형 휘도 감쇠 `v / 255 × maxAttenuation`을 의미합니다(gain = 1 − 감쇠). RGB 맵은 각 채널이 해당 감쇠를 나타냅니다. Target은 `APPLY_CORRECTION_MAP`의 선택 필드 `outputGamma`(Scanner의 gray70/gray25 추정, 없으면 2.2)로 코드 gain = gain^(1/γ), 오버레이 알파 = 1 − gain^(1/γ)를 만들고 8비트로 dither합니다. 카메라 단위의 근사이며 물리 휘도 교정 단위는 아닙니다.
 
 요청 예:
 

@@ -65,6 +65,8 @@ class MeasurementActivity : Activity() {
     companion object {
         private const val FRAMES_PER_PATTERN = 5
         private const val LOW_LIGHT_PATTERN = "gray25"
+        private const val LOW_LIGHT_CODE = 64      // gray25 = round(255·0.25)
+        private const val GRAY70_CODE = 179        // gray70 = round(255·0.70)
         private const val LOW_LIGHT_FRAMES = 5
         private const val LOW_LIGHT_STRAY_WARN = 0.10f
         private const val LOW_LIGHT_GAIN_WEIGHT = 0.35f
@@ -116,6 +118,8 @@ class MeasurementActivity : Activity() {
     private var measuring = false
     private var correctionOn = true
     private var strokeDetailReport: JSONObject? = null
+    /** 대상 패널 γ 추정치(gray70/gray25). Target이 감쇠(선형 휘도)를 코드 gain^(1/γ)로 바꾸는 데 쓴다. */
+    private var outputGamma: Float? = null
     private val resultLog = StringBuilder()
     private val visionTrustGateHolder = lazy { VisionTrustGate() }
     private val visionTrustGate by visionTrustGateHolder
@@ -550,6 +554,15 @@ class MeasurementActivity : Activity() {
         val lowStrayRatio = blackStats.median / lowStatsBefore.median
         val lowSignalValid = lowStrayRatio <= LOW_LIGHT_STRAY_WARN
         val lowLightWeight = if (lowSignalValid) LOW_LIGHT_GAIN_WEIGHT else LOW_LIGHT_WEAK_GAIN_WEIGHT
+        outputGamma = if (lowSignalValid) {
+            Analyzer.estimateDisplayGamma(statsBefore.median, lowStatsBefore.median, GRAY70_CODE, LOW_LIGHT_CODE)
+        } else {
+            null
+        }
+        log(
+            outputGamma?.let { "대상 패널 γ 추정 ${fmt(it)} (gray70/$LOW_LIGHT_PATTERN, 출력 gain^(1/γ) 변환에 사용)" }
+                ?: "대상 패널 γ 추정 실패 — Target 기본값 2.2로 출력 변환"
+        )
         log(
             "$LOW_LIGHT_PATTERN 보정 전: RMS ${pct(lowStatsBefore.rmsDev)}, " +
                 "P95 ${pct(lowStatsBefore.p95Dev)}, median ${fmt(lowStatsBefore.median)}, " +
@@ -1269,6 +1282,7 @@ class MeasurementActivity : Activity() {
             .put("estimatedBrightnessLoss", brightnessLoss)
             .put("strokeDetail", strokeDetailReport ?: JSONObject().put("used", false))
             .put("maxAttenuation", MAX_ATTENUATION.toDouble())
+            .put("outputGamma", outputGamma?.toDouble() ?: JSONObject.NULL)
             .put("rgbChannels", rgb70Json)
             .put("rgb70Channels", rgb70Json)
             .put("rgb30ChannelsBefore", statsMapJson(rgb30.stats))
@@ -1329,6 +1343,8 @@ class MeasurementActivity : Activity() {
                 .put("height", screenH)
                 .put("maxAttenuation", MAX_ATTENUATION.toDouble())
                 .put("defaultStrength", 100)
+            outputGamma?.let { request.put("outputGamma", it.toDouble()) }
+            request
                 .put("checksumMd5", md5(png))
                 .put("sourceDevice", "${Build.MANUFACTURER} ${Build.MODEL}")
                 .put("data", Base64.encodeToString(png, Base64.NO_WRAP))

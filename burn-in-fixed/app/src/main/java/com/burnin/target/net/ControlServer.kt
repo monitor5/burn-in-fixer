@@ -156,6 +156,7 @@ object ControlServer {
                     sourceDevice = msg.optString("sourceDevice", "scanner"),
                     rgbChecksumMd5 = msg.optString("rgbChecksumMd5", ""),
                     rgbDataBase64 = if (msg.has("rgbData")) msg.getString("rgbData") else null,
+                    outputGamma = if (msg.has("outputGamma")) msg.optDouble("outputGamma") else null,
                 )
                 if (error != null) {
                     AppLog.i("보정맵 거부: $error")

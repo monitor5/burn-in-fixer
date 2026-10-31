@@ -8,6 +8,7 @@ import android.graphics.Paint
 import android.graphics.Rect
 import android.view.View
 import com.burnin.target.correction.ColorLut
+import com.burnin.target.correction.OutputTransfer
 import kotlin.math.min
 
 /**
@@ -59,6 +60,19 @@ class PatternView(context: Context) : View(context) {
             invalidate()
         }
 
+    /**
+     * 패널 코드→휘도 지수. 감쇠맵은 선형 휘도 gain이므로 단색 경로에서 코드에는 gain^(1/γ)를 곱한다.
+     * (알파 비트맵 경로는 [com.burnin.target.correction.CorrectionStore]가 구울 때 이미 변환한다.)
+     */
+    var outputGamma: Double = OutputTransfer.DEFAULT_GAMMA
+        set(value) {
+            val v = OutputTransfer.sanitizeGamma(value)
+            if (v == field) return
+            field = v
+            clearSolidCache()
+            invalidate()
+        }
+
     /** 기준 기기 색감 일치 LUT. 번인 보정 ON/OFF와 독립적으로 단색 패턴에만 적용된다. */
     var colorLut: ColorLut? = null
         set(value) {
@@ -95,6 +109,7 @@ class PatternView(context: Context) : View(context) {
     private var solidCacheWhiteBalanceRgb: Bitmap? = null
     private var solidCacheCorrectionMaxAttenuation: Double = -1.0
     private var solidCacheWhiteBalanceMaxAttenuation: Double = -1.0
+    private var solidCacheGamma: Double = -1.0
     private var sparseCache: Bitmap? = null
     private var sparseCacheSpec: PatternSpec? = null
 
@@ -221,7 +236,8 @@ class PatternView(context: Context) : View(context) {
                 solidCacheRgb === rgb &&
                 solidCacheWhiteBalanceRgb === whiteBalanceRgb &&
                 solidCacheCorrectionMaxAttenuation == correctionMaxAttenuation &&
-                solidCacheWhiteBalanceMaxAttenuation == whiteBalanceMaxAttenuation
+                solidCacheWhiteBalanceMaxAttenuation == whiteBalanceMaxAttenuation &&
+                solidCacheGamma == outputGamma
             ) {
                 return cached
             }
@@ -237,33 +253,25 @@ class PatternView(context: Context) : View(context) {
         }
         if (correctionMap != null && correctionMap !== rgb) correctionMap.recycle()
         if (whiteBalanceMap != null && whiteBalanceMap !== whiteBalanceRgb) whiteBalanceMap.recycle()
-        val baseR = Color.red(color)
-        val baseG = Color.green(color)
-        val baseB = Color.blue(color)
         val strength = strengthPct / 100.0
         val correctionMaxAtt = correctionMaxAttenuation
         val whiteBalanceMaxAtt = whiteBalanceMaxAttenuation
-        val out = IntArray(w * h)
-        for (i in out.indices) {
-            var rGain = 1.0
-            var gGain = 1.0
-            var bGain = 1.0
-            correctionAtt?.let { att ->
-                val p = att[i]
-                rGain *= 1.0 - (Color.red(p) / 255.0) * correctionMaxAtt * strength
-                gGain *= 1.0 - (Color.green(p) / 255.0) * correctionMaxAtt * strength
-                bGain *= 1.0 - (Color.blue(p) / 255.0) * correctionMaxAtt * strength
-            }
-            whiteBalanceAtt?.let { att ->
-                val p = att[i]
-                rGain *= 1.0 - (Color.red(p) / 255.0) * whiteBalanceMaxAtt * strength
-                gGain *= 1.0 - (Color.green(p) / 255.0) * whiteBalanceMaxAtt * strength
-                bGain *= 1.0 - (Color.blue(p) / 255.0) * whiteBalanceMaxAtt * strength
-            }
-            val r = Math.round(baseR * rGain).toInt().coerceIn(0, 255)
-            val g = Math.round(baseG * gGain).toInt().coerceIn(0, 255)
-            val b = Math.round(baseB * bGain).toInt().coerceIn(0, 255)
-            out[i] = Color.rgb(r, g, b)
+        // 두 감쇠 층의 8비트 값 쌍 → 코드 gain. 감쇠는 선형 휘도 기준이라 곱한 뒤 1/γ 제곱한다.
+        val gamma = outputGamma
+        val codeGainLut = DoubleArray(256 * 256) { k ->
+            val lum = (1.0 - (k shr 8) / 255.0 * correctionMaxAtt * strength) *
+                (1.0 - (k and 0xFF) / 255.0 * whiteBalanceMaxAtt * strength)
+            OutputTransfer.codeGain(lum, gamma)
+        }
+        val out = IntArray(w * h) { 0xFF000000.toInt() }
+        for (channel in 0 until 3) {
+            val shift = 16 - 8 * channel
+            val base = (color shr shift) and 0xFF
+            OutputTransfer.dither(w, h, 255, { i ->
+                val c = correctionAtt?.let { (it[i] shr shift) and 0xFF } ?: 0
+                val wbv = whiteBalanceAtt?.let { (it[i] shr shift) and 0xFF } ?: 0
+                base * codeGainLut[(c shl 8) or wbv]
+            }) { i, v -> out[i] = out[i] or (v shl shift) }
         }
         val bmp = Bitmap.createBitmap(out, w, h, Bitmap.Config.ARGB_8888)
         solidCache = bmp
@@ -275,6 +283,7 @@ class PatternView(context: Context) : View(context) {
         solidCacheWhiteBalanceRgb = whiteBalanceRgb
         solidCacheCorrectionMaxAttenuation = correctionMaxAttenuation
         solidCacheWhiteBalanceMaxAttenuation = whiteBalanceMaxAttenuation
+        solidCacheGamma = outputGamma
         return bmp
     }
 

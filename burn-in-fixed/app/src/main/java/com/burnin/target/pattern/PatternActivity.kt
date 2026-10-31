@@ -8,6 +8,7 @@ import android.view.WindowManager
 import com.burnin.target.DeviceRole
 import com.burnin.target.correction.ColorProfileStore
 import com.burnin.target.correction.CorrectionStore
+import com.burnin.target.correction.OutputTransfer
 import com.burnin.target.correction.WhiteBalanceStore
 import com.burnin.target.util.AppLog
 
@@ -67,6 +68,7 @@ class PatternActivity : Activity(), PatternBus.Host {
         view.correctionBitmap = CorrectionStore.bakedBitmap
         view.correctionRgbBitmap = CorrectionStore.rgbAttenuationBitmap
         view.correctionMaxAttenuation = CorrectionStore.meta?.maxAttenuation ?: 0.05
+        view.outputGamma = CorrectionStore.meta?.outputGamma ?: OutputTransfer.DEFAULT_GAMMA
         view.whiteBalanceRgbBitmap = WhiteBalanceStore.rgbAttenuationBitmap
         view.whiteBalanceMaxAttenuation = WhiteBalanceStore.meta?.maxAttenuation ?: 0.10
         applyCorrectionState()
@@ -109,6 +111,7 @@ class PatternActivity : Activity(), PatternBus.Host {
         view.correctionBitmap = CorrectionStore.bakedBitmap
         view.correctionRgbBitmap = CorrectionStore.rgbAttenuationBitmap
         view.correctionMaxAttenuation = CorrectionStore.meta?.maxAttenuation ?: 0.05
+        view.outputGamma = CorrectionStore.meta?.outputGamma ?: OutputTransfer.DEFAULT_GAMMA
         view.whiteBalanceRgbBitmap = WhiteBalanceStore.rgbAttenuationBitmap
         view.whiteBalanceMaxAttenuation = WhiteBalanceStore.meta?.maxAttenuation ?: 0.10
         view.correctionEnabled = !DeviceRole.isReference(this) && PatternBus.correctionEnabled

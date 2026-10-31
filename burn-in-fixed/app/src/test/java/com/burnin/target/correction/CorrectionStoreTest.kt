@@ -30,10 +30,21 @@ class CorrectionStoreTest {
     private fun apply(bytes:ByteArray=png(Color.WHITE),checksum:String="",att:Double=.1,strength:Int=100,rgb:ByteArray?=null):String? =
         CorrectionStore.applyFromBase64(context,w,h,att,strength,checksum,Base64.encodeToString(bytes,Base64.NO_WRAP),"test",
             rgb?.let{CorrectionStore.md5(it)}.orEmpty(),rgb?.let{Base64.encodeToString(it,Base64.NO_WRAP)})
+    @Test fun outputGammaFromScannerIsBakedPersistedAndSanitized() {
+        val bytes=png(Color.WHITE)
+        assertNull(CorrectionStore.applyFromBase64(context,w,h,.1,100,"",Base64.encodeToString(bytes,Base64.NO_WRAP),"test",outputGamma=2.0))
+        assertEquals(13,Color.alpha(CorrectionStore.bakedBitmap!!.getPixel(0,0)))   // (1−√0.9)·255 = 13.1
+        assertTrue(CorrectionStore.loadFromDisk(context));assertEquals(2.0,CorrectionStore.meta!!.outputGamma,0.0)
+        assertEquals(13,Color.alpha(CorrectionStore.bakedBitmap!!.getPixel(0,0)))
+        assertNull(CorrectionStore.applyFromBase64(context,w,h,.1,100,"",Base64.encodeToString(bytes,Base64.NO_WRAP),"test",outputGamma=9.0))
+        assertEquals(2.2,CorrectionStore.meta!!.outputGamma,0.0)
+    }
     @Test fun bakesAlphaAndRoundTripsBothMapsWithComputedChecksums() {
         val alpha=png(Color.WHITE);val rgb=png(Color.RED)
         assertNull(apply(alpha,rgb=rgb))
-        assertEquals(26,Color.alpha(CorrectionStore.bakedBitmap!!.getPixel(0,0)))
+        // 감쇠 10%(선형 휘도) → 코드 공간 알파 1−0.9^(1/2.2) = 11.9/255
+        assertEquals(12,Color.alpha(CorrectionStore.bakedBitmap!!.getPixel(0,0)))
+        assertEquals(2.2,CorrectionStore.meta!!.outputGamma,0.0)
         assertEquals(0,Color.red(CorrectionStore.bakedBitmap!!.getPixel(0,0)))
         assertEquals(Color.RED,CorrectionStore.rgbAttenuationBitmap!!.getPixel(0,0))
         assertEquals(CorrectionStore.md5(alpha),CorrectionStore.meta!!.checksumMd5)

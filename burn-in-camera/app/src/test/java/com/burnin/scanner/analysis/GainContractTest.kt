@@ -4,6 +4,17 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class GainContractTest {
+    @Test fun displayGammaIsRecoveredFromTwoGrayLevelsAndRejectedWhenImplausible() {
+        val ratio = Math.pow(179.0 / 64.0, 2.2).toFloat()
+        assertEquals(2.2f, Analyzer.estimateDisplayGamma(ratio, 1f, 179, 64)!!, 1e-4f)
+        assertEquals(1.9f, Analyzer.estimateDisplayGamma(Math.pow(179.0 / 64.0, 1.9).toFloat() * 3f, 3f, 179, 64)!!, 1e-4f)
+        assertNull(Analyzer.estimateDisplayGamma(1.05f, 1f, 179, 64))          // γ≈0.05: 저휘도 미광 등
+        assertNull(Analyzer.estimateDisplayGamma(1000f, 1f, 179, 64))          // γ≈6.7
+        assertNull(Analyzer.estimateDisplayGamma(Float.NaN, 1f, 179, 64))
+        assertNull(Analyzer.estimateDisplayGamma(1f, 0f, 179, 64))
+        assertNull(Analyzer.estimateDisplayGamma(2f, 1f, 64, 179))
+    }
+
     @Test fun untrustedCellsRemainUncorrectedAfterBothBlurPasses() {
         val signal = FloatArray(25) { if (it < 3) .5f else 1f }
         val confidence = FloatArray(25) { 1f }.also { it[12] = 0f }

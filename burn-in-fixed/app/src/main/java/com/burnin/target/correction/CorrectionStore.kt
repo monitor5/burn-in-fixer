@@ -16,8 +16,10 @@ import java.security.MessageDigest
  * 보정 프로파일 저장소 + 검증기 (T-FR-006/007, 13장 데이터 포맷).
  *
  * 보정맵 PNG: 그레이스케일. 픽셀값 v(0~255)의 의미는 v/255 * maxAttenuation 만큼
- * 해당 위치의 밝기를 낮춘다는 뜻 (0 = 보정 없음, 255 = 최대 감쇠).
- * 적용을 위해 "검정 RGB + 알파 = v/255 * maxAttenuation" 인 ARGB 비트맵으로 굽는다(bake).
+ * 해당 위치의 **선형 휘도**를 낮춘다는 뜻 (0 = 보정 없음, 255 = 최대 감쇠).
+ * 적용을 위해 "검정 RGB + 알파" ARGB 비트맵으로 굽는다(bake). 알파 블렌딩은 코드 공간에서
+ * 일어나므로 알파 = 1 − gain^(1/γ)로 바꾸고, 8비트 알파 계단은 오차 확산 dither로 나눈다
+ * ([OutputTransfer]). γ는 Scanner가 gray70/gray25로 추정해 보낸 값, 없으면 2.2.
  */
 object CorrectionStore {
 
@@ -30,6 +32,7 @@ object CorrectionStore {
         val rgbChecksumMd5: String,
         val createdAt: String,
         val sourceDevice: String,
+        val outputGamma: Double = OutputTransfer.DEFAULT_GAMMA,
     ) {
         fun toJson(): JSONObject = JSONObject()
             .put("profileVersion", 2)
@@ -42,6 +45,7 @@ object CorrectionStore {
             .put("hasRgbMap", rgbChecksumMd5.isNotEmpty())
             .put("createdAt", createdAt)
             .put("sourceDevice", sourceDevice)
+            .put("outputGamma", outputGamma)
 
         companion object {
             fun fromJson(o: JSONObject) = Meta(
@@ -53,6 +57,9 @@ object CorrectionStore {
                 rgbChecksumMd5 = o.optString("rgbChecksumMd5", ""),
                 createdAt = o.optString("createdAt", ""),
                 sourceDevice = o.optString("sourceDevice", ""),
+                outputGamma = OutputTransfer.sanitizeGamma(
+                    if (o.has("outputGamma")) o.optDouble("outputGamma") else null
+                ),
             )
         }
     }
@@ -93,8 +100,10 @@ object CorrectionStore {
         sourceDevice: String,
         rgbChecksumMd5: String = "",
         rgbDataBase64: String? = null,
+        outputGamma: Double? = null,
     ): String? = applyValidated(context, width, height, maxAttenuation, defaultStrengthPct,
-        checksumMd5, dataBase64, sourceDevice, rgbChecksumMd5, rgbDataBase64)
+        checksumMd5, dataBase64, sourceDevice, rgbChecksumMd5, rgbDataBase64,
+        outputGamma = OutputTransfer.sanitizeGamma(outputGamma))
 
 
     @Synchronized
@@ -111,6 +120,7 @@ object CorrectionStore {
         rgbDataBase64: String? = null,
         persist: Boolean = true,
         restoredCreatedAt: String? = null,
+        outputGamma: Double = OutputTransfer.DEFAULT_GAMMA,
     ): String? {
         if (width <= 0 || height <= 0 || defaultStrengthPct !in 0..100) return "프로파일 메타데이터 범위 오류"
         if (rgbDataBase64.isNullOrBlank() && rgbChecksumMd5.isNotEmpty()) return "RGB 데이터 누락"
@@ -166,7 +176,7 @@ object CorrectionStore {
         val src = BitmapFactory.decodeByteArray(png, 0, png.size)
             ?: return "PNG 디코드 실패"
 
-        val baked = bake(src, maxAttenuation)
+        val baked = bake(src, maxAttenuation, outputGamma)
         src.recycle()
         val rgbBitmap = rgbPng?.let {
             BitmapFactory.decodeByteArray(it, 0, it.size)?.copy(Bitmap.Config.ARGB_8888, false)
@@ -178,6 +188,7 @@ object CorrectionStore {
             createdAt = restoredCreatedAt ?: java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssZ", java.util.Locale.US)
                 .format(java.util.Date()),
             sourceDevice = sourceDevice,
+            outputGamma = outputGamma,
         )
         try {
             val files = linkedMapOf("correction_alpha.png" to png, "metadata.json" to m.toJson().toString(2).toByteArray(Charsets.UTF_8))
@@ -193,22 +204,20 @@ object CorrectionStore {
         bakedBitmap = baked
         rgbAttenuationBitmap = rgbBitmap
         AppLog.i(
-            "보정맵 적용 준비 완료: ${width}x${height}, maxAtt=$maxAttenuation, " +
+            "보정맵 적용 준비 완료: ${width}x${height}, maxAtt=$maxAttenuation, γ=$outputGamma, " +
                 "RGB ${if (rgbBitmap != null) "있음" else "없음"}"
         )
         return null
     }
 
-    /** 그레이 PNG(감쇠 비율) → 검정+알파 ARGB 비트맵 */
-    private fun bake(src: Bitmap, maxAttenuation: Double): Bitmap {
+    /** 그레이 PNG(선형 휘도 감쇠 비율) → 검정+알파 ARGB 비트맵 (알파 = 1 − gain^(1/γ), dither). */
+    private fun bake(src: Bitmap, maxAttenuation: Double, gamma: Double): Bitmap {
         val w = src.width
         val h = src.height
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
-        val lut = IntArray(256) { v -> Math.round(v * maxAttenuation).toInt().coerceIn(0, 255) shl 24 }
-        for (i in pixels.indices) {
-            pixels[i] = lut[Color.red(pixels[i])]
-        }
+        val alpha255 = DoubleArray(256) { v -> OutputTransfer.overlayAlpha(1.0 - v / 255.0 * maxAttenuation, gamma) * 255.0 }
+        OutputTransfer.dither(w, h, 255, { i -> alpha255[Color.red(pixels[i])] }) { i, a -> pixels[i] = a shl 24 }
         return Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888)
     }
 
@@ -223,7 +232,7 @@ object CorrectionStore {
             applyValidated(context, m.width, m.height, m.maxAttenuation, m.defaultStrengthPct,
                 m.checksumMd5, Base64.encodeToString(png, Base64.NO_WRAP), m.sourceDevice,
                 m.rgbChecksumMd5, rgb?.let { Base64.encodeToString(it, Base64.NO_WRAP) },
-                persist = false, restoredCreatedAt = m.createdAt) == null
+                persist = false, restoredCreatedAt = m.createdAt, outputGamma = m.outputGamma) == null
         } catch (e: Exception) {
             AppLog.i("프로파일 적재 실패: ${e.message}")
             false

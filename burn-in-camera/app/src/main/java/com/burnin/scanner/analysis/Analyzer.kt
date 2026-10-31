@@ -27,6 +27,8 @@ object Analyzer {
 
     /** 블록 통계의 긴 변 방향 블록 수. 2400px 화면이면 40px 블록(상태바 높이의 절반 이하). */
     const val BLOCKS_ALONG_LONG_EDGE = 60
+    const val MIN_OUTPUT_GAMMA = 1.6f
+    const val MAX_OUTPUT_GAMMA = 3.0f
     private const val TARGET_BLOCK_PERCENTILE = 0.01f
 
 
@@ -424,6 +426,19 @@ object Analyzer {
         val means = blockGrid(luma, gw, gh).means.apply { sort() }
         val low = means[(means.size * TARGET_BLOCK_PERCENTILE).toInt().coerceIn(0, means.size - 1)]
         return maxOf(low, median * (1f - maxAtt))
+    }
+
+    /**
+     * 대상 패널의 코드→휘도 지수 γ 추정: L ∝ code^γ 이면 γ = ln(L_high/L_low) / ln(code_high/code_low).
+     * black을 뺀 gray70/gray25 중앙값을 쓴다. 측정값이 x^2.2 역변환 카메라 단위여도, 같은 단위로
+     * 추정한 γ로 코드 gain = gain^(1/γ)을 만들면 카메라 톤커브의 거듭제곱 오차가 상쇄된다.
+     * [MIN_OUTPUT_GAMMA, MAX_OUTPUT_GAMMA] 밖이면 측정 이상으로 보고 null.
+     */
+    fun estimateDisplayGamma(highMedian: Float, lowMedian: Float, highCode: Int, lowCode: Int): Float? {
+        if (!highMedian.isFinite() || !lowMedian.isFinite() || highMedian <= 0f || lowMedian <= 0f) return null
+        if (highCode !in 1..255 || lowCode !in 1..255 || highCode <= lowCode) return null
+        val g = (Math.log(highMedian.toDouble() / lowMedian) / Math.log(highCode.toDouble() / lowCode)).toFloat()
+        return g.takeIf { it.isFinite() && it in MIN_OUTPUT_GAMMA..MAX_OUTPUT_GAMMA }
     }
 
     fun edgeFalloff(luma: FloatArray, gw: Int, gh: Int, bandFraction: Float = 0.06f): Float {
