@@ -36,8 +36,10 @@ internal object MeasurementPolicy {
         }.toFloat()
 
     /**
-     * 화면 이동 허용치: 4px 또는 화면 대각선의 0.5% 중 큰 값. 보정 패턴은 가장자리 밝기를 바꿔
-     * 검출 경계가 1~2px 움직일 수 있어, 크게 잡힌 화면에서 고정 4px는 실제 이동이 아닌데도 중단시켰다.
+     * 화면 이동 허용치: 4px 또는 화면 대각선의 1.5% 중 큰 값. 매 반복 화면을 다시 검출·정합하므로
+     * 휘도는 이동을 따라가고, 이동에 민감한 건 카메라 좌표에 묶인 flat-field·black뿐인데 둘 다
+     * 완만해서 대각선 1.5%(이번 배치 약 19px) 안의 미세 이동은 영향이 작다. 0.5%(약 6px)로는 손만
+     * 스쳐도 추가 개선이 중단됐다.
      */
     fun geometryTolerance(reference: ScreenDetector.Quad): Float {
         val c = reference.corners
@@ -45,7 +47,7 @@ internal object MeasurementPolicy {
             Math.hypot((c[0].x - c[2].x).toDouble(), (c[0].y - c[2].y).toDouble()),
             Math.hypot((c[1].x - c[3].x).toDouble(), (c[1].y - c[3].y).toDouble()),
         ).toFloat()
-        return maxOf(4f, diag * 0.005f)
+        return maxOf(4f, diag * 0.015f)
     }
 
     /** A perfect baseline has no relative improvement; keep the report finite and deterministic. */

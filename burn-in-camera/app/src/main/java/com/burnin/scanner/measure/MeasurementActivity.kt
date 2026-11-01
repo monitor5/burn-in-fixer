@@ -365,6 +365,8 @@ class MeasurementActivity : Activity() {
 
     private var lastStep: String? = null
     private var nativeVerified = false
+    /** 이번 측정에서 탭에 색 균일화(화이트밸런스) 레이어를 올렸는지. */
+    private var whiteBalanceActive = false
     /** 측정 전 색 편차(블록 평균·P95). 최종 평가에서 전/후 비교에 쓴다. */
     private var chromaBefore: Pair<Float, Float>? = null
     private var lastStepAt = 0L
@@ -435,6 +437,8 @@ class MeasurementActivity : Activity() {
         val screenH = Session.screenHeight
         require(screenW > 0 && screenH > 0) { "대상 화면 정보 없음" }
         extraImprovement = null
+        whiteBalanceActive = false
+        chromaBefore = null
         resultLog.clear()
         log("대상: ${Session.targetName} (${screenW}x${screenH})")
         selectAnalysisResolution(cap)
@@ -569,10 +573,34 @@ class MeasurementActivity : Activity() {
         blackStore.delete()
 
         // ── 3.2 묶음 촬영: 분석 전에 전면 패턴을 전부 먼저 찍어 둔다 ─────────
+        // 색 균일화 레이어는 휘도 기준보다 먼저 정한다. 레이어가 위치별로 채널을 낮추면 밝기 분포도
+        // 바뀌므로, 휘도 기준(gray70/gray25/RGB30)을 레이어 없이 재면 반복 보정과 조건이 달라져
+        // 보정 맵이 매번 기준선에 지게 된다(평균 밝기 손실 0%, 맵 미채택).
+        captureBatch(client, cap, RGB70_PATTERNS.map { it to FRAMES_PER_PATTERN }, "3/10 색")
+        val rgb70 = try {
+            // 색 비율은 채널끼리 나누므로 카메라 flat-field는 상쇄된다(여기선 아직 없음).
+            measureRgbPatterns(
+                client, cap, blackRgbAvg, homography, screenW, screenH, screenW, screenH,
+                RGB70_PATTERNS, FRAMES_PER_PATTERN, "deviation_rgb70",
+                flatField = null,
+                makeHeatmaps = true,
+                includeGain = false,
+                keepGrids = true,
+            ).let { m ->
+                applyChromaUniformity(client, m, screenW, screenH, screenW, screenH)
+                m.copy(grids = LinkedHashMap(), confidences = LinkedHashMap())
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            log("RGB70 채널 측정 건너뜀: ${e.message}")
+            emptyRgbMeasurement()
+        }
+        val chromaOn = chromaBefore != null
         captureBatch(
             client, cap,
-            listOf(LOW_LIGHT_PATTERN to LOW_LIGHT_FRAMES) +
-                RGB70_PATTERNS.map { it to FRAMES_PER_PATTERN } +
+            (if (chromaOn) listOf("gray70" to FRAMES_PER_PATTERN) else emptyList()) +
+                listOf(LOW_LIGHT_PATTERN to LOW_LIGHT_FRAMES) +
                 RGB30_PATTERNS.map { it to LOW_RGB_FRAMES },
             "3/10",
         )
@@ -600,7 +628,7 @@ class MeasurementActivity : Activity() {
             Analyzer.applyFlatField(lumaBeforeRaw, flatField)
         }
         // 중간 신뢰도 격자(기본·프레임 안정도)는 합친 뒤 버리고, 리포트에는 평균값만 남긴다(상주 메모리 절감).
-        val graySpanMs = grayCapture.frameStore.spanMs
+        var graySpanMs = grayCapture.frameStore.spanMs
         var flickerStability70 = 0f
         val confidence70Single = run {
             val baseConfidence70 = withContext(Dispatchers.Default) {
@@ -628,7 +656,7 @@ class MeasurementActivity : Activity() {
         )
         // 리포트용 카메라 원본 회색 이미지는 지금 PNG로 바꿔 두고 이미지 자체는 놓는다.
         val grayAvgPng = if (cross != null) withContext(Dispatchers.Default) { Analyzer.grayImagePng(grayAvg) } else null
-        val confidence70 = if (cross != null) {
+        val confidence70PreWb = if (cross != null) {
             withContext(Dispatchers.Default) {
                 Analyzer.combineConfidence(confidence70Single, cross.agreement)
             }
@@ -637,7 +665,7 @@ class MeasurementActivity : Activity() {
         }
         // 원형(잔여 비네팅) 보정: 반복 보정은 같은 메인 카메라로 다시 재는 폐루프라 카메라 쪽 원형은
         // 반복으로 사라지지 않고 오히려 화면에 새겨진다. 초광각 기준 저주파 비율로 메인 flat-field를 고친다.
-        val lumaBefore = cross?.referenceBlocks?.let { ref ->
+        val lumaBeforePreWb = cross?.referenceBlocks?.let { ref ->
             withContext(Dispatchers.Default) {
                 val residual = LowFrequency.cameraResidual(lumaBeforeRadial, ref, gw, gh)
                 val up = LowFrequency.upsample(residual, gw, gh)
@@ -648,6 +676,26 @@ class MeasurementActivity : Activity() {
             }
         } ?: lumaBeforeRadial.also {
             if (cross != null) log("초광각 기준 잔여 비네팅 보정 생략: 초광각 화면 정합 실패")
+        }
+        // 색 균일화 레이어를 켠 상태에서 다시 찍은 gray70을 휘도 기준으로 쓴다(카메라 flat-field는 위에서 확정).
+        val (lumaBefore, confidence70) = if (chromaOn) {
+            val base = capturePatternGray(client, cap, "gray70", FRAMES_PER_PATTERN)
+            graySpanMs = base.frameStore.spanMs
+            val raw = withContext(Dispatchers.Default) {
+                Analyzer.lumaGrid(base.average, blackAvg, homography, screenW, screenH, gw, gh)
+            }
+            val luma = withContext(Dispatchers.Default) { Analyzer.applyFlatField(raw, flatField) }
+            val baseConf = withContext(Dispatchers.Default) { Analyzer.confidenceGrid(raw, blackFullGrid, strayWarn = 0.05f) }
+            val flicker = temporalLumaConfidence(base.frameStore, blackAvg, homography, screenW, screenH, gw, gh)
+            flickerStability70 = Analyzer.meanConfidence(flicker)
+            val conf = withContext(Dispatchers.Default) {
+                val single = Analyzer.combineConfidence(baseConf, flicker)
+                if (cross == null) single else Analyzer.combineConfidence(single, cross.agreement)
+            }
+            log("휘도 기준: 색 균일화 레이어를 켠 상태로 gray70 재측정(반복 보정과 같은 조건)")
+            luma to conf
+        } else {
+            lumaBeforePreWb to confidence70PreWb
         }
         if (cross != null) {
             cross.notes.forEach { log(it) }
@@ -753,23 +801,6 @@ class MeasurementActivity : Activity() {
 
         // ── 6. RGB 채널별 측정: 70% 진단 + 30% 보정 혼합 ─────────
         status("6/10 RGB 70%/30% 채널별 측정...")
-        val rgb70 = try {
-            measureRgbPatterns(
-                client, cap, blackRgbAvg, homography, screenW, screenH, gw, gh,
-                RGB70_PATTERNS, FRAMES_PER_PATTERN, "deviation_rgb70",
-                flatField = flatField,
-                makeHeatmaps = true,
-                includeGain = false,
-                keepGrids = true,
-            ).let { m ->
-                applyChromaUniformity(client, m, gw, gh, screenW, screenH)
-                // 색 맵을 만든 뒤 채널 격자·신뢰도는 놓는다(리포트는 통계·히트맵만 쓴다).
-                m.copy(grids = LinkedHashMap(), confidences = LinkedHashMap())
-            }
-        } catch (e: Exception) {
-            log("RGB70 채널 측정 건너뜀: ${e.message}")
-            emptyRgbMeasurement()
-        }
         // 측정 원본(gain 4장)은 신뢰도 제한을 건 사본만 남기고 바로 버린다(2048×1536 격자 한 장 12.6MB).
         val rgb30 = run {
         val rgb30Measured = try {
@@ -1058,9 +1089,10 @@ class MeasurementActivity : Activity() {
                         .put("data", Base64.encodeToString(png, Base64.NO_WRAP)),
                     timeoutMs = 120_000,
                 )
-                // 반복 보정이 맵을 적용하기 전까지는 번인 보정을 꺼 둔다(지난 측정 맵이 남아 있을 수 있음).
-                client.command(Protocol.CMD_DISABLE_CORRECTION)
             }
+            // 지난 측정 맵 대신 무감쇠(중립) 맵을 올리고 보정을 켜서 색 레이어만 켜진 상태를 만든다.
+            whiteBalanceActive = true
+            applyGainMap(client, CorrectionMap(FloatArray(gw * gh) { 1f }, emptyMap(), 0f, isBaseline = true), gw, gh, screenW, screenH)
             val maxAtt = listOf(gr, gg, gb).maxOf { blk -> blk.values.maxOf { 1f - it } }
             log(
                 "색 균일화: 블록 색 편차 평균 ${pct(chroma.meanSpread())} / P95 ${pct(chroma.p95Spread())} " +
@@ -1699,7 +1731,9 @@ class MeasurementActivity : Activity() {
                     .put("rgbData", Base64.encodeToString(rgbPng, Base64.NO_WRAP))
             }
             client.request(request, timeoutMs = 120_000)
-            client.command(if (map.isBaseline) Protocol.CMD_DISABLE_CORRECTION
+            // 색 균일화 레이어가 있으면 무보정(기준선) 맵이어도 보정을 켜 둔다 — 레이어가 같이 꺼지면
+            // 반복·최종 평가가 기준 측정과 다른 조건이 된다.
+            client.command(if (map.isBaseline && !whiteBalanceActive) Protocol.CMD_DISABLE_CORRECTION
                 else Protocol.CMD_ENABLE_CORRECTION, "strength" to 100)
             client.showPattern("gray70")
         }
