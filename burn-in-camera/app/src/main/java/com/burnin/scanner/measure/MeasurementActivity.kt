@@ -93,7 +93,8 @@ class MeasurementActivity : Activity() {
         private const val PASS_P95 = 0.035f      // 합격: P95 편차 ≤ 3.5%
         private const val PASS_BLOCK = 0.02f     // 합격: 블록 평균 최대 편차 ≤ 2% (좁은 띠 번인)
         private const val MAX_ITERATIONS = 24    // 품질 우선 반복 상한
-        private const val STAGNATION_LIMIT = 6   // 묶음 촬영으로 반복이 빨라져 개선이 멈춘 뒤에도 조금 더 돌린다
+        private const val STAGNATION_LIMIT = 4
+        private const val DEFAULT_EXTRA_ITERATIONS = 4
         private const val DIVERGENCE_LIMIT = 3
         private const val DAMPING_ALPHA = 0.3f   // 반복 damping
         private const val DRIFT_LIMIT = 0.10f    // 중앙 휘도 드리프트 > 10%면 조건 변화로 무효
@@ -124,6 +125,10 @@ class MeasurementActivity : Activity() {
     private lateinit var chkTri: CheckBox
     /** 묶음 촬영으로 미리 저장한 패턴별 프레임 (pattern → store). */
     private val prefetched = LinkedHashMap<String, CaptureFrameStore>()
+    /** 직전 측정의 최적 맵에서 반복 보정을 n회 더 돌리는 작업. 측정이 끝나야 생긴다. */
+    private var extraImprovement: (suspend (Int) -> Unit)? = null
+    private lateinit var editExtra: EditText
+    private lateinit var btnExtra: Button
     private var triSelection: CameraEnumerator.TriSelection? = null
     private var measuring = false
     private var correctionOn = true
@@ -176,6 +181,8 @@ class MeasurementActivity : Activity() {
 
     private data class CorrectionIterations(
         val bestMap: CorrectionMap,
+        /** 최적 맵의 균일도 점수(낮을수록 좋음). 추가 개선의 출발점 비교에 쓴다. */
+        val bestScore: Float,
         val bestRms: Float,
         val bestLowRms: Float,
         val bestLowRgbRms: Float,
@@ -209,6 +216,21 @@ class MeasurementActivity : Activity() {
             scope.launch { runMeasurementSafely() }
         }
         btnToggle.setOnClickListener { toggleCorrection() }
+        editExtra = findViewById(R.id.editExtra)
+        btnExtra = findViewById(R.id.btnExtra)
+        findViewById<View>(R.id.rowExtra).visibility = View.VISIBLE
+        editExtra.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+            override fun afterTextChanged(s: android.text.Editable?) { btnExtra.text = "추가 개선 ${extraIterations()}회" }
+        })
+        btnExtra.setOnClickListener {
+            val job = extraImprovement ?: return@setOnClickListener
+            val n = extraIterations()
+            btnStart.isEnabled = false
+            btnExtra.isEnabled = false
+            scope.launch { runMeasurementSafely { job(n) } }
+        }
 
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             status("카메라 권한 없음 — 홈 화면에서 권한을 허용하세요")
@@ -337,8 +359,12 @@ class MeasurementActivity : Activity() {
         AppLog.i(msg)
     }
 
-    private suspend fun runMeasurementSafely() {
+    private fun extraIterations(): Int =
+        (editExtra.text.toString().trim().toIntOrNull() ?: DEFAULT_EXTRA_ITERATIONS).coerceIn(1, MAX_ITERATIONS)
+
+    private suspend fun runMeasurementSafely(block: suspend () -> Unit = { runMeasurement() }) {
         measuring = true
+        btnExtra.isEnabled = false
         chkTri.isEnabled = false
         editRefresh.isEnabled = false
         val measurementClient = Session.client
@@ -353,7 +379,7 @@ class MeasurementActivity : Activity() {
                         MeasurementCleanup.WARNING, android.widget.Toast.LENGTH_LONG).show()
                     throw cleanup
                 }
-            }) { runMeasurement() }
+            }) { block() }
         } catch (e: CancellationException) {
             throw e
         } catch (e: OutOfMemoryError) {
@@ -374,6 +400,7 @@ class MeasurementActivity : Activity() {
         } finally {
             clearPrefetched()
             btnStart.isEnabled = true
+            btnExtra.isEnabled = extraImprovement != null
             measuring = false
             chkTri.isEnabled = triSelection != null
             editRefresh.isEnabled = true
@@ -386,6 +413,7 @@ class MeasurementActivity : Activity() {
         val screenW = Session.screenWidth
         val screenH = Session.screenHeight
         require(screenW > 0 && screenH > 0) { "대상 화면 정보 없음" }
+        extraImprovement = null
         resultLog.clear()
         log("대상: ${Session.targetName} (${screenW}x${screenH})")
         selectAnalysisResolution(cap)
@@ -755,6 +783,7 @@ class MeasurementActivity : Activity() {
             smoothRadius = smoothRadius,
             strokeDetail = strokeDetail,
         )
+        suspend fun finish(correction: CorrectionIterations) {
         val bestMap = correction.bestMap
         val bestGain = bestMap.effectiveGain
         val bestRms = correction.bestRms
@@ -897,6 +926,26 @@ class MeasurementActivity : Activity() {
         status("측정 완료 — $verdict, 개선율 ${pct(improvement.toFloat())}")
         btnToggle.isEnabled = true
         correctionOn = true
+
+        // 이 측정의 기준(화면 위치·black·flat-field·신뢰도·목표)과 최적 맵을 그대로 이어받아 더 돌린다.
+        extraImprovement = { n ->
+            log("──────────────")
+            log("추가 개선 ${n}회 시작 — 직전 최적 맵(균일도 점수 ${fmt(correction.bestScore)}x)에서 이어서 반복")
+            val more = runCorrectionIterations(
+                client = client, cap = cap, screenW = screenW, screenH = screenH, gw = gw, gh = gh,
+                lumaBefore = lumaBefore, lumaLowBefore = lumaLowBefore,
+                confidence70 = confidence70, confidenceLow = confidenceLow,
+                lowLightWeight = lowLightWeight, rgb30 = rgb30, lowRgbWeight = lowRgbWeight,
+                blackAvg = blackAvg, blackRgbAvg = blackRgbAvg, blackFullGrid = blackFullGrid,
+                homography = homography, det = det, cornerMapping = cornerMapping,
+                statsBefore = statsBefore, target = target, lowTarget = lowTarget,
+                flatField = flatField, smoothRadius = smoothRadius, strokeDetail = strokeDetail,
+                previous = correction, maxIterations = n,
+            )
+            finish(more)
+        }
+        }
+        finish(correction)
     }
 
     private suspend fun runCorrectionIterations(
@@ -925,6 +974,9 @@ class MeasurementActivity : Activity() {
         flatField: FloatArray,
         smoothRadius: Int,
         strokeDetail: StrokeDetail?,
+        /** 있으면 그 최적 맵에서 출발하고, 선택도 그 점수와 비교해 더 나은 맵만 바꾼다. */
+        previous: CorrectionIterations? = null,
+        maxIterations: Int = MAX_ITERATIONS,
     ): CorrectionIterations {
         val gray70Gain = withContext(Dispatchers.Default) {
             Analyzer.gainGrid(lumaBefore, gw, gh, MAX_ATTENUATION, confidence70, smoothRadius)
@@ -941,6 +993,7 @@ class MeasurementActivity : Activity() {
             }
         } ?: grayMixedGain
         gain = Analyzer.limitGainByConfidence(gain, confidence70, MAX_ATTENUATION)
+        if (previous != null && !previous.bestMap.isBaseline) gain = previous.bestMap.gain.copyOf()
         val baselineLowStats = Analyzer.stats(lumaLowBefore)
         val baselineScore = maxOf(
             uniformityScore(statsBefore, lumaBefore, gw, gh),
@@ -951,6 +1004,12 @@ class MeasurementActivity : Activity() {
         var bestRms = statsBefore.rmsDev
         var bestLowRms = baselineLowStats.rmsDev
         var bestLowRgbRms = rgb30.meanRms
+        if (previous != null && !previous.bestMap.isBaseline) {
+            selection.consider(previous.bestMap.gain, previous.bestScore)
+            bestRms = previous.bestRms
+            bestLowRms = previous.bestLowRms
+            bestLowRgbRms = previous.bestLowRgbRms
+        }
         var prevScore: Float? = null
         var divergeCount = 0
         var stalledCount = 0
@@ -963,9 +1022,9 @@ class MeasurementActivity : Activity() {
 
         withContext(Dispatchers.IO) { client.showPattern("gray70") }
         var iter = 0
-        while (iter < MAX_ITERATIONS) {
+        while (iter < maxIterations) {
             iter++
-            status("7/10 반복 $iter/$MAX_ITERATIONS — 보정맵 전송·적용...")
+            status("7/10 반복 $iter/$maxIterations — 보정맵 전송·적용...")
             applyGainMap(
                 client,
                 CorrectionMap(gain, rgb30.channelGains, lowRgbWeight, detail = strokeDetail?.gain, maxAttenuation = MAX_ATTENUATION),
@@ -979,7 +1038,7 @@ class MeasurementActivity : Activity() {
                     if (rgb30Targets.isNotEmpty()) RGB30_PATTERNS.map { it to LOW_RGB_FRAMES } else emptyList(),
                 "8/10 반복 $iter",
             )
-            status("8/10 반복 $iter/$MAX_ITERATIONS — gray70/$LOW_LIGHT_PATTERN/RGB30 평가...")
+            status("8/10 반복 $iter/$maxIterations — gray70/$LOW_LIGHT_PATTERN/RGB30 평가...")
             val afterCapture = capturePatternGray(client, cap, "gray70", FRAMES_PER_PATTERN)
             val afterAvg = afterCapture.average
             val detAfter = withContext(Dispatchers.Default) { ScreenDetector.detect(afterAvg) }
@@ -1136,6 +1195,7 @@ class MeasurementActivity : Activity() {
 
         return CorrectionIterations(
             bestMap = bestMap,
+            bestScore = selection.score,
             bestRms = bestRms,
             bestLowRms = bestLowRms,
             bestLowRgbRms = bestLowRgbRms,
