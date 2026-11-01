@@ -6,6 +6,9 @@ package com.burnin.scanner.analysis
  */
 class Homography private constructor(private val m: DoubleArray) {
 
+    /** 행 우선 3×3 계수 사본(m[8] = 1). 네이티브 격자 샘플링에 넘긴다. */
+    internal fun coefficients(): DoubleArray = DoubleArray(9) { if (it < m.size) m[it] else 1.0 }
+
     /** (u,v) 화면 좌표 → 이미지 좌표 (out[0]=x, out[1]=y) */
     fun map(u: Double, v: Double, out: DoubleArray) {
         require(out.size >= 2 && u.isFinite() && v.isFinite()) { "invalid projection input" }

@@ -1,0 +1,27 @@
+{
+  "buildFiles": [
+    "C:\\Users\\uhyun\\Desktop\\project_win_2026\\burn-in-fixer\\burn-in-camera\\app\\src\\main\\cpp\\CMakeLists.txt"
+  ],
+  "cleanCommandsComponents": [
+    [
+      "C:\\Users\\uhyun\\AppData\\Local\\Android\\Sdk\\cmake\\3.22.1\\bin\\ninja.exe",
+      "-C",
+      "C:\\Users\\uhyun\\Desktop\\project_win_2026\\burn-in-fixer\\burn-in-camera\\app\\.cxx\\Debug\\73414y1y\\arm64-v8a",
+      "clean"
+    ]
+  ],
+  "buildTargetsCommandComponents": [
+    "C:\\Users\\uhyun\\AppData\\Local\\Android\\Sdk\\cmake\\3.22.1\\bin\\ninja.exe",
+    "-C",
+    "C:\\Users\\uhyun\\Desktop\\project_win_2026\\burn-in-fixer\\burn-in-camera\\app\\.cxx\\Debug\\73414y1y\\arm64-v8a",
+    "{LIST_OF_TARGETS_TO_BUILD}"
+  ],
+  "libraries": {
+    "pixelcore::@6890427a1f51a3e7e1df": {
+      "artifactName": "pixelcore",
+      "abi": "arm64-v8a",
+      "output": "C:\\Users\\uhyun\\Desktop\\project_win_2026\\burn-in-fixer\\burn-in-camera\\app\\build\\intermediates\\cxx\\Debug\\73414y1y\\obj\\arm64-v8a\\libpixelcore.so",
+      "runtimeFiles": []
+    }
+  }
+}

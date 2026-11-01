@@ -1,0 +1,3 @@
+C:/Users/uhyun/Desktop/project_win_2026/burn-in-fixer/burn-in-camera/app/.cxx/Debug/73414y1y/arm64-v8a/CMakeFiles/pixelcore.dir
+C:/Users/uhyun/Desktop/project_win_2026/burn-in-fixer/burn-in-camera/app/.cxx/Debug/73414y1y/arm64-v8a/CMakeFiles/edit_cache.dir
+C:/Users/uhyun/Desktop/project_win_2026/burn-in-fixer/burn-in-camera/app/.cxx/Debug/73414y1y/arm64-v8a/CMakeFiles/rebuild_cache.dir

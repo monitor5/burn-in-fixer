@@ -21,6 +21,7 @@ import com.burnin.scanner.analysis.DotGridDetector
 import com.burnin.scanner.analysis.GrayImage
 import com.burnin.scanner.analysis.Homography
 import com.burnin.scanner.analysis.ImageOps
+import com.burnin.scanner.analysis.NativePixel
 import com.burnin.scanner.analysis.RgbImage
 import com.burnin.scanner.analysis.ScreenDetector
 import com.burnin.scanner.analysis.SparseSpotPhotometry
@@ -524,6 +525,8 @@ class MeasurementActivity : Activity() {
             null
         }
         val homography = dotGrid?.homography ?: initialHomography
+        runCatching { verifyNative(grayCapture.frameStore, homography, screenW, screenH) }
+            .onFailure { log("네이티브 검증 실패: ${it.message}") }
         if (dotGrid != null) {
             log(
                 "dot-grid 정합: ${dotGrid.matchedPoints}점, " +
@@ -1981,7 +1984,9 @@ class MeasurementActivity : Activity() {
             delay(PATTERN_SETTLE_MS)
             captureFrameStore(cap, frameCount)
         }
-        return GrayCapture(averageDecodedFromStore(store) { ImageOps.decodeLinearChannel(it, channel) }, store)
+        val avg = withContext(Dispatchers.Default) { NativePixel.average(store.files, channel) }
+            ?: averageDecodedFromStore(store) { ImageOps.decodeLinearChannel(it, channel) }
+        return GrayCapture(avg, store)
     }
 
     private suspend fun capturePatternRgb(
@@ -2293,7 +2298,46 @@ class MeasurementActivity : Activity() {
      * (min/max 추적만 추가하면 되어 스트리밍 처리 그대로 유지)
      */
     private suspend fun averageGrayFromStore(store: CaptureFrameStore): GrayImage =
-        averageDecodedFromStore(store) { ImageOps.decodeLinearGray(it) }
+        withContext(Dispatchers.Default) { NativePixel.average(store.files, NativePixel.MODE_GRAY) }
+            ?: averageDecodedFromStore(store) { ImageOps.decodeLinearGray(it) }
+
+    /**
+     * 측정마다 한 번, 같은 프레임으로 네이티브와 Kotlin 결과를 비교해 로그로 남긴다.
+     * (네이티브는 단위 테스트로 못 돌리므로 실기기에서 직접 확인)
+     */
+    private suspend fun verifyNative(store: CaptureFrameStore, h: Homography, screenW: Int, screenH: Int) {
+        if (!NativePixel.available) {
+            log("네이티브 픽셀 처리: 사용 불가 — Kotlin 구현으로 진행")
+            return
+        }
+        val t0 = android.os.SystemClock.elapsedRealtime()
+        val native = withContext(Dispatchers.Default) { NativePixel.average(store.files, NativePixel.MODE_GRAY) }
+        val t1 = android.os.SystemClock.elapsedRealtime()
+        if (native == null) {
+            log("네이티브 픽셀 처리: 이 프레임 형식은 미지원 — Kotlin 구현으로 진행")
+            return
+        }
+        NativePixel.enabled = false
+        val kotlin = try {
+            averageDecodedFromStore(store) { ImageOps.decodeLinearGray(it) }
+        } finally {
+            NativePixel.enabled = true
+        }
+        val t2 = android.os.SystemClock.elapsedRealtime()
+        var maxDiff = 0f
+        for (i in native.data.indices) maxDiff = maxOf(maxDiff, Math.abs(native.data[i] - kotlin.data[i]))
+        val gw = 256
+        val gh = (256L * screenH / screenW).toInt().coerceAtLeast(1)
+        val gN = withContext(Dispatchers.Default) { Analyzer.lumaGrid(native, null, h, screenW, screenH, gw, gh) }
+        val gK = withContext(Dispatchers.Default) { Analyzer.lumaGridKotlin(native, null, h, screenW, screenH, gw, gh) }
+        var maxRel = 0f
+        for (i in gN.indices) maxRel = maxOf(maxRel, Math.abs(gN[i] - gK[i]) / gK[i].coerceAtLeast(1e-4f))
+        log(
+            "네이티브 픽셀 처리 검증: 평균 이미지 최대 차이 ${String.format(java.util.Locale.US, "%.2e", maxDiff)}, " +
+                "격자 최대 상대 차이 ${String.format(java.util.Locale.US, "%.2e", maxRel)}, " +
+                "평균 ${t1 - t0}ms (Kotlin ${t2 - t1}ms)"
+        )
+    }
 
     /** 프레임마다 [decode]한 단일 평면을 양끝값 제외 평균한다(4장 이상). */
     private suspend fun averageDecodedFromStore(

@@ -196,6 +196,9 @@ object ImageOps {
     /** 8-bit 비디오 레인지 Y' → 선형 휘도 룩업 (블록 평균을 선형 도메인에서 하기 위함, 현재 [toneMode]) */
     private val Y_LINEAR_LUT: FloatArray get() = luts.yLinear
 
+    /** 네이티브 YUV 디코드가 쓰는 Y→선형 LUT (현재 톤커브). */
+    internal fun yLinearLut(): FloatArray = luts.yLinear
+
     /**
      * sample×sample 블록 평균 다운샘플. 이전의 N픽셀 건너뛰기 점 샘플링은 센서 격자와
      * OLED 서브픽셀 격자의 간섭(무아레)을 저역 통과 없이 그대로 통과시키고 앨리어싱을

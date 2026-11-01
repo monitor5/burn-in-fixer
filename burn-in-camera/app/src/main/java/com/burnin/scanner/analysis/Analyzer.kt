@@ -195,6 +195,20 @@ object Analyzer {
         gw: Int,
         gh: Int,
     ): FloatArray {
+        NativePixel.lumaGrid(gray, black, h, screenW, screenH, gw, gh)?.let { return it }
+        return lumaGridKotlin(gray, black, h, screenW, screenH, gw, gh)
+    }
+
+    /** [lumaGrid]의 Kotlin 구현(네이티브가 없을 때와 검증 기준). */
+    fun lumaGridKotlin(
+        gray: GrayImage,
+        black: GrayImage?,
+        h: Homography,
+        screenW: Int,
+        screenH: Int,
+        gw: Int,
+        gh: Int,
+    ): FloatArray {
         val grid = FloatArray(gw * gh)
         val margin = SCREEN_SAMPLE_MARGIN
         // 2048×1536 격자 × 9탭 샘플이라 측정 분석의 큰 몫을 차지한다. 행 단위로 코어에 나눈다.
