@@ -64,10 +64,10 @@ object RawDecode {
         val outW = Math.max(1, (r.w + sample - 1) / sample)
         val outH = Math.max(1, (r.h + sample - 1) / sample)
         val out = FloatArray(outW * outH)
-        var i = 0
-        for (oy in 0 until outH) {
+        Analyzer.parallelRows(outH) { oy ->
             val y0 = oy * sample
             val y1 = Math.min(y0 + sample, r.h)
+            var i = oy * outW
             for (ox in 0 until outW) {
                 val x0 = ox * sample
                 val x1 = Math.min(x0 + sample, r.w)
@@ -88,10 +88,10 @@ object RawDecode {
         val outR = FloatArray(outW * outH)
         val outG = FloatArray(outW * outH)
         val outB = FloatArray(outW * outH)
-        val sum = FloatArray(3)
-        val cnt = IntArray(3)
-        var i = 0
-        for (oy in 0 until outH) {
+        Analyzer.parallelRows(outH) { oy ->
+            val sum = FloatArray(3)
+            val cnt = IntArray(3)
+            var i = oy * outW
             // 블록을 2×2 Bayer 쿼드 경계로 넓혀 세 채널이 모두 들어가게 한다.
             val y0 = (oy * sample) and 1.inv()
             val y1 = Math.min(Math.max(oy * sample + sample, y0 + 2), r.h)

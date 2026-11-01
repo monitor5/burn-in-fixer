@@ -347,7 +347,18 @@ class MeasurementActivity : Activity() {
         }
         txtStatus.text = msg
         AppLog.i(msg)
+        // 단계("N/10")가 바뀔 때 직전 단계 소요 시간을 남겨 병목을 볼 수 있게 한다.
+        val step = Regex("""^(\d+/10)""").find(msg)?.groupValues?.get(1)
+        if (step != null && step != lastStep) {
+            val now = android.os.SystemClock.elapsedRealtime()
+            lastStep?.let { log("⏱ $it 단계 ${fmtSeconds(now - lastStepAt)}") }
+            lastStep = step
+            lastStepAt = now
+        }
     }
+
+    private var lastStep: String? = null
+    private var lastStepAt = 0L
 
     private fun log(msg: String) {
         if (Looper.myLooper() != Looper.getMainLooper()) {
@@ -364,6 +375,7 @@ class MeasurementActivity : Activity() {
 
     private suspend fun runMeasurementSafely(block: suspend () -> Unit = { runMeasurement() }) {
         measuring = true
+        lastStep = null
         btnExtra.isEnabled = false
         chkTri.isEnabled = false
         editRefresh.isEnabled = false

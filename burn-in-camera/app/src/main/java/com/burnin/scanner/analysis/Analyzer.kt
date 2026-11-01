@@ -181,6 +181,11 @@ object Analyzer {
      * 평균 샘플하고, black offset 맵(있으면)을 같은 위치에서 빼준다.
      * 화면 전체를 마진 없이 샘플한다. 출력 보정맵도 같은 좌표계를 사용한다.
      */
+    /** [n]개 행을 공용 ForkJoin 풀에서 병렬로 처리한다. 행마다 서로 다른 출력 칸만 쓴다는 전제. */
+    internal fun parallelRows(n: Int, body: (Int) -> Unit) {
+        java.util.stream.IntStream.range(0, n).parallel().forEach { body(it) }
+    }
+
     fun lumaGrid(
         gray: GrayImage,
         black: GrayImage?,
@@ -191,9 +196,10 @@ object Analyzer {
         gh: Int,
     ): FloatArray {
         val grid = FloatArray(gw * gh)
-        val out = DoubleArray(2)
         val margin = SCREEN_SAMPLE_MARGIN
-        for (gy in 0 until gh) {
+        // 2048×1536 격자 × 9탭 샘플이라 측정 분석의 큰 몫을 차지한다. 행 단위로 코어에 나눈다.
+        parallelRows(gh) { gy ->
+            val out = DoubleArray(2)
             for (gx in 0 until gw) {
                 val u = (margin + (1 - 2 * margin) * (gx + 0.5f) / gw) * screenW
                 val v = (margin + (1 - 2 * margin) * (gy + 0.5f) / gh) * screenH
@@ -228,9 +234,10 @@ object Analyzer {
         gh: Int,
     ): FloatArray {
         val grid = FloatArray(gw * gh)
-        val out = DoubleArray(2)
         val margin = SCREEN_SAMPLE_MARGIN
-        for (gy in 0 until gh) {
+        // 2048×1536 격자 × 9탭 샘플이라 측정 분석의 큰 몫을 차지한다. 행 단위로 코어에 나눈다.
+        parallelRows(gh) { gy ->
+            val out = DoubleArray(2)
             for (gx in 0 until gw) {
                 val u = (margin + (1 - 2 * margin) * (gx + 0.5f) / gw) * screenW
                 val v = (margin + (1 - 2 * margin) * (gy + 0.5f) / gh) * screenH
