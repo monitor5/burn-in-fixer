@@ -142,7 +142,7 @@
             android:layout_height="wrap_content"
             android:checked="true"
             android:textSize="12sp"
-            android:text="RGB점" />
+            android:text="RGBW점" />
 
         <Button
             android:id="@+id/btnCheckAtt"

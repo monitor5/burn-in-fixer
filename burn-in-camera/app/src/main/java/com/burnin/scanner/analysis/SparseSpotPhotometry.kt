@@ -583,6 +583,55 @@ object SparseSpotPhotometry {
         return weightedBox(weightedBox(prod, all, w, h, radius), all, w, h, radius)
     }
 
+    /**
+     * 픽셀 단위 고주파 잔차 크기: R = map/lowPass(map)의 RMS 편차에서 점 측정 잡음(표준오차 중앙값)을
+     * 뺀 값. 보정을 켠 채 잰 희소 맵에 쓰면 픽셀 단위로 얼마나 고르게 됐는지를 직접 검증한다.
+     */
+    fun detailRms(map: SparseMap, lowPassRadius: Int): Float {
+        val w = map.width
+        val h = map.height
+        val low = weightedBox(weightedBox(map.value, map.valid, w, h, lowPassRadius), map.valid, w, h, lowPassRadius)
+        var ss = 0.0
+        var n = 0
+        val noise = ArrayList<Float>()
+        for (i in map.value.indices) {
+            if (!map.valid[i] || low[i] <= 0f) continue
+            val d = map.value[i] / low[i] - 1.0
+            ss += d * d
+            n++
+            noise += map.relNoise[i]
+        }
+        if (n == 0) return Float.NaN
+        noise.sort()
+        val sigma = noise[noise.size / 2].toDouble()
+        return Math.sqrt(maxOf(0.0, ss / n - sigma * sigma)).toFloat()
+    }
+
+    /**
+     * 보정을 켠 채 잰 잔차 맵으로 고주파 층을 다시 맞춘다: new = old · q / R (q, R은 잔차 맵 기준).
+     * 아직 밝은 픽셀은 더 낮추고, 과하게 낮춘 픽셀(R < q)은 되돌린다. [allowance]는 픽셀별 적용 비율.
+     */
+    fun refineDetailGain(
+        old: FloatArray,
+        residual: SparseMap,
+        lowPassRadius: Int,
+        maxAtt: Float,
+        allowance: FloatArray? = null,
+    ): FloatArray {
+        require(old.size == residual.value.size && (allowance == null || allowance.size == old.size))
+        val ratio = detailRatio(residual, lowPassRadius)
+        val q = detailReference(residual, lowPassRadius, maxAtt)
+        return FloatArray(old.size) { i ->
+            if (!residual.valid[i]) {
+                old[i]
+            } else {
+                val target = (old[i] * q / ratio[i].coerceAtLeast(1e-3f)).coerceIn(1f - maxAtt, 1f)
+                val a = allowance?.get(i)?.coerceIn(0f, 1f) ?: 1f
+                old[i] + (target - old[i]) * a
+            }
+        }
+    }
+
     private fun highPass(src: FloatArray, valid: BooleanArray, w: Int, h: Int, radius: Int): FloatArray {
         val low = weightedBox(src, valid, w, h, radius)
         return FloatArray(src.size) { i -> if (valid[i] && low[i] > 0f) src[i] / low[i] - 1f else 0f }

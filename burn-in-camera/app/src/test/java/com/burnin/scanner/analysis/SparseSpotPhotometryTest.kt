@@ -253,4 +253,21 @@ class SparseSpotPhotometryTest {
         assertEquals(a[1] * 4 + 1.5, b[1], 1e-9)
         assertNotNull(full)
     }
+
+    @Test fun pixelRefineDimsRemainingBrightPixelsAndRestoresOvercorrectedOnes() {
+        val w = 40
+        val h = 40
+        val n = w * h
+        val value = FloatArray(n) { 1f }
+        value[20 * w + 10] = 1.08f   // 보정 후에도 밝게 남은 픽셀
+        value[20 * w + 30] = 0.95f   // 과하게 낮춘 픽셀
+        val residual = SparseSpotPhotometry.SparseMap(w, h, value, FloatArray(n) { 0.002f }, BooleanArray(n) { true })
+        val old = FloatArray(n) { 1f }.also { it[20 * w + 30] = 0.93f }
+        val rmsBefore = SparseSpotPhotometry.detailRms(residual, 3)
+        assertTrue(rmsBefore > 0.001f)
+        val g = SparseSpotPhotometry.refineDetailGain(old, residual, 3, 0.25f)
+        assertTrue("bright pixel dimmed", g[20 * w + 10] < 0.95f)
+        assertTrue("overcorrected pixel raised", g[20 * w + 30] > 0.96f)
+        assertEquals(1f, g[5 * w + 5], 0.01f)
+    }
 }

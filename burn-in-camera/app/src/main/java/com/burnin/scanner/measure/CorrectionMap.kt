@@ -40,6 +40,10 @@ internal class CorrectionMap(
         return FloatArray(g.size) { (g[it] * d[it]).coerceIn(1f - maxAttenuation, 1f) }
     }
 
+    /** 같은 저주파·채널 맵에 고주파 층만 바꾼 맵(픽셀 단위 재검증 결과 반영용). */
+    fun replaceDetail(newDetail: FloatArray, newDetailRgb: List<FloatArray>? = detailRgb): CorrectionMap =
+        CorrectionMap(gain, channels, channelWeight, isBaseline, newDetail, maxAttenuation, shareChannels = true, detailRgb = newDetailRgb)
+
     fun alphaPng(gw: Int, gh: Int, width: Int, height: Int, maxAttenuation: Float): ByteArray =
         Analyzer.toAlphaPng(effectiveGain, gw, gh, width, height, maxAttenuation)
 
