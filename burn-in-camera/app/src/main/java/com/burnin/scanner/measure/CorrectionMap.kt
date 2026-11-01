@@ -17,6 +17,8 @@ internal class CorrectionMap(
     private val maxAttenuation: Float = 1f,
     /** true면 채널 gain을 복사하지 않고 공유한다(측정 뒤 바뀌지 않는 격자를 반복마다 넘길 때). */
     shareChannels: Boolean = false,
+    /** 채널별(R/G/B) 픽셀 단위 고주파 층. 있으면 RGB 맵의 각 채널에 [detail] 대신 곱한다(공유, 복사 안 함). */
+    private val detailRgb: List<FloatArray>? = null,
 ) {
     val gain = gain.copyOf()
     private val channels = if (shareChannels) channelGains else channelGains.mapValues { it.value.copyOf() }
@@ -42,12 +44,14 @@ internal class CorrectionMap(
         Analyzer.toAlphaPng(effectiveGain, gw, gh, width, height, maxAttenuation)
 
     fun rgbPng(gw: Int, gh: Int, width: Int, height: Int, maxAttenuation: Float): ByteArray? {
-        if (channels.isEmpty() || channelWeight <= 0f) return null
+        val rgbDetail = detailRgb?.takeIf { !isBaseline && it.size == 3 }
+        if ((channels.isEmpty() || channelWeight <= 0f) && rgbDetail == null) return null
         // 채널 혼합 결과에 고주파 층을 제자리에서 곱해 채널당 격자 하나만 새로 만든다.
         fun channel(index: Int): FloatArray {
-            val mixed = channels[index]?.let { Analyzer.mixGainGrids(gain, it, channelWeight, maxAttenuation) }
-                ?: return effectiveGain
-            val d = detail
+            val mixed = channels[index]?.takeIf { channelWeight > 0f }
+                ?.let { Analyzer.mixGainGrids(gain, it, channelWeight, maxAttenuation) }
+                ?: if (rgbDetail != null) gain.copyOf() else return effectiveGain
+            val d = rgbDetail?.get(index) ?: detail
             if (d != null && !isBaseline) {
                 for (i in mixed.indices) mixed[i] = (mixed[i] * d[i]).coerceIn(1f - this.maxAttenuation, 1f)
             }

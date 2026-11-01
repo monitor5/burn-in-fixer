@@ -58,6 +58,15 @@ class PatternSpecTest {
     }
 
     @Test
+    fun parsesSingleChannelSparsePatterns() {
+        assertEquals(0xFFB30000.toInt(), PatternSpec.parse("sparse70_b1_p5_x0_y0_cr")!!.color)
+        assertEquals(0xFF00B300.toInt(), PatternSpec.parse("sparse70_b1_p5_x0_y0_cg")!!.color)
+        assertEquals(0xFF0000B3.toInt(), PatternSpec.parse("sparse70_b1_p5_x0_y0_cb")!!.color)
+        assertEquals(true, PatternSpec.parse("sparse70_b1_p5_x2_y1_cb")!!.sparseLit(7, 6))
+        assertNull(PatternSpec.parse("sparse70_b1_p5_x0_y0_cx"))
+    }
+
+    @Test
     fun rejectsInvalidSparsePatterns() {
         assertNull(PatternSpec.parse("sparse70_b1_p4_x4_y0"))   // 위상 범위 초과
         assertNull(PatternSpec.parse("sparse70_b2_p5_x0_y0"))   // pitch가 block의 배수가 아님

@@ -47,9 +47,12 @@ object SparseSpotPhotometry {
         val phasesPerAxis: Int get() = pitch / block
         val patternCount: Int get() = phasesPerAxis * phasesPerAxis
 
-        fun patternName(phaseX: Int, phaseY: Int): String {
+        /** [channel]이 0/1/2면 그 채널(R/G/B)만 켜는 패턴, null이면 흰색. */
+        fun patternName(phaseX: Int, phaseY: Int, channel: Int? = null): String {
             require(phaseX in 0 until phasesPerAxis && phaseY in 0 until phasesPerAxis)
-            return "$PATTERN_PREFIX${level}_b${block}_p${pitch}_x${phaseX}_y$phaseY"
+            require(channel == null || channel in 0..2)
+            val suffix = channel?.let { "_c" + "rgb"[it] } ?: ""
+            return "$PATTERN_PREFIX${level}_b${block}_p${pitch}_x${phaseX}_y$phaseY$suffix"
         }
 
         fun phases(): List<Pair<Int, Int>> =

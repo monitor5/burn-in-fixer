@@ -77,9 +77,10 @@ internal object MeasurementPolicy {
             channelWeight: Float,
             detail: FloatArray? = null,
             maxAttenuation: Float = 1f,
+            detailRgb: List<FloatArray>? = null,
         ): CorrectionMap =
             CorrectionMap(gain, if (isBaseline) emptyMap() else channelGains,
-                if (isBaseline) 0f else channelWeight, isBaseline, detail, maxAttenuation)
+                if (isBaseline) 0f else channelWeight, isBaseline, detail, maxAttenuation, detailRgb = detailRgb)
 
         fun consider(candidate: FloatArray, candidateScore: Float): Boolean {
             require(candidate.size == gain.size && candidate.all { it.isFinite() && it in 0f..1f })

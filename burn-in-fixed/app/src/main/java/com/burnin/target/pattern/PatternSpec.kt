@@ -8,6 +8,7 @@ package com.burnin.target.pattern
  *  - "checker"  : 체커보드 (렌즈 왜곡 캘리브레이션용)
  *  - "dotgrid"  : 도트 그리드 (렌즈 왜곡 캘리브레이션용)
  *  - "sparse70_b1_p4_x0_y3" : 희소 점등. block×block 픽셀 블록만 pitch 간격으로 켠다(밝기 70%).
+ *  - "sparse70_b1_p4_x0_y3_cr" : 같은 배치를 한 채널(r/g/b)만 켠다(서브픽셀별 측정).
  *    블록 좌상단은 (x·block + i·pitch, y·block + j·pitch). 글씨 획 단위 번인 측광용.
  *  - "rgb-RRGGBB" : 임의 코드값 단색 (색감 측정 패치, 16진수)
  */
@@ -41,11 +42,11 @@ data class PatternSpec(
         val BLACK = solid("black", COLOR_BLACK)
 
         private val solidRegex = Regex("^(black|white|gray|grey|red|green|blue)(\\d{1,3})?$")
-        private val sparseRegex = Regex("^sparse(\\d{1,3})_b(\\d)_p(\\d{1,2})_x(\\d{1,2})_y(\\d{1,2})$")
+        private val sparseRegex = Regex("^sparse(\\d{1,3})_b(\\d)_p(\\d{1,2})_x(\\d{1,2})_y(\\d{1,2})(?:_c([rgb]))?$")
 
         private fun parseSparse(name: String): PatternSpec? {
             val m = sparseRegex.matchEntire(name) ?: return null
-            val (pctText, blockText, pitchText, xText, yText) = m.destructured
+            val (pctText, blockText, pitchText, xText, yText, channelText) = m.destructured
             val pct = pctText.toInt().coerceIn(0, 100)
             val block = blockText.toInt()
             val pitch = pitchText.toInt()
@@ -55,7 +56,13 @@ data class PatternSpec(
             val phases = pitch / block
             if (px >= phases || py >= phases) return null
             val v = Math.round(255f * pct / 100f)
-            return PatternSpec(name, Kind.SPARSE, rgb(v, v, v), block = block, pitch = pitch, phaseX = px, phaseY = py)
+            val color = when (channelText) {
+                "r" -> rgb(v, 0, 0)
+                "g" -> rgb(0, v, 0)
+                "b" -> rgb(0, 0, v)
+                else -> rgb(v, v, v)
+            }
+            return PatternSpec(name, Kind.SPARSE, color, block = block, pitch = pitch, phaseX = px, phaseY = py)
         }
 
         private val rgbRegex = Regex("^rgb-([0-9a-f]{6})$")
