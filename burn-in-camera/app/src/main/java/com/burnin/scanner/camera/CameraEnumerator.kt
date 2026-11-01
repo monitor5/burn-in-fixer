@@ -113,6 +113,26 @@ object CameraEnumerator {
         val listedBack = choices.filter { it.source == Source.LISTED && it.physicalId == null }
         return grouped.values.sortedByDescending { it.size }
             .firstNotNullOfOrNull { selectFromGroup(it, listedBack, concurrentSets) }
+            ?: selectListedPair(listedBack, concurrentSets)
+    }
+
+    /**
+     * 물리 서브카메라를 노출하지 않는 기기(삼성 등)용 2대 세트: 공개 ID로 따로 보이는
+     * 표준(메인)과 초광각을 각각 열어 동시에 찍는다. 초광각은 독립 오픈(standalone) 역할이다.
+     * OS가 보고한 동시 오픈 세트에 있는 쌍을 우선하되, 없어도 시도한다. 삼성은 그 세트에
+     * 전·후면 쌍만 올리는 경우가 많고, 실제로 안 되면 CaptureController가 메인을 잃은 것을
+     * 감지해 메인 단독으로 돌아간다.
+     */
+    private fun selectListedPair(listedBack: List<CameraChoice>, concurrentSets: List<Set<String>>): TriSelection? {
+        val main = listedBack.filter { it.fovDeg in 55f..95f }.maxByOrNull { it.maxW.toLong() * it.maxH }
+            ?: return null
+        val ultra = listedBack
+            .filter { it !== main && it.openId != main.openId && it.fovDeg >= 95f }
+            .sortedWith(compareByDescending<CameraChoice> { canOpenConcurrently(main.openId, it.openId, concurrentSets) }
+                .thenByDescending { it.fovDeg })
+            .firstOrNull()
+            ?: return null
+        return TriSelection(main.openId, main, ultra, null, setOf(ROLE_ULTRA_WIDE))
     }
 
     private fun selectFromGroup(group: List<CameraChoice>, listedBack: List<CameraChoice>, concurrentSets: List<Set<String>>): TriSelection? {

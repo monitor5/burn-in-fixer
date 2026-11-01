@@ -8,6 +8,7 @@ import android.os.Bundle
 import android.util.Base64
 import android.hardware.camera2.CameraManager
 import android.view.TextureView
+import android.view.View
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.CheckBox
@@ -237,9 +238,17 @@ class MeasurementActivity : Activity() {
             try {
                 capture?.close()
                 capture = null
-                val c = CaptureController(this@MeasurementActivity, findViewById<TextureView>(R.id.preview))
+                val auxView = findViewById<TextureView>(R.id.previewAux)
+                val wantAux = chkTri.isChecked && triSelection?.let { it.roleCount > 1 } == true
+                auxView.visibility = if (wantAux) View.VISIBLE else View.GONE
+                val c = CaptureController(
+                    this@MeasurementActivity,
+                    findViewById<TextureView>(R.id.preview),
+                    auxTextureView = if (wantAux) auxView else null,
+                )
                 capture = c
                 c.start(if (chkTri.isChecked) triSelection else null)
+                if (!c.isAuxPreviewActive) auxView.visibility = View.GONE
                 status("카메라 준비 완료 — 정렬 확인 후 [측정 시작]")
                 log(
                     "카메라: ${c.captureSize.width}x${c.captureSize.height} " +
@@ -247,8 +256,8 @@ class MeasurementActivity : Activity() {
                 )
                 if (chkTri.isChecked) {
                     log(
-                        if (c.isTriActive) "동시 3각 세션 구성: ${c.triSummary()}"
-                        else "동시 3각 구성 실패 → 메인 단독 폴백 (기기 HAL 제한)"
+                        if (c.isTriActive) "동시 촬영 구성(${c.activeRoles.size}대): ${c.triSummary()}"
+                        else "동시 촬영 구성 실패 → 메인 단독 폴백 (기기 HAL 제한)"
                     )
                 }
                 c.diagnosticNotes().forEach { log(it) }

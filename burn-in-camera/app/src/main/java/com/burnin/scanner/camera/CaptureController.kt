@@ -32,6 +32,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
@@ -58,7 +59,12 @@ data class CaptureFrame(
  *   (MANUAL_SENSOR 미지원 기기는 AE/AWB lock fallback)
  * - 프레임 평균화를 위해 같은 패턴을 여러 장 연속 촬영
  */
-class CaptureController(context: Context, private val textureView: TextureView) {
+class CaptureController(
+    context: Context,
+    private val textureView: TextureView,
+    /** 보조 화각(초광각/망원) 프리뷰. null이거나 보조 카메라가 없으면 쓰지 않는다. */
+    private val auxTextureView: TextureView? = null,
+) {
 
     private val manager = context.getSystemService(CameraManager::class.java)
     private val thread = HandlerThread("camera").apply { start() }
@@ -68,6 +74,12 @@ class CaptureController(context: Context, private val textureView: TextureView) 
     private var session: CameraCaptureSession? = null
     private var reader: ImageReader? = null
     private var previewSurface: Surface? = null
+    private var auxPreviewSurface: Surface? = null
+    /** 보조 프리뷰에 연결된 역할 (ultrawide/tele). */
+    var auxPreviewRole: String? = null
+        private set
+    /** 메인 카메라가 열린 뒤 끊겼는지(다른 카메라를 열다 빼앗긴 경우 등). */
+    @Volatile private var mainLost = false
     private lateinit var previewBuilder: CaptureRequest.Builder
 
     /** 동시 3각 촬영용 보조 화각 리더 (role → reader). 비어 있으면 메인 단독. */
@@ -80,6 +92,9 @@ class CaptureController(context: Context, private val textureView: TextureView) 
     private val lastPhysicalExposureNs = LinkedHashMap<String, Long>()
 
     val isTriActive: Boolean get() = extraReaders.isNotEmpty() || standaloneCameras.isNotEmpty()
+
+    /** 보조 화각 프리뷰가 실제로 흘러가고 있는지. */
+    val isAuxPreviewActive: Boolean get() = isTriActive && auxPreviewSurface != null
 
     val activeRoles: List<String>
         get() = listOf(CameraEnumerator.ROLE_MAIN) + extraReaders.keys + standaloneCameras.keys
@@ -215,6 +230,18 @@ class CaptureController(context: Context, private val textureView: TextureView) 
 
         reader = ImageReader.newInstance(captureSize.width, captureSize.height, captureFormat, 3)
 
+        auxPreviewRole = tri?.roles()?.firstOrNull { it.first != CameraEnumerator.ROLE_MAIN }?.first
+        val auxView = auxTextureView
+        auxPreviewSurface = if (auxPreviewRole != null && auxView != null) {
+            withTimeoutOrNull(3_000) { awaitSurfaceTexture(auxView) }?.let { st ->
+                st.setDefaultBufferSize(previewSize.width, previewSize.height)
+                Surface(st)
+            }
+        } else null
+        if (auxPreviewRole != null && auxView != null && auxPreviewSurface == null) {
+            setupNotes += "보조 프리뷰 없음 (화면 준비 안 됨)"
+        }
+
         extraReaders.clear()
         standaloneCameras.values.forEach { runCatching { it.close() } }
         standaloneCameras.clear()
@@ -237,10 +264,19 @@ class CaptureController(context: Context, private val textureView: TextureView) 
             }
         }
 
+        mainLost = false
         device = openCamera()
         session = if (tri != null && extraReaders.isNotEmpty() && Build.VERSION.SDK_INT >= 28) {
             try {
-                createTriSession(tri, pSurface)
+                try {
+                    createTriSession(tri, pSurface, auxPreviewSurface)
+                } catch (e: Exception) {
+                    if (auxPreviewSurface == null) throw e
+                    // 보조 프리뷰 스트림 하나 때문에 동시 촬영 전체를 잃지 않게 프리뷰 없이 재시도
+                    setupNotes += "보조 프리뷰 포함 세션 실패, 프리뷰 없이 재시도: ${e.message}"
+                    releaseAuxPreview()
+                    createTriSession(tri, pSurface, null)
+                }
             } catch (e: Exception) {
                 // 동시 3각 구성 실패 → 보조 리더 정리 후 메인 단독 폴백
                 setupNotes += "논리 멀티카메라 세션 실패: ${e.message}"
@@ -265,10 +301,24 @@ class CaptureController(context: Context, private val textureView: TextureView) 
                     setupNotes += "독립 $role[${choice.key}] 동시 오픈 활성"
                 }
             }
+            if (standaloneCameras.isNotEmpty()) {
+                // 동시 오픈이 보장되지 않는 기기는 두 번째 카메라를 열 때 메인을 끊어 버린다.
+                delay(500)
+                if (mainLost) {
+                    val notes = setupNotes.toList()
+                    closeCameras()
+                    start(null)
+                    setupNotes.addAll(0, notes)
+                    setupNotes += "보조 카메라를 열자 메인 카메라가 끊김 — 이 기기는 동시 오픈 불가, 메인 단독으로 폴백"
+                    return
+                }
+            }
         }
 
         previewBuilder = device!!.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
             addTarget(pSurface)
+            // 논리 멀티카메라 세션이면 보조 프리뷰도 같은 반복 요청으로 흘린다.
+            if (auxPreviewRole?.let { it in extraReaders } == true) auxPreviewSurface?.let { addTarget(it) }
             set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
             set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
             set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
@@ -619,16 +669,16 @@ class CaptureController(context: Context, private val textureView: TextureView) 
         )
     }
 
-    private suspend fun awaitSurfaceTexture(): SurfaceTexture =
+    private suspend fun awaitSurfaceTexture(view: TextureView = textureView): SurfaceTexture =
         suspendCancellableCoroutine { cont ->
-            val existing = textureView.surfaceTexture
-            if (textureView.isAvailable && existing != null) {
+            val existing = view.surfaceTexture
+            if (view.isAvailable && existing != null) {
                 cont.resume(existing)
                 return@suspendCancellableCoroutine
             }
-            textureView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+            view.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
                 override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
-                    textureView.surfaceTextureListener = null
+                    view.surfaceTextureListener = null
                     if (cont.isActive) cont.resume(st)
                 }
                 override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {}
@@ -639,13 +689,14 @@ class CaptureController(context: Context, private val textureView: TextureView) 
 
     @SuppressLint("MissingPermission")
     private suspend fun openCamera(): CameraDevice = suspendCancellableCoroutine { cont ->
-        openCameraById(cameraId, cont)
+        openCameraById(cameraId, cont) { mainLost = true }
     }
 
     @SuppressLint("MissingPermission")
     private fun openCameraById(
         id: String,
         cont: kotlinx.coroutines.CancellableContinuation<CameraDevice>,
+        onLostAfterOpen: (() -> Unit)? = null,
     ) {
         manager.openCamera(id, object : CameraDevice.StateCallback() {
             override fun onOpened(camera: CameraDevice) {
@@ -654,10 +705,12 @@ class CaptureController(context: Context, private val textureView: TextureView) 
             override fun onDisconnected(camera: CameraDevice) {
                 camera.close()
                 if (cont.isActive) cont.resumeWithException(IllegalStateException("카메라 연결 끊김"))
+                else onLostAfterOpen?.invoke()
             }
             override fun onError(camera: CameraDevice, error: Int) {
                 camera.close()
                 if (cont.isActive) cont.resumeWithException(IllegalStateException("카메라 오류 $error"))
+                else onLostAfterOpen?.invoke()
             }
         }, handler)
     }
@@ -679,7 +732,26 @@ class CaptureController(context: Context, private val textureView: TextureView) 
         val sDevice = suspendCancellableCoroutine<CameraDevice> { cont ->
             openCameraById(choice.openId, cont)
         }
-        val sSession = createSession(sDevice, listOf(sReader.surface))
+        val aux = auxPreviewSurface?.takeIf { role == auxPreviewRole }
+        val sSession = try {
+            createSession(sDevice, listOfNotNull(sReader.surface, aux))
+        } catch (e: Exception) {
+            if (aux == null) throw e
+            setupNotes += "독립 $role 보조 프리뷰 포함 세션 실패, 프리뷰 없이 재시도: ${e.message}"
+            releaseAuxPreview()
+            createSession(sDevice, listOf(sReader.surface))
+        }
+        if (aux != null && auxPreviewSurface != null) {
+            // 보조 프리뷰: 자동 노출/초점으로 계속 흘린다. 측정 촬영은 별도 요청에 수동값을 싣는다.
+            val pReq = sDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                addTarget(aux)
+                set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
+                set(CaptureRequest.FLASH_MODE, CameraMetadata.FLASH_MODE_OFF)
+            }
+            sSession.setRepeatingRequest(pReq.build(), null, handler)
+        }
         return StandaloneCamera(role, choice, sDevice, sSession, sReader)
     }
 
@@ -743,6 +815,7 @@ class CaptureController(context: Context, private val textureView: TextureView) 
     private suspend fun createTriSession(
         tri: CameraEnumerator.TriSelection,
         previewSurface: Surface,
+        auxPreview: Surface?,
     ): CameraCaptureSession = suspendCancellableCoroutine { cont ->
         require(Build.VERSION.SDK_INT >= 28)
         val mainPid = tri.main.physicalId
@@ -758,6 +831,11 @@ class CaptureController(context: Context, private val textureView: TextureView) 
             val r = extraReaders[role] ?: continue
             outputs += OutputConfiguration(r.surface).also { out ->
                 choice.physicalId?.let { out.setPhysicalCameraId(it) }
+            }
+            if (auxPreview != null && role == auxPreviewRole) {
+                outputs += OutputConfiguration(auxPreview).also { out ->
+                    choice.physicalId?.let { out.setPhysicalCameraId(it) }
+                }
             }
         }
         val config = SessionConfiguration(
@@ -784,6 +862,12 @@ class CaptureController(context: Context, private val textureView: TextureView) 
     }
 
     fun close() {
+        closeCameras()
+        thread.quitSafely()
+    }
+
+    /** 카메라·세션·리더만 닫는다(스레드는 유지해 다시 start할 수 있게). */
+    private fun closeCameras() {
         runCatching { session?.close() }
         runCatching { device?.close() }
         runCatching { reader?.close() }
@@ -791,11 +875,17 @@ class CaptureController(context: Context, private val textureView: TextureView) 
         standaloneCameras.clear()
         extraReaders.values.forEach { runCatching { it.close() } }
         extraReaders.clear()
+        releaseAuxPreview()
         runCatching { previewSurface?.release() }
+        previewSurface = null
         session = null
         device = null
         reader = null
-        thread.quitSafely()
+    }
+
+    private fun releaseAuxPreview() {
+        runCatching { auxPreviewSurface?.release() }
+        auxPreviewSurface = null
     }
 
     private fun StandaloneCamera.close() {

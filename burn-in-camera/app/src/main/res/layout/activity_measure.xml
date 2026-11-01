@@ -4,11 +4,27 @@
     android:layout_height="match_parent"
     android:orientation="vertical">
 
-    <TextureView
-        android:id="@+id/preview"
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="0dp"
-        android:layout_weight="1" />
+        android:layout_weight="1"
+        android:orientation="horizontal">
+
+        <TextureView
+            android:id="@+id/preview"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1" />
+
+        <!-- 보조 화각(초광각/망원) 프리뷰. 동시 촬영이 켜질 때만 보인다. -->
+        <TextureView
+            android:id="@+id/previewAux"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_marginStart="4dp"
+            android:layout_weight="1"
+            android:visibility="gone" />
+    </LinearLayout>
 
     <TextView
         android:id="@+id/txtStatus"
@@ -48,7 +64,7 @@
             android:layout_weight="1"
             android:enabled="false"
             android:textSize="13sp"
-            android:text="3각 동시 교차(초광각/표준/망원)" />
+            android:text="멀티 카메라 동시 교차(초광각/표준/망원 중 2~3대)" />
     </LinearLayout>
 
     <ScrollView

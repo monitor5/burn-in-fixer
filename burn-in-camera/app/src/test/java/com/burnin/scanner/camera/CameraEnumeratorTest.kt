@@ -109,6 +109,28 @@ class CameraEnumeratorTest {
     }
 
     @Test
+    fun listedMainAndUltraWideFormTwoCameraSetWithoutPhysicalIds() {
+        // S25 Edge처럼 물리 ID 없이 메인(0)과 초광각(2)만 공개 ID로 보이는 경우
+        val main = choice("0", fov = 72f, w = 4080, h = 3060, openId = "0", source = CameraEnumerator.Source.LISTED)
+        val ultra = choice("2", fov = 106f, w = 4000, h = 3000, openId = "2", source = CameraEnumerator.Source.LISTED)
+        val tri = CameraEnumerator.selectTriSet(listOf(main, ultra))
+        assertNotNull(tri)
+        assertEquals("0", tri!!.openId)
+        assertEquals("0", tri.main.openId)
+        assertEquals("2", tri.ultraWide?.openId)
+        assertNull(tri.tele)
+        assertTrue(tri.isStandalone(CameraEnumerator.ROLE_ULTRA_WIDE))
+        assertEquals(2, tri.roleCount)
+
+        // OS 동시 오픈 세트에 쌍이 없어도 시도한다(실패는 CaptureController가 감지·폴백)
+        assertNotNull(CameraEnumerator.selectTriSet(listOf(main, ultra), concurrentSets = listOf(setOf("0", "1"))))
+        // 보고된 세트 안의 초광각을 우선한다
+        val ultra3 = choice("3", fov = 120f, w = 4000, h = 3000, openId = "3", source = CameraEnumerator.Source.LISTED)
+        val preferred = CameraEnumerator.selectTriSet(listOf(main, ultra, ultra3), concurrentSets = listOf(setOf("0", "2")))
+        assertEquals("2", preferred!!.ultraWide?.openId)
+    }
+
+    @Test
     fun rejectsSingleFovGroup() {
         // 화각이 하나뿐이면 교차 의미 없음
         val main = choice("1", fov = 80f, w = 8000, h = 6000)
