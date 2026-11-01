@@ -288,6 +288,18 @@ class MeasurementActivity : Activity() {
         loadVignetteModel()
         editMaxAtt = findViewById(R.id.editMaxAtt)
         chkRgbDots = findViewById(R.id.chkRgbDots)
+        // 감쇠 상한·RGBW 선택은 앱을 다시 띄워도(업데이트 설치 포함) 유지한다
+        val prefs = getSharedPreferences("app", MODE_PRIVATE)
+        prefs.getString("max_attenuation_pct", null)?.let { editMaxAtt.setText(it) }
+        chkRgbDots.isChecked = prefs.getBoolean("rgbw_dots", chkRgbDots.isChecked)
+        editMaxAtt.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+            override fun afterTextChanged(s: android.text.Editable?) {
+                prefs.edit().putString("max_attenuation_pct", s.toString().trim()).apply()
+            }
+        })
+        chkRgbDots.setOnCheckedChangeListener { _, checked -> prefs.edit().putBoolean("rgbw_dots", checked).apply() }
         findViewById<Button>(R.id.btnCheckAtt).setOnClickListener {
             btnStart.isEnabled = false
             btnExtra.isEnabled = false
@@ -918,6 +930,15 @@ class MeasurementActivity : Activity() {
         }
         val edgeFalloff = withContext(Dispatchers.Default) {
             Analyzer.edgeFalloff(lumaBeforeRaw, gw, gh)
+        }
+        val flatStrength = Analyzer.flatFieldStrength(flatField)
+        if (vignetteModel != null && flatStrength > 0.25f) {
+            log(
+                "경고: 비네팅 보정값이 가장자리를 ${pct(flatStrength)}나 보정함" +
+                    (if (vignetteModel?.rMax?.isFinite() == true) "" else "(보정 범위 정보 없는 예전 값)") +
+                    " — 탭과 카메라 거리·박스를 바꿨다면 '비네팅 보정 (3위치)'을 지금 거치로 다시 해 주세요. " +
+                    "맞지 않는 값이면 가장자리를 과하게 어둡게 만듭니다."
+            )
         }
         val lumaBeforeRadial = withContext(Dispatchers.Default) {
             Analyzer.applyFlatField(lumaBeforeRaw, flatField)
@@ -1623,6 +1644,8 @@ class MeasurementActivity : Activity() {
             bestLowRgbRms = previous.bestLowRgbRms
         }
         var prevScore: Float? = null
+        // 점수가 최적보다 나빠지면 최적 맵 쪽으로 반 걸음 되돌리고 보폭을 줄인다(되먹임 과보정 억제)
+        var stepAlpha = DAMPING_ALPHA
         var divergeCount = 0
         var stalledCount = 0
         var invalid = false
@@ -1701,13 +1724,13 @@ class MeasurementActivity : Activity() {
             val grayScoreLow = uniformityScore(lowSt, lumaLowAfter, gw, gh)
             val refined70 = withContext(Dispatchers.Default) {
                 Analyzer.refineGain(
-                    gain, levelAdjusted(lumaAfter, gw, gh), curveTarget70 ?: target, DAMPING_ALPHA, gw, gh, maxAttenuation,
+                    gain, levelAdjusted(lumaAfter, gw, gh), curveTarget70 ?: target, stepAlpha, gw, gh, maxAttenuation,
                     confidenceAfter, smoothRadius
                 )
             }
             val refined30 = withContext(Dispatchers.Default) {
                 Analyzer.refineGain(
-                    gain, lumaLowAfter, lowTarget, DAMPING_ALPHA, gw, gh, maxAttenuation,
+                    gain, lumaLowAfter, lowTarget, stepAlpha, gw, gh, maxAttenuation,
                     confidenceLowAfter, smoothRadius
                 )
             }
@@ -1753,12 +1776,15 @@ class MeasurementActivity : Activity() {
                     "RGB30 평균 RMS ${pct(rgb30AfterMeanRms)}, 균일도 점수 ${fmt(compositeScore)}x, 힙 ${heapText()}"
             )
 
-            if (selection.consider(gain, compositeScore)) {
+            val improvedBest = selection.consider(gain, compositeScore)
+            if (improvedBest) {
                 bestRms = st.rmsDev
                 bestLowRms = lowSt.rmsDev
                 bestLowRgbRms = rgb30AfterMeanRms
                 lastAppliedIsBest = true
             }
+            val backtrack = !improvedBest && !selection.isBaseline &&
+                compositeScore > selection.score * 1.01f + 0.01f
 
             if (bothGrayPassed) {
                 log(
@@ -1795,6 +1821,13 @@ class MeasurementActivity : Activity() {
                 }
             } ?: refinedGray
             gain = Analyzer.limitGainByConfidenceInPlace(gain, confidence70, maxAttenuation)
+            if (backtrack) {
+                // 이번 맵이 최적보다 나빴다: 다음 맵은 최적 맵과 이번 갱신의 기하 중간, 이후 보폭은 절반
+                val best = selection.gain
+                for (i in gain.indices) gain[i] = Math.sqrt((gain[i] * best[i]).toDouble()).toFloat()
+                stepAlpha = (stepAlpha * 0.5f).coerceAtLeast(0.05f)
+                log("반복 $iter: 점수가 최적(${fmt(selection.score)}x)보다 나쁨 — 최적 맵 쪽으로 반 걸음 되돌리고 보폭 α=${fmt(stepAlpha)}")
+            }
         }
 
         val bestMap = selection.correctionMap(rgb30.channelGains, lowRgbWeight, strokeDetail?.gain, maxAttenuation, strokeDetail?.channelGains)

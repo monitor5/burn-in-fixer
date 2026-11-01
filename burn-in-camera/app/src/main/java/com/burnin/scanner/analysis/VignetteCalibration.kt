@@ -17,18 +17,28 @@ import kotlin.math.ln
 object VignetteCalibration {
 
     /** 비네팅 모델: 카메라 이미지 정규화 좌표(중심 0, 긴 변 반폭 1)에서 상대 감도. */
-    data class Model(val c1: Double, val c2: Double, val c3: Double) {
+    data class Model(
+        val c1: Double,
+        val c2: Double,
+        val c3: Double,
+        /** 보정 촬영 데이터가 닿은 최대 반지름. 그 밖은 다항식 외삽이 폭주하므로 이 값에서 멈춘다. */
+        val rMax: Double = Double.POSITIVE_INFINITY,
+    ) {
         fun logGain(x: Double, y: Double): Double {
-            val r2 = x * x + y * y
+            val r2 = minOf(x * x + y * y, rMax * rMax)
             return c1 * r2 + c2 * r2 * r2 + c3 * r2 * r2 * r2
         }
 
         fun gain(x: Double, y: Double): Double = exp(logGain(x, y))
 
         fun toJson(): JSONObject = JSONObject().put("c1", c1).put("c2", c2).put("c3", c3)
+            .apply { if (rMax.isFinite()) put("rMax", rMax) }
 
         companion object {
-            fun fromJson(o: JSONObject) = Model(o.getDouble("c1"), o.getDouble("c2"), o.optDouble("c3", 0.0))
+            fun fromJson(o: JSONObject) = Model(
+                o.getDouble("c1"), o.getDouble("c2"), o.optDouble("c3", 0.0),
+                o.optDouble("rMax", Double.POSITIVE_INFINITY).takeIf { !it.isNaN() } ?: Double.POSITIVE_INFINITY,
+            )
         }
     }
 
@@ -78,7 +88,12 @@ object VignetteCalibration {
             }
         }
         val c = solve(ata, atb) ?: throw IllegalStateException("비네팅 계수를 풀 수 없습니다(위치 차이가 너무 작음)")
-        val model = Model(c[0], c[1], if (useR6) c[2] else 0.0)
+        var rMax = 0.0
+        for (pos in positions) for (b in 0 until nBlocks) {
+            val v = pos.values[b]
+            if (v.isFinite() && v > 0f) rMax = maxOf(rMax, Math.hypot(pos.xs[b].toDouble(), pos.ys[b].toDouble()))
+        }
+        val model = Model(c[0], c[1], if (useR6) c[2] else 0.0, if (rMax > 0.0) rMax else Double.POSITIVE_INFINITY)
         var ss = 0.0
         var n = 0
         for (b in 0 until nBlocks) {

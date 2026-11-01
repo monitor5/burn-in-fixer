@@ -444,9 +444,49 @@ object Analyzer {
         requireGrid(luma, gw, gh)
         requireAttenuation(maxAtt)
         val median = stats(luma).median
-        val means = blockGrid(luma, gw, gh).means.apply { sort() }
+        val grid = blockGrid(luma, gw, gh)
+        val means = grid.means.copyOf().apply { sort() }
         val low = means[(means.size * TARGET_BLOCK_PERCENTILE).toInt().coerceIn(0, means.size - 1)]
-        return maxOf(low, median * (1f - maxAtt))
+        val floor = median * (1f - maxAtt)
+        if (low >= floor) return low
+        return optimalTarget(grid.means, grid.counts, floor, low.coerceAtLeast(floor).coerceAtLeast(median * 0.5f), median, maxAtt)
+    }
+
+    /**
+     * 감쇠 상한 안에서 가장 고른 결과를 내는 목표를 고른다. 목표 T 아래 블록은 밝힐 수 없어 그대로
+     * 남고, T보다 1/(1−maxAtt)배 넘게 밝은 블록은 상한에 걸려 밝게 남는다. 가장 어두운 1% 블록을
+     * 목표로 삼으면(가장자리 셰이딩 오차·먼지 한 점에도 끌려 내려감) 화면 전체가 상한 가까이 어두워지고
+     * 정작 밝은 영역은 상한에 걸려 덜 고쳐졌다. 그래서 [floor, median] 구간에서 보정 뒤 블록 RMS가
+     * 최소인 T를 찾고, 거의 같으면(0.1% 이내) 밝기 손실이 적은 높은 T를 고른다.
+     */
+    private fun optimalTarget(means: FloatArray, counts: IntArray, floor: Float, lowStart: Float, median: Float, maxAtt: Float): Float {
+        val keep = 1f - maxAtt
+        fun rms(t: Float): Double {
+            var sw = 0.0
+            var s = 0.0
+            var ss = 0.0
+            for (i in means.indices) {
+                val m = means[i]
+                if (!m.isFinite() || m <= 0f || counts[i] == 0) continue
+                val c = if (m <= t) m else maxOf(t, m * keep)
+                val w = counts[i].toDouble()
+                sw += w; s += w * c; ss += w * c * c
+            }
+            if (sw <= 0.0) return Double.MAX_VALUE
+            val mean = s / sw
+            return Math.sqrt(maxOf(0.0, ss / sw - mean * mean)) / mean
+        }
+        val lo = minOf(floor, lowStart)
+        val steps = 200
+        val values = DoubleArray(steps + 1)
+        var best = Double.MAX_VALUE
+        for (k in 0..steps) {
+            values[k] = rms(lo + (median - lo) * k / steps)
+            if (values[k] < best) best = values[k]
+        }
+        var pick = lo
+        for (k in 0..steps) if (values[k] <= best * 1.001 + 1e-7) pick = lo + (median - lo) * k / steps
+        return pick.coerceIn(floor, median)
     }
 
     /**
