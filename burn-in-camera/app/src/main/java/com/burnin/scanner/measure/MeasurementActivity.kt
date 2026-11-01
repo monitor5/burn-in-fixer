@@ -352,13 +352,14 @@ class MeasurementActivity : Activity() {
         val step = Regex("""^(\d+/10)""").find(msg)?.groupValues?.get(1)
         if (step != null && step != lastStep) {
             val now = android.os.SystemClock.elapsedRealtime()
-            lastStep?.let { log("⏱ $it 단계 ${fmtSeconds(now - lastStepAt)}") }
+            lastStep?.let { log("⏱ $it 단계 ${fmtSeconds(now - lastStepAt)}, 힙 ${heapText()}") }
             lastStep = step
             lastStepAt = now
         }
     }
 
     private var lastStep: String? = null
+    private var nativeVerified = false
     private var lastStepAt = 0L
 
     private fun log(msg: String) {
@@ -490,6 +491,8 @@ class MeasurementActivity : Activity() {
                     runCatching { cap.captureSequential(1, 0L) { role, frame -> frames[role] = frame } }
                         .onFailure { log("보조 화각 마커 번갈아 촬영 실패: ${it.message}") }
                 }
+                // 교차 분석은 보조 화각 마커만 쓴다. 메인 RAW 프레임(25MB)은 들고 가지 않는다.
+                frames.remove(CameraEnumerator.ROLE_MAIN)
                 markerTriFrames = frames
             }
             withContext(Dispatchers.Default) {
@@ -547,7 +550,13 @@ class MeasurementActivity : Activity() {
         val triBlackStores = captureTriStores(cap, FRAMES_PER_PATTERN)
         val blackStore = triBlackStores.getValue(CameraEnumerator.ROLE_MAIN)
         val blackAvg = averageGrayFromStore(blackStore)
-        val blackRgbAvg = averageRgbFromStore(blackStore)
+        // 채널마다 네이티브 평균(중간 배열은 네이티브 메모리). 네이티브가 없으면 Kotlin RGB 평균.
+        val blackRgbAvg = withContext(Dispatchers.Default) {
+            val r = NativePixel.average(blackStore.files, 0)
+            val g = r?.let { NativePixel.average(blackStore.files, 1) }
+            val b = g?.let { NativePixel.average(blackStore.files, 2) }
+            if (r != null && g != null && b != null) RgbImage(r.w, r.h, r.data, g.data, b.data) else null
+        } ?: averageRgbFromStore(blackStore)
         blackStore.delete()
 
         // ── 3.2 묶음 촬영: 분석 전에 전면 패턴을 전부 먼저 찍어 둔다 ─────────
@@ -581,14 +590,18 @@ class MeasurementActivity : Activity() {
         val lumaBefore = withContext(Dispatchers.Default) {
             Analyzer.applyFlatField(lumaBeforeRaw, flatField)
         }
-        val baseConfidence70 = withContext(Dispatchers.Default) {
-            Analyzer.confidenceGrid(lumaBeforeRaw, blackFullGrid, strayWarn = 0.05f)
-        }
-        val flickerConfidence70 = temporalLumaConfidence(
-            grayCapture.frameStore, blackAvg, homography, screenW, screenH, gw, gh
-        )
-        val confidence70Single = withContext(Dispatchers.Default) {
-            Analyzer.combineConfidence(baseConfidence70, flickerConfidence70)
+        // 중간 신뢰도 격자(기본·프레임 안정도)는 합친 뒤 버리고, 리포트에는 평균값만 남긴다(상주 메모리 절감).
+        val graySpanMs = grayCapture.frameStore.spanMs
+        var flickerStability70 = 0f
+        val confidence70Single = run {
+            val baseConfidence70 = withContext(Dispatchers.Default) {
+                Analyzer.confidenceGrid(lumaBeforeRaw, blackFullGrid, strayWarn = 0.05f)
+            }
+            val flickerConfidence70 = temporalLumaConfidence(
+                grayCapture.frameStore, blackAvg, homography, screenW, screenH, gw, gh
+            )
+            flickerStability70 = Analyzer.meanConfidence(flickerConfidence70)
+            withContext(Dispatchers.Default) { Analyzer.combineConfidence(baseConfidence70, flickerConfidence70) }
         }
 
         // ── 3.5 동시 3각 교차 분석: 화각 간 불일치 구간을 보정에서 무시 ──
@@ -604,6 +617,8 @@ class MeasurementActivity : Activity() {
             gw,
             gh,
         )
+        // 리포트용 카메라 원본 회색 이미지는 지금 PNG로 바꿔 두고 이미지 자체는 놓는다.
+        val grayAvgPng = if (cross != null) withContext(Dispatchers.Default) { Analyzer.grayImagePng(grayAvg) } else null
         val confidence70 = if (cross != null) {
             withContext(Dispatchers.Default) {
                 Analyzer.combineConfidence(confidence70Single, cross.agreement)
@@ -630,8 +645,8 @@ class MeasurementActivity : Activity() {
             "카메라 flat-field 보정: radial max ${pct(Analyzer.flatFieldStrength(flatField))}, " +
                 "raw edge falloff ${pct(edgeFalloff)}, " +
                 "gray70 confidence 평균 ${pct(Analyzer.meanConfidence(confidence70))}, " +
-                "프레임 안정도 ${pct(Analyzer.meanConfidence(flickerConfidence70))}, " +
-                "flicker span ${fmtSeconds(grayCapture.frameStore.spanMs)}"
+                "프레임 안정도 ${pct(flickerStability70)}, " +
+                "flicker span ${fmtSeconds(graySpanMs)}"
         )
         if (edgeFalloff > 0.08f) {
             log(
@@ -665,15 +680,20 @@ class MeasurementActivity : Activity() {
         val lumaLowBefore = withContext(Dispatchers.Default) {
             Analyzer.applyFlatField(lumaLowBeforeRaw, flatField)
         }
-        val baseConfidenceLow = withContext(Dispatchers.Default) {
-            Analyzer.confidenceGrid(lumaLowBeforeRaw, blackFullGrid, strayWarn = LOW_LIGHT_STRAY_WARN)
-        }
-        val flickerConfidenceLow = temporalLumaConfidence(
-            lowBeforeCapture.frameStore, blackAvg, homography, screenW, screenH, gw, gh
-        )
-        val confidenceLow = withContext(Dispatchers.Default) {
-            val single = Analyzer.combineConfidence(baseConfidenceLow, flickerConfidenceLow)
-            if (cross == null) single else Analyzer.combineConfidence(single, cross.agreement)
+        val lowSpanMs = lowBeforeCapture.frameStore.spanMs
+        var flickerStabilityLow = 0f
+        val confidenceLow = run {
+            val baseConfidenceLow = withContext(Dispatchers.Default) {
+                Analyzer.confidenceGrid(lumaLowBeforeRaw, blackFullGrid, strayWarn = LOW_LIGHT_STRAY_WARN)
+            }
+            val flickerConfidenceLow = temporalLumaConfidence(
+                lowBeforeCapture.frameStore, blackAvg, homography, screenW, screenH, gw, gh
+            )
+            flickerStabilityLow = Analyzer.meanConfidence(flickerConfidenceLow)
+            withContext(Dispatchers.Default) {
+                val single = Analyzer.combineConfidence(baseConfidenceLow, flickerConfidenceLow)
+                if (cross == null) single else Analyzer.combineConfidence(single, cross.agreement)
+            }
         }
         val lowStatsBefore = Analyzer.stats(lumaLowBefore)
         val lowTarget = Analyzer.correctionTarget(lumaLowBefore, gw, gh, MAX_ATTENUATION)
@@ -704,8 +724,8 @@ class MeasurementActivity : Activity() {
         }
         log(
             "$LOW_LIGHT_PATTERN confidence 평균 ${pct(Analyzer.meanConfidence(confidenceLow))}, " +
-                "프레임 안정도 ${pct(Analyzer.meanConfidence(flickerConfidenceLow))}, " +
-                "flicker span ${fmtSeconds(lowBeforeCapture.frameStore.spanMs)}"
+                "프레임 안정도 ${pct(flickerStabilityLow)}, " +
+                "flicker span ${fmtSeconds(lowSpanMs)}"
         )
 
         // ── 6. RGB 채널별 측정: 70% 진단 + 30% 보정 혼합 ─────────
@@ -738,10 +758,13 @@ class MeasurementActivity : Activity() {
             emptyRgbMeasurement()
         }
         val rgb30 = rgb30Measured.copy(
+            // 측정 원본 gain은 이후 쓰지 않으므로 제자리로 제한해 복사본 4장(약 50MB)을 만들지 않는다.
             channelGains = rgb30Measured.channelGains.mapValuesTo(LinkedHashMap()) { (_, gain) ->
-                Analyzer.limitGainByConfidence(gain, confidence70, MAX_ATTENUATION)
+                Analyzer.limitGainByConfidenceInPlace(gain, confidence70, MAX_ATTENUATION)
             },
-            aggregateGain = rgb30Measured.aggregateGain?.let { Analyzer.limitGainByConfidence(it, confidence70, MAX_ATTENUATION) },
+            aggregateGain = rgb30Measured.aggregateGain?.let { Analyzer.limitGainByConfidenceInPlace(it, confidence70, MAX_ATTENUATION) },
+            // 초기 RGB30 신뢰도 격자 3장은 gain 계산에만 쓰고 이후엔 안 쓴다(반복은 재측정 값을 씀).
+            confidences = LinkedHashMap(),
         )
         rgb30
         }
@@ -898,11 +921,11 @@ class MeasurementActivity : Activity() {
             flatField = flatField,
             edgeFalloff = edgeFalloff,
             confidence70 = confidence70,
-            flickerConfidence70 = flickerConfidence70,
-            grayCapture = grayCapture,
+            flickerStability70 = flickerStability70,
+            graySpanMs = graySpanMs,
             confidenceLow = confidenceLow,
-            flickerConfidenceLow = flickerConfidenceLow,
-            lowBeforeCapture = lowBeforeCapture,
+            flickerStabilityLow = flickerStabilityLow,
+            lowSpanMs = lowSpanMs,
             strayRatio = strayRatio,
             cap = cap,
             refreshHz = refreshHz,
@@ -936,7 +959,7 @@ class MeasurementActivity : Activity() {
             finalLumaAfter = finalLumaAfter,
             lumaLowBefore = lumaLowBefore,
             finalLowLumaAfter = finalLowLumaAfter,
-            grayAvg = grayAvg,
+            grayAvgPng = grayAvgPng,
         )
         log("리포트 저장: ${dir.absolutePath}")
         status("측정 완료 — $verdict, 개선율 ${pct(improvement.toFloat())}")
@@ -962,6 +985,28 @@ class MeasurementActivity : Activity() {
         }
         }
         finish(correction)
+    }
+
+    private suspend fun initialGain(
+        lumaBefore: FloatArray,
+        lumaLowBefore: FloatArray,
+        confidence70: FloatArray,
+        confidenceLow: FloatArray,
+        lowLightWeight: Float,
+        rgb30: RgbMeasurement,
+        lowRgbWeight: Float,
+        gw: Int,
+        gh: Int,
+        smoothRadius: Int,
+    ): FloatArray = withContext(Dispatchers.Default) {
+        val grayMixedGain = run {
+            val gray70Gain = Analyzer.gainGrid(lumaBefore, gw, gh, MAX_ATTENUATION, confidence70, smoothRadius)
+            val lowLightGain = Analyzer.gainGrid(lumaLowBefore, gw, gh, MAX_ATTENUATION, confidenceLow, smoothRadius)
+            Analyzer.mixGainGrids(gray70Gain, lowLightGain, lowLightWeight, MAX_ATTENUATION)
+        }
+        val mixed = rgb30.aggregateGain?.let { Analyzer.mixGainGrids(grayMixedGain, it, lowRgbWeight, MAX_ATTENUATION) }
+            ?: grayMixedGain
+        Analyzer.limitGainByConfidenceInPlace(mixed, confidence70, MAX_ATTENUATION)
     }
 
     private suspend fun runCorrectionIterations(
@@ -994,22 +1039,12 @@ class MeasurementActivity : Activity() {
         previous: CorrectionIterations? = null,
         maxIterations: Int = MAX_ITERATIONS,
     ): CorrectionIterations {
-        val gray70Gain = withContext(Dispatchers.Default) {
-            Analyzer.gainGrid(lumaBefore, gw, gh, MAX_ATTENUATION, confidence70, smoothRadius)
+        // 직전 최적 맵에서 이어 갈 때는 초기 gain을 다시 계산하지 않는다(격자 6장가량의 과도 메모리).
+        var gain = if (previous != null && !previous.bestMap.isBaseline) {
+            previous.bestMap.gain.copyOf()
+        } else {
+            initialGain(lumaBefore, lumaLowBefore, confidence70, confidenceLow, lowLightWeight, rgb30, lowRgbWeight, gw, gh, smoothRadius)
         }
-        val lowLightGain = withContext(Dispatchers.Default) {
-            Analyzer.gainGrid(lumaLowBefore, gw, gh, MAX_ATTENUATION, confidenceLow, smoothRadius)
-        }
-        val grayMixedGain = withContext(Dispatchers.Default) {
-            Analyzer.mixGainGrids(gray70Gain, lowLightGain, lowLightWeight, MAX_ATTENUATION)
-        }
-        var gain = rgb30.aggregateGain?.let { rgb30Gain ->
-            withContext(Dispatchers.Default) {
-                Analyzer.mixGainGrids(grayMixedGain, rgb30Gain, lowRgbWeight, MAX_ATTENUATION)
-            }
-        } ?: grayMixedGain
-        gain = Analyzer.limitGainByConfidence(gain, confidence70, MAX_ATTENUATION)
-        if (previous != null && !previous.bestMap.isBaseline) gain = previous.bestMap.gain.copyOf()
         val baselineLowStats = Analyzer.stats(lumaLowBefore)
         val baselineScore = maxOf(
             uniformityScore(statsBefore, lumaBefore, gw, gh),
@@ -1098,21 +1133,51 @@ class MeasurementActivity : Activity() {
                 Analyzer.combineConfidence(baseConfidenceLowAfter, flickerConfidenceLowAfter)
             }
             val lowSt = Analyzer.stats(lumaLowAfter)
-            val rgb30After = if (rgb30Targets.isNotEmpty()) {
+            // 점수와 다음 gain 후보를 RGB 측정 전에 미리 구해, gray70/gray25 격자·신뢰도 4장을 먼저 놓는다.
+            // (멈추게 되면 refine 계산만 버려진다 — 메모리 대신 CPU를 쓴다)
+            val grayScore70 = uniformityScore(st, lumaAfter, gw, gh)
+            val grayScoreLow = uniformityScore(lowSt, lumaLowAfter, gw, gh)
+            val refined70 = withContext(Dispatchers.Default) {
+                Analyzer.refineGain(
+                    gain, lumaAfter, target, DAMPING_ALPHA, gw, gh, MAX_ATTENUATION,
+                    confidenceAfter, smoothRadius
+                )
+            }
+            val refined30 = withContext(Dispatchers.Default) {
+                Analyzer.refineGain(
+                    gain, lumaLowAfter, lowTarget, DAMPING_ALPHA, gw, gh, MAX_ATTENUATION,
+                    confidenceLowAfter, smoothRadius
+                )
+            }
+            // RGB30은 패턴마다 바로 refine해 감쇠 누적 버퍼 한 장에 더하고 격자·신뢰도는 버린다.
+            val rgbAttSum = if (rgb30Targets.isNotEmpty()) FloatArray(gain.size) else null
+            var rgbRefinedCount = 0
+            val gainForRgb = gain
+            val rgb30After = if (rgbAttSum != null) {
                 measureRgbPatterns(
                     client, cap, blackRgbAvg, hAfter, screenW, screenH, gw, gh,
                     RGB30_PATTERNS, LOW_RGB_FRAMES, "iteration",
                     flatField = flatField,
                     makeHeatmaps = false,
                     includeGain = false,
-                    keepGrids = true,
+                    onGrid = { pattern, grid, confidence ->
+                        val t = rgb30Targets[pattern]
+                        if (t != null) {
+                            val r = withContext(Dispatchers.Default) {
+                                Analyzer.refineGain(
+                                    gainForRgb, grid, t, DAMPING_ALPHA, gw, gh, MAX_ATTENUATION,
+                                    confidence, smoothRadius
+                                )
+                            }
+                            for (i in rgbAttSum.indices) rgbAttSum[i] += 1f - r[i]
+                            rgbRefinedCount++
+                        }
+                    },
                 )
             } else {
                 emptyRgbMeasurement()
             }
             val rgb30AfterMeanRms = rgb30After.meanRms
-            val grayScore70 = uniformityScore(st, lumaAfter, gw, gh)
-            val grayScoreLow = uniformityScore(lowSt, lumaLowAfter, gw, gh)
             val gray70Passed = grayScore70 <= 1f
             val lowLightPassed = grayScoreLow <= 1f
             val bothGrayPassed = gray70Passed && lowLightPassed
@@ -1179,19 +1244,11 @@ class MeasurementActivity : Activity() {
             prevScore = compositeScore
             if (stopAfterThisEvaluation) break
 
-            val refined70 = withContext(Dispatchers.Default) {
-                Analyzer.refineGain(
-                    gain, lumaAfter, target, DAMPING_ALPHA, gw, gh, MAX_ATTENUATION,
-                    confidenceAfter, smoothRadius
-                )
-            }
-            val refined30 = withContext(Dispatchers.Default) {
-                Analyzer.refineGain(
-                    gain, lumaLowAfter, lowTarget, DAMPING_ALPHA, gw, gh, MAX_ATTENUATION,
-                    confidenceLowAfter, smoothRadius
-                )
-            }
-            val refinedRgb30 = refineRgbGain(gain, rgb30After, rgb30Targets, gw, gh, smoothRadius)
+            val refinedRgb30 = if (rgbAttSum != null && rgbRefinedCount > 0) {
+                // averageGainGrids와 같은 평균: 감쇠 평균을 gain으로 되돌리고 상한으로 자른다.
+                val n = rgbRefinedCount.toFloat()
+                FloatArray(rgbAttSum.size) { (1f - rgbAttSum[it] / n).coerceIn(1f - MAX_ATTENUATION, 1f) }
+            } else null
             val refinedGray = withContext(Dispatchers.Default) {
                 Analyzer.mixGainGrids(refined70, refined30, lowLightWeight, MAX_ATTENUATION)
             }
@@ -1200,7 +1257,7 @@ class MeasurementActivity : Activity() {
                     Analyzer.mixGainGrids(refinedGray, rgbGain, lowRgbWeight, MAX_ATTENUATION)
                 }
             } ?: refinedGray
-            gain = Analyzer.limitGainByConfidence(gain, confidence70, MAX_ATTENUATION)
+            gain = Analyzer.limitGainByConfidenceInPlace(gain, confidence70, MAX_ATTENUATION)
         }
 
         val bestMap = selection.correctionMap(rgb30.channelGains, lowRgbWeight, strokeDetail?.gain, MAX_ATTENUATION)
@@ -1312,11 +1369,11 @@ class MeasurementActivity : Activity() {
         flatField: FloatArray,
         edgeFalloff: Float,
         confidence70: FloatArray,
-        flickerConfidence70: FloatArray,
-        grayCapture: GrayCapture,
+        flickerStability70: Float,
+        graySpanMs: Long,
         confidenceLow: FloatArray,
-        flickerConfidenceLow: FloatArray,
-        lowBeforeCapture: GrayCapture,
+        flickerStabilityLow: Float,
+        lowSpanMs: Long,
         strayRatio: Float,
         cap: CaptureController,
         refreshHz: Float,
@@ -1350,7 +1407,7 @@ class MeasurementActivity : Activity() {
         finalLumaAfter: FloatArray?,
         lumaLowBefore: FloatArray,
         finalLowLumaAfter: FloatArray?,
-        grayAvg: GrayImage,
+        grayAvgPng: ByteArray?,
     ): File {
         val bestPng = withContext(Dispatchers.Default) {
             bestMap.alphaPng(gw, gh, screenW, screenH, MAX_ATTENUATION)
@@ -1389,11 +1446,11 @@ class MeasurementActivity : Activity() {
             .put("flatFieldRadialMaxDeviation", Analyzer.flatFieldStrength(flatField).toDouble())
             .put("rawEdgeFalloff", edgeFalloff.toDouble())
             .put("gray70ConfidenceMean", Analyzer.meanConfidence(confidence70).toDouble())
-            .put("gray70FrameStabilityMean", Analyzer.meanConfidence(flickerConfidence70).toDouble())
-            .put("gray70FlickerFrameSpanSeconds", grayCapture.frameStore.spanMs / 1000.0)
+            .put("gray70FrameStabilityMean", flickerStability70.toDouble())
+            .put("gray70FlickerFrameSpanSeconds", graySpanMs / 1000.0)
             .put("lowLightConfidenceMean", Analyzer.meanConfidence(confidenceLow).toDouble())
-            .put("lowLightFrameStabilityMean", Analyzer.meanConfidence(flickerConfidenceLow).toDouble())
-            .put("lowLightFlickerFrameSpanSeconds", lowBeforeCapture.frameStore.spanMs / 1000.0)
+            .put("lowLightFrameStabilityMean", flickerStabilityLow.toDouble())
+            .put("lowLightFlickerFrameSpanSeconds", lowSpanMs / 1000.0)
             .put("strayLightRatio", strayRatio.toDouble())
             .put("cameraSetup", cap.triSummary())
             .put("simultaneousTriCapture", cap.isTriActive)
@@ -1495,7 +1552,7 @@ class MeasurementActivity : Activity() {
             files.putAll(finalRgb30.heatmaps)
             if (cross != null) {
                 files.putAll(cross.files)
-                files["camera_main_gray70.png"] = Analyzer.grayImagePng(grayAvg)
+                grayAvgPng?.let { files["camera_main_gray70.png"] = it }
             }
             ReportStore.save(dir, report, files)
         }
@@ -1570,6 +1627,8 @@ class MeasurementActivity : Activity() {
         includeGain: Boolean,
         keepGrids: Boolean = false,
         smoothRadius: Int = 1,
+        /** 있으면 패턴마다 (패턴, 격자, 신뢰도)를 넘기고 격자·신뢰도는 보관하지 않는다(반복 루프용). */
+        onGrid: (suspend (String, FloatArray, FloatArray) -> Unit)? = null,
     ): RgbMeasurement {
         val stats = LinkedHashMap<String, Analyzer.Stats>()
         val grids = LinkedHashMap<String, FloatArray>()
@@ -1603,7 +1662,7 @@ class MeasurementActivity : Activity() {
                 if (makeHeatmaps) {
                     heatmaps["${heatmapPrefix}_${pattern}.png"] = Analyzer.deviationHeatmapPng(grid, gw, gh)
                 }
-                if (includeGain || keepGrids) {
+                if (includeGain || keepGrids || onGrid != null) {
                     val blackFull = withContext(Dispatchers.Default) {
                         Analyzer.channelGrid(blackRgb, null, channel, h, screenW, screenH, gw, gh)
                     }
@@ -1616,7 +1675,7 @@ class MeasurementActivity : Activity() {
                     val confidence = withContext(Dispatchers.Default) {
                         Analyzer.combineConfidence(baseConfidence, flickerConfidence)
                     }
-                    confidences[pattern] = confidence
+                    if (onGrid != null) onGrid(pattern, grid, confidence) else confidences[pattern] = confidence
                     if (includeGain || makeHeatmaps) {
                         log(
                             "$pattern 프레임 안정도 ${pct(Analyzer.meanConfidence(flickerConfidence))}, " +
@@ -1660,29 +1719,6 @@ class MeasurementActivity : Activity() {
             maxStrayRatio = maxStrayRatio,
             signalValid = stats.isNotEmpty() && maxStrayRatio <= LOW_LIGHT_STRAY_WARN,
         )
-    }
-
-    private suspend fun refineRgbGain(
-        currentGain: FloatArray,
-        measurement: RgbMeasurement,
-        targets: Map<String, Float>,
-        gw: Int,
-        gh: Int,
-        smoothRadius: Int = 1,
-    ): FloatArray? {
-        if (measurement.grids.isEmpty()) return null
-        val refined = ArrayList<FloatArray>()
-        for ((pattern, grid) in measurement.grids) {
-            val target = targets[pattern] ?: continue
-            val confidence = measurement.confidences[pattern]
-            refined += withContext(Dispatchers.Default) {
-                Analyzer.refineGain(
-                    currentGain, grid, target, DAMPING_ALPHA, gw, gh, MAX_ATTENUATION,
-                    confidence, smoothRadius
-                )
-            }
-        }
-        return withContext(Dispatchers.Default) { Analyzer.averageGainGrids(refined, MAX_ATTENUATION) }
     }
 
     private fun emptyRgbMeasurement(): RgbMeasurement =
@@ -2307,6 +2343,9 @@ class MeasurementActivity : Activity() {
      * (네이티브는 단위 테스트로 못 돌리므로 실기기에서 직접 확인)
      */
     private suspend fun verifyNative(store: CaptureFrameStore, h: Homography, screenW: Int, screenH: Int) {
+        // Kotlin 비교는 메모리를 더 쓰므로 측정 화면을 열 때마다 한 번만 한다.
+        if (nativeVerified) return
+        nativeVerified = true
         if (!NativePixel.available) {
             log("네이티브 픽셀 처리: 사용 불가 — Kotlin 구현으로 진행")
             return

@@ -888,6 +888,15 @@ object Analyzer {
         return FloatArray(gain.size) { maxOf(gain[it], 1f - maxAtt * confidence[it]) }
     }
 
+    /** [limitGainByConfidence]의 제자리 버전. 새 격자를 만들지 않고 [gain]을 고쳐 돌려준다. */
+    fun limitGainByConfidenceInPlace(gain: FloatArray, confidence: FloatArray, maxAtt: Float): FloatArray {
+        require(gain.size == confidence.size && gain.all { it.isFinite() && it in 0f..1f })
+        requireConfidence(confidence)
+        requireAttenuation(maxAtt)
+        for (i in gain.indices) gain[i] = maxOf(gain[i], 1f - maxAtt * confidence[i])
+        return gain
+    }
+
     fun mixGainGrids(
         primary: FloatArray,
         secondary: FloatArray,
