@@ -21,6 +21,7 @@ import com.burnin.scanner.analysis.DotGridDetector
 import com.burnin.scanner.analysis.GrayImage
 import com.burnin.scanner.analysis.Homography
 import com.burnin.scanner.analysis.ImageOps
+import com.burnin.scanner.analysis.LowFrequency
 import com.burnin.scanner.analysis.NativePixel
 import com.burnin.scanner.analysis.RgbImage
 import com.burnin.scanner.analysis.ScreenDetector
@@ -67,6 +68,10 @@ class MeasurementActivity : Activity() {
 
     companion object {
         private const val FRAMES_PER_PATTERN = 5
+        /** 색 균일화(화이트밸런스 레이어) 최대 감쇠. 탭 앱 WhiteBalanceStore 기본값과 같다. */
+        private const val CHROMA_MAX_ATTENUATION = 0.10f
+        /** 저주파(잔여 비네팅·색 얼룩) 블록 수: 긴 변 기준. */
+        private const val LOW_FREQ_BLOCKS = 24
         /** 패턴 표시 ACK(프레임 커밋 후) 뒤 카메라 파이프라인에 남은 이전 장면이 빠질 시간. */
         private const val PATTERN_SETTLE_MS = 300L
         /** 노출 잠금 전 자동 노출·화이트밸런스 수렴 대기. */
@@ -360,6 +365,8 @@ class MeasurementActivity : Activity() {
 
     private var lastStep: String? = null
     private var nativeVerified = false
+    /** 측정 전 색 편차(블록 평균·P95). 최종 평가에서 전/후 비교에 쓴다. */
+    private var chromaBefore: Pair<Float, Float>? = null
     private var lastStepAt = 0L
 
     private fun log(msg: String) {
@@ -437,6 +444,8 @@ class MeasurementActivity : Activity() {
         withContext(Dispatchers.IO) {
             client.command(Protocol.CMD_DISABLE_CORRECTION)
             client.command(Protocol.CMD_DISABLE_OVERLAY)
+            // 지난 측정의 색 균일화 레이어가 남아 있으면 새 색 측정이 틀어지므로 지운다.
+            runCatching { client.command(Protocol.CMD_CLEAR_WHITE_BALANCE) }
             client.showPattern("gray70")
         }
         delay(AE_CONVERGE_MS)
@@ -587,7 +596,7 @@ class MeasurementActivity : Activity() {
         val edgeFalloff = withContext(Dispatchers.Default) {
             Analyzer.edgeFalloff(lumaBeforeRaw, gw, gh)
         }
-        val lumaBefore = withContext(Dispatchers.Default) {
+        val lumaBeforeRadial = withContext(Dispatchers.Default) {
             Analyzer.applyFlatField(lumaBeforeRaw, flatField)
         }
         // 중간 신뢰도 격자(기본·프레임 안정도)는 합친 뒤 버리고, 리포트에는 평균값만 남긴다(상주 메모리 절감).
@@ -611,7 +620,7 @@ class MeasurementActivity : Activity() {
             markerTriFrames,
             grayAvg,
             homography,
-            lumaBefore,
+            lumaBeforeRadial,
             screenW,
             screenH,
             gw,
@@ -625,6 +634,20 @@ class MeasurementActivity : Activity() {
             }
         } else {
             confidence70Single
+        }
+        // 원형(잔여 비네팅) 보정: 반복 보정은 같은 메인 카메라로 다시 재는 폐루프라 카메라 쪽 원형은
+        // 반복으로 사라지지 않고 오히려 화면에 새겨진다. 초광각 기준 저주파 비율로 메인 flat-field를 고친다.
+        val lumaBefore = cross?.referenceBlocks?.let { ref ->
+            withContext(Dispatchers.Default) {
+                val residual = LowFrequency.cameraResidual(lumaBeforeRadial, ref, gw, gh)
+                val up = LowFrequency.upsample(residual, gw, gh)
+                for (i in flatField.indices) flatField[i] *= up[i]
+                val maxDev = residual.values.maxOf { Math.abs(it - 1f) }
+                log("초광각 기준 메인 카메라 잔여 비네팅 보정: 블록 ${residual.bw}x${residual.bh}, 최대 ${pct(maxDev)}")
+                FloatArray(lumaBeforeRadial.size) { (lumaBeforeRadial[it] / up[it].coerceAtLeast(0.5f)).coerceAtLeast(1e-5f) }
+            }
+        } ?: lumaBeforeRadial.also {
+            if (cross != null) log("초광각 기준 잔여 비네팅 보정 생략: 초광각 화면 정합 실패")
         }
         if (cross != null) {
             cross.notes.forEach { log(it) }
@@ -737,7 +760,12 @@ class MeasurementActivity : Activity() {
                 flatField = flatField,
                 makeHeatmaps = true,
                 includeGain = false,
-            )
+                keepGrids = true,
+            ).let { m ->
+                applyChromaUniformity(client, m, gw, gh, screenW, screenH)
+                // 색 맵을 만든 뒤 채널 격자·신뢰도는 놓는다(리포트는 통계·히트맵만 쓴다).
+                m.copy(grids = LinkedHashMap(), confidences = LinkedHashMap())
+            }
         } catch (e: Exception) {
             log("RGB70 채널 측정 건너뜀: ${e.message}")
             emptyRgbMeasurement()
@@ -985,6 +1013,65 @@ class MeasurementActivity : Activity() {
         }
         }
         finish(correction)
+    }
+
+    /**
+     * 색 균일화: RGB70 채널 격자의 블록 비율로 위치별 색 틀어짐을 구하고, 강한 채널만 낮추는
+     * 위치별 RGB 감쇠 맵을 탭의 화이트밸런스 레이어로 보낸다. 밝기 보정맵과 따로 저장·적용되며,
+     * 이후 반복 보정의 gray 재측정에는 이 레이어가 켜진 상태가 반영돼 밝기 손실을 다시 맞춘다.
+     */
+    private suspend fun applyChromaUniformity(
+        client: ControlClient,
+        rgb70: RgbMeasurement,
+        gw: Int,
+        gh: Int,
+        screenW: Int,
+        screenH: Int,
+    ) {
+        val r = rgb70.grids["red70"]
+        val g = rgb70.grids["green70"]
+        val b = rgb70.grids["blue70"]
+        if (r == null || g == null || b == null) {
+            chromaBefore = null
+            log("색 균일화 생략: RGB70 측정 없음")
+            return
+        }
+        try {
+            val chroma = withContext(Dispatchers.Default) { LowFrequency.chroma(r, g, b, gw, gh, LOW_FREQ_BLOCKS) }
+            chromaBefore = chroma.meanSpread() to chroma.p95Spread()
+            val (gr, gg, gb) = LowFrequency.chromaGains(chroma, CHROMA_MAX_ATTENUATION)
+            val png = withContext(Dispatchers.Default) {
+                Analyzer.toRgbAttenuationPng(
+                    { c -> LowFrequency.upsample(when (c) { 0 -> gr; 1 -> gg; else -> gb }, gw, gh) },
+                    gw, gh, screenW, screenH, CHROMA_MAX_ATTENUATION,
+                )
+            }
+            withContext(Dispatchers.IO) {
+                client.request(
+                    JSONObject()
+                        .put("cmd", Protocol.CMD_APPLY_WHITE_BALANCE)
+                        .put("width", screenW)
+                        .put("height", screenH)
+                        .put("maxAttenuation", CHROMA_MAX_ATTENUATION.toDouble())
+                        .put("checksumMd5", md5(png))
+                        .put("sourceDevice", "${Build.MANUFACTURER} ${Build.MODEL}")
+                        .put("data", Base64.encodeToString(png, Base64.NO_WRAP)),
+                    timeoutMs = 120_000,
+                )
+                // 반복 보정이 맵을 적용하기 전까지는 번인 보정을 꺼 둔다(지난 측정 맵이 남아 있을 수 있음).
+                client.command(Protocol.CMD_DISABLE_CORRECTION)
+            }
+            val maxAtt = listOf(gr, gg, gb).maxOf { blk -> blk.values.maxOf { 1f - it } }
+            log(
+                "색 균일화: 블록 색 편차 평균 ${pct(chroma.meanSpread())} / P95 ${pct(chroma.p95Spread())} " +
+                    "(가장 강한/약한 채널 비 − 1), 채널 감쇠 최대 ${pct(maxAtt)} — 탭 화이트밸런스 레이어로 적용"
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            chromaBefore = null
+            log("색 균일화 실패 — 밝기 보정만 진행: ${e.message}")
+        }
     }
 
     private suspend fun initialGain(
@@ -1308,7 +1395,8 @@ class MeasurementActivity : Activity() {
         captureBatch(
             client, cap,
             listOf("gray70" to FRAMES_PER_PATTERN, LOW_LIGHT_PATTERN to LOW_LIGHT_FRAMES) +
-                if (rgb30Targets.isNotEmpty()) RGB30_PATTERNS.map { it to LOW_RGB_FRAMES } else emptyList(),
+                (if (rgb30Targets.isNotEmpty()) RGB30_PATTERNS.map { it to LOW_RGB_FRAMES } else emptyList()) +
+                (if (chromaBefore != null) RGB70_PATTERNS.map { it to FRAMES_PER_PATTERN } else emptyList()),
             "9/10 최종",
         )
         status("9/10 최종 gray70/$LOW_LIGHT_PATTERN/RGB30 평가...")
@@ -1345,6 +1433,25 @@ class MeasurementActivity : Activity() {
             )
         } else {
             emptyRgbMeasurement()
+        }
+        chromaBefore?.let { (beforeMean, beforeP95) ->
+            runCatching {
+                val m = measureRgbPatterns(
+                    client, cap, blackRgbAvg, hFinal, screenW, screenH, gw, gh,
+                    RGB70_PATTERNS, FRAMES_PER_PATTERN, "deviation_rgb70_after",
+                    flatField = flatField,
+                    makeHeatmaps = false,
+                    includeGain = false,
+                    keepGrids = true,
+                )
+                val after = withContext(Dispatchers.Default) {
+                    LowFrequency.chroma(m.grids.getValue("red70"), m.grids.getValue("green70"), m.grids.getValue("blue70"), gw, gh, LOW_FREQ_BLOCKS)
+                }
+                log(
+                    "색 균일화 결과: 블록 색 편차 평균 ${pct(beforeMean)} → ${pct(after.meanSpread())}, " +
+                        "P95 ${pct(beforeP95)} → ${pct(after.p95Spread())}"
+                )
+            }.onFailure { log("색 균일화 재측정 실패: ${it.message}") }
         }
         withContext(Dispatchers.IO) { client.showPattern("gray70") }
 
@@ -2167,6 +2274,8 @@ class MeasurementActivity : Activity() {
         val files: LinkedHashMap<String, ByteArray>,
         val notes: List<String>,
         val vlDecisions: List<VisionTrustGate.Decision>,
+        /** 초광각이 본 화면의 저주파 블록(평탄화 전). 메인 카메라 잔여 비네팅 추정 기준. */
+        val referenceBlocks: LowFrequency.Blocks? = null,
     )
 
     /**
@@ -2199,6 +2308,7 @@ class MeasurementActivity : Activity() {
         val notes = ArrayList<String>()
         val roleImages = LinkedHashMap<String, GrayImage>()
         val roleHomographies = LinkedHashMap<String, Homography>()
+        var referenceBlocks: LowFrequency.Blocks? = null
         roleImages[CameraEnumerator.ROLE_MAIN] = mainGray
         roleHomographies[CameraEnumerator.ROLE_MAIN] = mainHomography
 
@@ -2231,6 +2341,10 @@ class MeasurementActivity : Activity() {
 
                 val raw = withContext(Dispatchers.Default) {
                     Analyzer.lumaGrid(roleGray, roleBlack, h, screenW, screenH, gw, gh)
+                }
+                // 초광각은 화면을 프레임 가운데 작게 보므로 그 영역의 렌즈 비네팅이 거의 평평하다.
+                if (role == CameraEnumerator.ROLE_ULTRA_WIDE && referenceBlocks == null) {
+                    referenceBlocks = withContext(Dispatchers.Default) { LowFrequency.blocks(raw, gw, gh, LOW_FREQ_BLOCKS) }
                 }
                 val ff = withContext(Dispatchers.Default) { Analyzer.radialFlatField(raw, gw, gh) }
                 val grid = withContext(Dispatchers.Default) { Analyzer.applyFlatField(raw, ff) }
@@ -2326,6 +2440,7 @@ class MeasurementActivity : Activity() {
             files = files,
             notes = notes,
             vlDecisions = vlDecisions,
+            referenceBlocks = referenceBlocks,
         )
     }
 
