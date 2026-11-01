@@ -93,7 +93,7 @@ class MeasurementActivity : Activity() {
         private const val PASS_P95 = 0.035f      // 합격: P95 편차 ≤ 3.5%
         private const val PASS_BLOCK = 0.02f     // 합격: 블록 평균 최대 편차 ≤ 2% (좁은 띠 번인)
         private const val MAX_ITERATIONS = 24    // 품질 우선 반복 상한
-        private const val STAGNATION_LIMIT = 4
+        private const val STAGNATION_LIMIT = 6   // 묶음 촬영으로 반복이 빨라져 개선이 멈춘 뒤에도 조금 더 돌린다
         private const val DIVERGENCE_LIMIT = 3
         private const val DAMPING_ALPHA = 0.3f   // 반복 damping
         private const val DRIFT_LIMIT = 0.10f    // 중앙 휘도 드리프트 > 10%면 조건 변화로 무효
@@ -122,6 +122,8 @@ class MeasurementActivity : Activity() {
     private lateinit var btnToggle: Button
     private lateinit var editRefresh: EditText
     private lateinit var chkTri: CheckBox
+    /** 묶음 촬영으로 미리 저장한 패턴별 프레임 (pattern → store). */
+    private val prefetched = LinkedHashMap<String, CaptureFrameStore>()
     private var triSelection: CameraEnumerator.TriSelection? = null
     private var measuring = false
     private var correctionOn = true
@@ -370,6 +372,7 @@ class MeasurementActivity : Activity() {
                 log("   위치: ${it.className.substringAfterLast('.')}.${it.methodName}(${it.fileName}:${it.lineNumber}) [${e.javaClass.simpleName}]")
             }
         } finally {
+            clearPrefetched()
             btnStart.isEnabled = true
             measuring = false
             chkTri.isEnabled = triSelection != null
@@ -502,6 +505,15 @@ class MeasurementActivity : Activity() {
         val blackAvg = averageGrayFromStore(blackStore)
         val blackRgbAvg = averageRgbFromStore(blackStore)
         blackStore.delete()
+
+        // ── 3.2 묶음 촬영: 분석 전에 전면 패턴을 전부 먼저 찍어 둔다 ─────────
+        captureBatch(
+            client, cap,
+            listOf(LOW_LIGHT_PATTERN to LOW_LIGHT_FRAMES) +
+                RGB70_PATTERNS.map { it to FRAMES_PER_PATTERN } +
+                RGB30_PATTERNS.map { it to LOW_RGB_FRAMES },
+            "3/10",
+        )
 
         // ── 4. 휘도맵 + 목표값 ──────────────────────────────────
         status("4/10 gray70 휘도맵 계산 (기기 해상도 1:1)...")
@@ -961,9 +973,14 @@ class MeasurementActivity : Activity() {
             )
             lastAppliedIsBest = false
 
-            status("8/10 반복 $iter/$MAX_ITERATIONS — gray70/$LOW_LIGHT_PATTERN/RGB30 재촬영·평가...")
-            delay(PATTERN_SETTLE_MS)
-            val afterCapture = captureGray(cap)
+            captureBatch(
+                client, cap,
+                listOf("gray70" to FRAMES_PER_PATTERN, LOW_LIGHT_PATTERN to LOW_LIGHT_FRAMES) +
+                    if (rgb30Targets.isNotEmpty()) RGB30_PATTERNS.map { it to LOW_RGB_FRAMES } else emptyList(),
+                "8/10 반복 $iter",
+            )
+            status("8/10 반복 $iter/$MAX_ITERATIONS — gray70/$LOW_LIGHT_PATTERN/RGB30 평가...")
+            val afterCapture = capturePatternGray(client, cap, "gray70", FRAMES_PER_PATTERN)
             val afterAvg = afterCapture.average
             val detAfter = withContext(Dispatchers.Default) { ScreenDetector.detect(afterAvg) }
             checkNotNull(detAfter) { "반복 화면 검출 실패 — 재측정 필요" }
@@ -1155,10 +1172,14 @@ class MeasurementActivity : Activity() {
             )
         }
 
-        status("9/10 최종 gray70/$LOW_LIGHT_PATTERN/RGB30 촬영·평가...")
-        withContext(Dispatchers.IO) { client.showPattern("gray70") }
-        delay(PATTERN_SETTLE_MS)
-        val finalAvg = captureAveraged(cap)
+        captureBatch(
+            client, cap,
+            listOf("gray70" to FRAMES_PER_PATTERN, LOW_LIGHT_PATTERN to LOW_LIGHT_FRAMES) +
+                if (rgb30Targets.isNotEmpty()) RGB30_PATTERNS.map { it to LOW_RGB_FRAMES } else emptyList(),
+            "9/10 최종",
+        )
+        status("9/10 최종 gray70/$LOW_LIGHT_PATTERN/RGB30 평가...")
+        val finalAvg = capturePatternAveraged(client, cap, "gray70", FRAMES_PER_PATTERN)
         val detFinal = withContext(Dispatchers.Default) { ScreenDetector.detect(finalAvg) }
         checkNotNull(detFinal) { "최종 화면 검출 실패 — 평가 무효" }
         check(MeasurementPolicy.geometryStable(referenceQuad, detFinal.quad)) {
@@ -1819,6 +1840,34 @@ class MeasurementActivity : Activity() {
         return SparseSpotPhotometry.Frame(img.w, img.h, data)
     }
 
+    /**
+     * 묶음 촬영: 패턴을 연달아 띄우며 프레임만 디스크에 저장하고 분석은 나중에 패턴 하나씩 한다.
+     * 촬영 구간이 짧아져 거치가 흔들릴 시간이 줄고, 분석 때는 한 패턴의 프레임만 메모리에 올린다.
+     * 저장한 것은 [capturePatternGray]/[capturePatternRgb]가 같은 패턴을 요청할 때 꺼내 쓴다.
+     */
+    private suspend fun captureBatch(
+        client: ControlClient,
+        cap: CaptureController,
+        plan: List<Pair<String, Int>>,
+        label: String,
+    ) {
+        val startedMs = System.currentTimeMillis()
+        for ((index, entry) in plan.withIndex()) {
+            val (pattern, count) = entry
+            status("$label 묶음 촬영 ${index + 1}/${plan.size}: $pattern ${count}장")
+            withContext(Dispatchers.IO) { client.showPattern(pattern) }
+            delay(PATTERN_SETTLE_MS)
+            prefetched.remove(pattern)?.delete()
+            prefetched[pattern] = captureFrameStore(cap, count)
+        }
+        log("$label 묶음 촬영: ${plan.size}패턴 ${plan.sumOf { it.second }}장, ${fmtSeconds(System.currentTimeMillis() - startedMs)}")
+    }
+
+    private fun clearPrefetched() {
+        prefetched.values.forEach { it.delete() }
+        prefetched.clear()
+    }
+
     private suspend fun capturePatternGray(
         client: ControlClient,
         cap: CaptureController,
@@ -1826,6 +1875,7 @@ class MeasurementActivity : Activity() {
         frameCount: Int,
         settleMs: Long = PATTERN_SETTLE_MS,
     ): GrayCapture {
+        prefetched.remove(pattern)?.let { return GrayCapture(averageGrayFromStore(it), it) }
         withContext(Dispatchers.IO) { client.showPattern(pattern) }
         delay(settleMs)
         return captureGray(cap, frameCount)
@@ -1850,6 +1900,7 @@ class MeasurementActivity : Activity() {
         frameCount: Int,
         settleMs: Long = PATTERN_SETTLE_MS,
     ): RgbCapture {
+        prefetched.remove(pattern)?.let { return RgbCapture(averageRgbFromStore(it), it) }
         withContext(Dispatchers.IO) { client.showPattern(pattern) }
         delay(settleMs)
         return captureRgb(cap, frameCount)
