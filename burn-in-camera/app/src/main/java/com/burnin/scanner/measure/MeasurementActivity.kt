@@ -1399,6 +1399,49 @@ class MeasurementActivity : Activity() {
         Analyzer.limitGainByConfidenceInPlace(mixed, confidence70, maxAttenuation)
     }
 
+    /** 반복 1회의 RGB30 재측정과 채널별 refine(감쇠 누적 평균). 격자·신뢰도는 패턴마다 버린다. */
+    private suspend fun measureRgb30WithRefine(
+        client: ControlClient,
+        cap: CaptureController,
+        blackRgbAvg: RgbImage,
+        hAfter: Homography,
+        screenW: Int,
+        screenH: Int,
+        gw: Int,
+        gh: Int,
+        flatField: FloatArray,
+        gain: FloatArray,
+        rgb30Targets: Map<String, Float>,
+        smoothRadius: Int,
+    ): Pair<RgbMeasurement, FloatArray?> {
+        if (rgb30Targets.isEmpty()) return emptyRgbMeasurement() to null
+        val attSum = FloatArray(gain.size)
+        var count = 0
+        val m = measureRgbPatterns(
+            client, cap, blackRgbAvg, hAfter, screenW, screenH, gw, gh,
+            RGB30_PATTERNS, LOW_RGB_FRAMES, "iteration",
+            flatField = flatField,
+            makeHeatmaps = false,
+            includeGain = false,
+            onGrid = { pattern, grid, confidence ->
+                val t = rgb30Targets[pattern]
+                if (t != null) {
+                    val r = withContext(Dispatchers.Default) {
+                        Analyzer.refineGain(gain, grid, t, DAMPING_ALPHA, gw, gh, maxAttenuation, confidence, smoothRadius)
+                    }
+                    for (i in attSum.indices) attSum[i] += 1f - r[i]
+                    count++
+                }
+            },
+        )
+        if (count == 0) return m to null
+        // averageGainGrids와 같은 평균: 감쇠 평균을 gain으로 되돌리고 상한으로 자른다.
+        val n = count.toFloat()
+        val maxAtt = maxAttenuation
+        for (i in attSum.indices) attSum[i] = (1f - attSum[i] / n).coerceIn(1f - maxAtt, 1f)
+        return m to attSum
+    }
+
     private suspend fun runCorrectionIterations(
         client: ControlClient,
         cap: CaptureController,
@@ -1541,33 +1584,10 @@ class MeasurementActivity : Activity() {
                 )
             }
             // RGB30은 패턴마다 바로 refine해 감쇠 누적 버퍼 한 장에 더하고 격자·신뢰도는 버린다.
-            val rgbAttSum = if (rgb30Targets.isNotEmpty()) FloatArray(gain.size) else null
-            var rgbRefinedCount = 0
-            val gainForRgb = gain
-            val rgb30After = if (rgbAttSum != null) {
-                measureRgbPatterns(
-                    client, cap, blackRgbAvg, hAfter, screenW, screenH, gw, gh,
-                    RGB30_PATTERNS, LOW_RGB_FRAMES, "iteration",
-                    flatField = flatField,
-                    makeHeatmaps = false,
-                    includeGain = false,
-                    onGrid = { pattern, grid, confidence ->
-                        val t = rgb30Targets[pattern]
-                        if (t != null) {
-                            val r = withContext(Dispatchers.Default) {
-                                Analyzer.refineGain(
-                                    gainForRgb, grid, t, DAMPING_ALPHA, gw, gh, maxAttenuation,
-                                    confidence, smoothRadius
-                                )
-                            }
-                            for (i in rgbAttSum.indices) rgbAttSum[i] += 1f - r[i]
-                            rgbRefinedCount++
-                        }
-                    },
-                )
-            } else {
-                emptyRgbMeasurement()
-            }
+            // (반복 함수가 너무 커지면 ART 검증기가 클래스를 거부해 별도 함수로 뺀다)
+            val (rgb30After, refinedRgb30) = measureRgb30WithRefine(
+                client, cap, blackRgbAvg, hAfter, screenW, screenH, gw, gh, flatField, gain, rgb30Targets, smoothRadius,
+            )
             val rgb30AfterMeanRms = rgb30After.meanRms
             val gray70Passed = grayScore70 <= 1f
             val lowLightPassed = grayScoreLow <= 1f
@@ -1638,11 +1658,6 @@ class MeasurementActivity : Activity() {
             prevScore = compositeScore
             if (stopAfterThisEvaluation) break
 
-            val refinedRgb30 = if (rgbAttSum != null && rgbRefinedCount > 0) {
-                // averageGainGrids와 같은 평균: 감쇠 평균을 gain으로 되돌리고 상한으로 자른다.
-                val n = rgbRefinedCount.toFloat()
-                FloatArray(rgbAttSum.size) { (1f - rgbAttSum[it] / n).coerceIn(1f - maxAttenuation, 1f) }
-            } else null
             val refinedGray = withContext(Dispatchers.Default) {
                 Analyzer.mixGainGrids(refined70, refined30, lowLightWeight, maxAttenuation)
             }
