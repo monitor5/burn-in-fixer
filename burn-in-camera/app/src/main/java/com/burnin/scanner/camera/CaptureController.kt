@@ -104,7 +104,7 @@ class CaptureController(
 
     private companion object {
         /** 번갈아 촬영 시 보조 카메라를 연 뒤 AF·센서가 안정될 때까지 기다리는 시간. */
-        const val SEQUENTIAL_SETTLE_MS = 700L
+        const val SEQUENTIAL_SETTLE_MS = 500L
     }
 
     val activeRoles: List<String>

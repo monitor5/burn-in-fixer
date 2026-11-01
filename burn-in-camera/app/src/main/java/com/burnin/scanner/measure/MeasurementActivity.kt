@@ -66,6 +66,10 @@ class MeasurementActivity : Activity() {
 
     companion object {
         private const val FRAMES_PER_PATTERN = 5
+        /** 패턴 표시 ACK(프레임 커밋 후) 뒤 카메라 파이프라인에 남은 이전 장면이 빠질 시간. */
+        private const val PATTERN_SETTLE_MS = 300L
+        /** 노출 잠금 전 자동 노출·화이트밸런스 수렴 대기. */
+        private const val AE_CONVERGE_MS = 1_200L
         /** 원본 해상도 분석에 필요한 힙: RGB 프레임 한 장 크기의 이 배수 이상. */
         private const val FULL_RES_HEAP_FACTOR = 4
         private const val LOW_LIGHT_PATTERN = "gray25"
@@ -83,8 +87,8 @@ class MeasurementActivity : Activity() {
         private const val STROKE_DETAIL_ENABLED = true
         private const val SPARSE_FRAMES_PER_PATTERN = 8
         private const val SPARSE_BLACK_FRAMES = 8
-        private const val SPARSE_INTER_FRAME_DELAY_MS = 150L
-        private const val SPARSE_SETTLE_MS = 600L
+        private const val SPARSE_INTER_FRAME_DELAY_MS = 0L
+        private const val SPARSE_SETTLE_MS = 300L
         private const val PASS_RMS = 0.015f      // 합격: 잔여 RMS ≤ 1.5%
         private const val PASS_P95 = 0.035f      // 합격: P95 편차 ≤ 3.5%
         private const val PASS_BLOCK = 0.02f     // 합격: 블록 평균 최대 편차 ≤ 2% (좁은 띠 번인)
@@ -97,7 +101,7 @@ class MeasurementActivity : Activity() {
         private const val FLICKER_STABILITY_GRID_MAX_EDGE = 512
         private const val FLICKER_OK_RELATIVE_RANGE = 0.015f
         private const val FLICKER_ZERO_RELATIVE_RANGE = 0.045f
-        private const val FLICKER_INTER_FRAME_DELAY_MS = 1_200L
+        private const val FLICKER_INTER_FRAME_DELAY_MS = 0L // 촬영되는 대로 연속 촬영(사용자 요청). 위상 지터만 남김
         private const val VL_REGION_CONFIDENCE_THRESHOLD = 0.55f
         private const val VL_REGION_MIN_AREA = 96
         private const val VL_RESTORED_CONFIDENCE_FLOOR = 0.85f
@@ -349,6 +353,10 @@ class MeasurementActivity : Activity() {
             status(if (e.suppressed.any { it is MeasurementCleanup.Incomplete })
                 MeasurementCleanup.WARNING else "측정 실패: ${e.message}")
             log("!! 중단: ${e.message}")
+            // 메시지 없는 require/check 실패도 위치를 알 수 있게 앱 코드의 첫 스택 프레임을 남긴다.
+            e.stackTrace.firstOrNull { it.className.startsWith("com.burnin") }?.let {
+                log("   위치: ${it.className.substringAfterLast('.')}.${it.methodName}(${it.fileName}:${it.lineNumber}) [${e.javaClass.simpleName}]")
+            }
         } finally {
             btnStart.isEnabled = true
             measuring = false
@@ -374,14 +382,14 @@ class MeasurementActivity : Activity() {
             client.command(Protocol.CMD_DISABLE_OVERLAY)
             client.showPattern("gray70")
         }
-        delay(2500)
+        delay(AE_CONVERGE_MS)
         val refreshHz = inputRefreshHz()
         val lockText = cap.lockMeasurementControls(refreshHz)
         log("캡처 고정: $lockText (입력 주사율 ${fmtRefresh(refreshHz)}Hz)")
         if (cap.isTriActive) log("동시 3각 촬영 활성: ${cap.triSummary()}")
         cap.diagnosticNotes().forEach { log(it) }
         log("측정 톤커브(디코더 역변환): ${cap.toneMode.label}")
-        delay(400)
+        delay(150)
 
         // ── 2. 기준 촬영 + 화면 검출 (활성 화각 전체 동시 캡처) ────
         status("2/10 기준 패턴 촬영 (${FRAMES_PER_PATTERN}장)...")
@@ -413,7 +421,7 @@ class MeasurementActivity : Activity() {
         var markerTriFrames: Map<String, CaptureFrame> = emptyMap()
         val markerOrientation = try {
             withContext(Dispatchers.IO) { client.showPattern("marker") }
-            delay(500)
+            delay(PATTERN_SETTLE_MS)
             val markerAvg = captureAveraged(cap)
             if (cap.isTriActive) {
                 // 보조 화각도 방향 판별이 필요하다 (교차 그리드 180° 뒤집힘 방지)
@@ -448,7 +456,7 @@ class MeasurementActivity : Activity() {
         status("2/10 dot-grid 기준점 촬영, 호모그래피 보강...")
         val dotGrid = try {
             withContext(Dispatchers.IO) { client.showPattern("dotgrid") }
-            delay(500)
+            delay(PATTERN_SETTLE_MS)
             val dotAvg = captureAveraged(cap)
             withContext(Dispatchers.Default) {
                 DotGridDetector.refineHomography(dotAvg, initialHomography, screenW, screenH)
@@ -473,7 +481,7 @@ class MeasurementActivity : Activity() {
         // ── 3. 블랙 오프셋 (활성 화각 전체 동시 캡처) ─────────────
         status("3/10 black 패턴 촬영 (오프셋/미광 검증)...")
         withContext(Dispatchers.IO) { client.showPattern("black") }
-        delay(500)
+        delay(PATTERN_SETTLE_MS)
         val triBlackStores = captureTriStores(cap, FRAMES_PER_PATTERN)
         val blackStore = triBlackStores.getValue(CameraEnumerator.ROLE_MAIN)
         val blackAvg = averageGrayFromStore(blackStore)
@@ -933,7 +941,7 @@ class MeasurementActivity : Activity() {
             lastAppliedIsBest = false
 
             status("8/10 반복 $iter/$MAX_ITERATIONS — gray70/$LOW_LIGHT_PATTERN/RGB30 재촬영·평가...")
-            delay(900)
+            delay(PATTERN_SETTLE_MS)
             val afterCapture = captureGray(cap)
             val afterAvg = afterCapture.average
             val detAfter = withContext(Dispatchers.Default) { ScreenDetector.detect(afterAvg) }
@@ -1128,7 +1136,7 @@ class MeasurementActivity : Activity() {
 
         status("9/10 최종 gray70/$LOW_LIGHT_PATTERN/RGB30 촬영·평가...")
         withContext(Dispatchers.IO) { client.showPattern("gray70") }
-        delay(900)
+        delay(PATTERN_SETTLE_MS)
         val finalAvg = captureAveraged(cap)
         val detFinal = withContext(Dispatchers.Default) { ScreenDetector.detect(finalAvg) }
         checkNotNull(detFinal) { "최종 화면 검출 실패 — 평가 무효" }
@@ -1617,7 +1625,7 @@ class MeasurementActivity : Activity() {
         cap: CaptureController,
         pattern: String,
         frameCount: Int,
-        settleMs: Long = 900,
+        settleMs: Long = PATTERN_SETTLE_MS,
     ): GrayImage {
         val capture = capturePatternGray(client, cap, pattern, frameCount, settleMs)
         capture.frameStore.delete()
@@ -1794,7 +1802,7 @@ class MeasurementActivity : Activity() {
         cap: CaptureController,
         pattern: String,
         frameCount: Int,
-        settleMs: Long = 900,
+        settleMs: Long = PATTERN_SETTLE_MS,
     ): GrayCapture {
         withContext(Dispatchers.IO) { client.showPattern(pattern) }
         delay(settleMs)
@@ -1806,7 +1814,7 @@ class MeasurementActivity : Activity() {
         cap: CaptureController,
         pattern: String,
         frameCount: Int,
-        settleMs: Long = 900,
+        settleMs: Long = PATTERN_SETTLE_MS,
     ): RgbImage {
         val capture = capturePatternRgb(client, cap, pattern, frameCount, settleMs)
         capture.frameStore.delete()
@@ -1818,7 +1826,7 @@ class MeasurementActivity : Activity() {
         cap: CaptureController,
         pattern: String,
         frameCount: Int,
-        settleMs: Long = 900,
+        settleMs: Long = PATTERN_SETTLE_MS,
     ): RgbCapture {
         withContext(Dispatchers.IO) { client.showPattern(pattern) }
         delay(settleMs)
