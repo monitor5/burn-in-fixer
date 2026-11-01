@@ -1407,7 +1407,7 @@ class MeasurementActivity : Activity() {
                         .put("cmd", Protocol.CMD_APPLY_WHITE_BALANCE)
                         .put("width", screenW)
                         .put("height", screenH)
-                        .put("maxAttenuation", CHROMA_MAX_ATTENUATION.toDouble())
+                        .put("maxAttenuation", CHROMA_MAX_ATTENUATION.wire())
                         .put("checksumMd5", md5(png))
                         .put("sourceDevice", "${Build.MANUFACTURER} ${Build.MODEL}")
                         .put("data", Base64.encodeToString(png, Base64.NO_WRAP)),
@@ -2075,7 +2075,7 @@ class MeasurementActivity : Activity() {
             .put("estimatedBrightnessLoss", brightnessLoss)
             .put("strokeDetail", strokeDetailReport ?: JSONObject().put("used", false))
             .put("responseCurve", curveReport ?: JSONObject().put("used", false))
-            .put("maxAttenuation", maxAttenuation.toDouble())
+            .put("maxAttenuation", maxAttenuation.wire())
             .put("outputGamma", outputGamma?.toDouble() ?: JSONObject.NULL)
             .put("cameraToneCurve", capture?.let { if (it.isRaw) "RAW_LINEAR" else it.toneMode.name } ?: JSONObject.NULL)
             .put("captureFormat", capture?.captureFormatText ?: JSONObject.NULL)
@@ -2137,7 +2137,7 @@ class MeasurementActivity : Activity() {
                 .put("cmd", Protocol.CMD_APPLY_MAP)
                 .put("width", screenW)
                 .put("height", screenH)
-                .put("maxAttenuation", maxAttenuation.toDouble())
+                .put("maxAttenuation", maxAttenuation.wire())
                 .put("defaultStrength", 100)
             outputGamma?.let { request.put("outputGamma", it.toDouble()) }
             request
@@ -2157,6 +2157,12 @@ class MeasurementActivity : Activity() {
             client.showPattern("gray70")
         }
     }
+
+    /**
+     * 프로토콜로 보내는 float → double. 0.3f.toDouble()은 0.30000001192…라 탭의 상한 검사(0~0.30)에 걸려
+     * 맵 적용이 거부되고 연결이 끊겼다. 십진 표기 그대로(0.3) 보낸다.
+     */
+    private fun Float.wire(): Double = toString().toDouble()
 
     private fun mean(a: FloatArray): Float {
         var s = 0.0

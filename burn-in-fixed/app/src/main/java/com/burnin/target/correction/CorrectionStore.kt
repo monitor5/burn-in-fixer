@@ -147,7 +147,7 @@ object CorrectionStore {
         ) {
             return "RGB 체크섬 불일치 (파일 손상)"
         }
-        if (maxAttenuation !in 0.0..0.30) {
+        if (maxAttenuation !in 0.0..0.30 + 1e-6) {  // float 반올림 여유
             return "maxAttenuation 범위 오류: $maxAttenuation (허용 0~0.30)"
         }
 
