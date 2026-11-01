@@ -28,8 +28,14 @@ object SparseSpotPhotometry {
     /** 이웃 블록 중심 간 최소 카메라 픽셀 간격. 이보다 가까우면 PSF 꼬리가 이웃 창으로 샌다. */
     const val MIN_SPACING_CAMERA_PX = 5f
 
-    /** 한 축 위상 수 상한. 패턴 수는 그 제곱이다 (6 → 36장). */
+    /** 한 축 위상 수 상한. 패턴 수는 그 제곱이다 (6 → 36장). 2px 블록에 쓴다. */
     const val MAX_PHASES_PER_AXIS = 6
+
+    /**
+     * 1px 블록의 한 축 위상 수 상한(10 → 100장). 카메라 해상도가 모자랄 때 2px 블록으로 바꾸면
+     * 획 단위(1px) 정밀도를 잃으므로, 시간이 더 들더라도 점 간격을 넓혀 1px 점을 유지한다.
+     */
+    const val MAX_PHASES_PER_AXIS_FINE = 10
 
     /** 고주파 층이 단독으로 줄 수 있는 최대 감쇠. 이보다 어두운 결함은 이 층에서 일부만 보정한다. */
     const val MAX_DETAIL_ATTENUATION = 0.06f
@@ -70,13 +76,15 @@ object SparseSpotPhotometry {
         level: Int = 70,
         minSpacingCameraPx: Float = MIN_SPACING_CAMERA_PX,
         maxPhasesPerAxis: Int = MAX_PHASES_PER_AXIS,
+        maxPhasesPerAxisFine: Int = MAX_PHASES_PER_AXIS_FINE,
     ): Plan? {
         if (!cameraPxPerScreenPx.isFinite() || cameraPxPerScreenPx <= 0f) return null
         val minPitch = Math.ceil((minSpacingCameraPx / cameraPxPerScreenPx).toDouble()).toInt()
         for (block in 1..2) {
             var pitch = maxOf(minPitch, 2 * block, 3)
             if (pitch % block != 0) pitch += block - pitch % block
-            if (pitch / block <= maxPhasesPerAxis) return Plan(block, pitch, level)
+            val limit = if (block == 1) maxOf(maxPhasesPerAxis, maxPhasesPerAxisFine) else maxPhasesPerAxis
+            if (pitch / block <= limit) return Plan(block, pitch, level)
         }
         return null
     }

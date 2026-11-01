@@ -152,9 +152,14 @@ class SparseSpotPhotometryTest {
         assertEquals(4, fine.pitch)
         assertEquals(16, fine.patternCount)
         assertEquals("sparse70_b1_p4_x3_y1", fine.patternName(3, 1))
+        // 해상도가 모자라면 2px로 바꾸기 전에 1px 점 간격을 넓혀(패턴 수를 늘려) 정밀도를 유지한다
         val coarse = SparseSpotPhotometry.plan(0.6f)!!
-        assertEquals(2, coarse.block)
-        assertTrue(coarse.phasesPerAxis <= SparseSpotPhotometry.MAX_PHASES_PER_AXIS)
+        assertEquals(1, coarse.block)
+        assertEquals(9, coarse.pitch)
+        assertTrue(coarse.phasesPerAxis <= SparseSpotPhotometry.MAX_PHASES_PER_AXIS_FINE)
+        val veryCoarse = SparseSpotPhotometry.plan(0.45f)!!
+        assertEquals(2, veryCoarse.block)
+        assertTrue(veryCoarse.phasesPerAxis <= SparseSpotPhotometry.MAX_PHASES_PER_AXIS)
         assertNull(SparseSpotPhotometry.plan(0.2f))
         assertNull(SparseSpotPhotometry.plan(Float.NaN))
     }
