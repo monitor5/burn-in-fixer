@@ -109,6 +109,7 @@ object ImageOps {
     fun decodeLinearGray(frame: CaptureFrame, maxLongEdge: Int = analysisMaxLongEdge): GrayImage =
         when (frame.format) {
             ImageFormat.YUV_420_888 -> decodeYuvLinearGray(frame, maxLongEdge)
+            ImageFormat.RAW_SENSOR -> RawDecode.gray(frame, yuvSample(frame.width, frame.height, maxLongEdge))
             ImageFormat.JPEG -> decodeLinearGray(frame.planes[0].bytes, maxLongEdge)
             else -> throw IllegalArgumentException("지원하지 않는 이미지 형식: ${frame.format}")
         }
@@ -116,6 +117,7 @@ object ImageOps {
     fun decodeLinearRgb(frame: CaptureFrame, maxLongEdge: Int = analysisMaxLongEdge): RgbImage =
         when (frame.format) {
             ImageFormat.YUV_420_888 -> decodeYuvLinearRgb(frame, maxLongEdge)
+            ImageFormat.RAW_SENSOR -> RawDecode.rgb(frame, yuvSample(frame.width, frame.height, maxLongEdge))
             ImageFormat.JPEG -> decodeLinearRgb(frame.planes[0].bytes, maxLongEdge)
             else -> throw IllegalArgumentException("지원하지 않는 이미지 형식: ${frame.format}")
         }

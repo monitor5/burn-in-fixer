@@ -388,7 +388,10 @@ class MeasurementActivity : Activity() {
         log("캡처 고정: $lockText (입력 주사율 ${fmtRefresh(refreshHz)}Hz)")
         if (cap.isTriActive) log("동시 3각 촬영 활성: ${cap.triSummary()}")
         cap.diagnosticNotes().forEach { log(it) }
-        log("측정 톤커브(디코더 역변환): ${cap.toneMode.label}")
+        log(
+            if (cap.isRaw) "측정 프레임: RAW_SENSOR 선형값 (톤커브 역변환 불필요, 보조 화각 YUV는 ${cap.toneMode.label})"
+            else "측정 톤커브(디코더 역변환): ${cap.toneMode.label}"
+        )
         delay(150)
 
         // ── 2. 기준 촬영 + 화면 검출 (활성 화각 전체 동시 캡처) ────
@@ -1344,7 +1347,8 @@ class MeasurementActivity : Activity() {
             .put("strokeDetail", strokeDetailReport ?: JSONObject().put("used", false))
             .put("maxAttenuation", MAX_ATTENUATION.toDouble())
             .put("outputGamma", outputGamma?.toDouble() ?: JSONObject.NULL)
-            .put("cameraToneCurve", capture?.toneMode?.name ?: JSONObject.NULL)
+            .put("cameraToneCurve", capture?.let { if (it.isRaw) "RAW_LINEAR" else it.toneMode.name } ?: JSONObject.NULL)
+            .put("captureFormat", capture?.captureFormatText ?: JSONObject.NULL)
             .put("rgbChannels", rgb70Json)
             .put("rgb70Channels", rgb70Json)
             .put("rgb30ChannelsBefore", statsMapJson(rgb30.stats))

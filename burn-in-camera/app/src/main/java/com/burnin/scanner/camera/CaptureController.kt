@@ -44,7 +44,30 @@ data class CaptureFrame(
     val timestampNs: Long,
     val sensitivityIso: Int?,
     val exposureTimeNs: Long?,
+    /** RAW_SENSOR 프레임 디코드 정보. 다른 형식이면 null. */
+    val raw: RawInfo? = null,
 ) {
+    /**
+     * RAW 디코드에 필요한 센서·촬영 정보. [blackLevel]은 2×2 위치(행 우선) 순서,
+     * gain은 촬영에 고정한 AWB gain, [ccm]은 HAL 색 보정 행렬(행 우선 3×3, 없으면 null).
+     */
+    data class RawInfo(
+        val cfa: Int,
+        val blackLevel: List<Int>,
+        val whiteLevel: Int,
+        val gainR: Float,
+        val gainG: Float,
+        val gainB: Float,
+        val ccm: List<Float>?,
+    ) {
+        companion object {
+            const val CFA_RGGB = 0
+            const val CFA_GRBG = 1
+            const val CFA_GBRG = 2
+            const val CFA_BGGR = 3
+        }
+    }
+
     data class Plane(
         val bytes: ByteArray,
         val rowStride: Int,
@@ -137,6 +160,8 @@ class CaptureController(
         val device: CameraDevice,
         val session: CameraCaptureSession,
         val reader: ImageReader,
+        /** RAW로 찍는 보조 화각이면 그 센서의 CFA·레벨 정보. */
+        val raw: RawStatic? = null,
     )
 
     lateinit var cameraId: String
@@ -153,6 +178,11 @@ class CaptureController(
     private var latestExposureTimeNs: Long? = null
     private var latestSensitivityIso: Int? = null
     private var latestAwbGains: RggbChannelVector? = null
+    private var latestCcm: android.hardware.camera2.params.ColorSpaceTransform? = null
+    private var rawStatic: RawStatic? = null
+
+    /** RAW_SENSOR를 쓸 수 있으면 RAW로 촬영한다(센서 선형값). */
+    var preferRaw: Boolean = true
     private var latestFocusDistance: Float? = null
     private var manualExposureTimeNs: Long? = null
     private var manualSensitivityIso: Int? = null
@@ -171,10 +201,14 @@ class CaptureController(
     var aeLocked = false
         private set
 
+    /** 메인 측정 프레임이 RAW_SENSOR인지 (선형 센서값, 톤커브 무관). */
+    val isRaw: Boolean get() = captureFormat == ImageFormat.RAW_SENSOR
+
     val captureFormatText: String
         get() = when (captureFormat) {
             ImageFormat.YUV_420_888 -> "YUV_420_888"
             ImageFormat.JPEG -> "JPEG"
+            ImageFormat.RAW_SENSOR -> "RAW_SENSOR(16bit Bayer)"
             else -> "format=$captureFormat"
         }
 
@@ -231,8 +265,15 @@ class CaptureController(
         val yuvSize = yuvSizes.maxByOrNull { it.width.toLong() * it.height }
         val fallbackJpegSize = jpegSizes.maxByOrNull { it.width.toLong() * it.height }
             ?: throw IllegalStateException("JPEG/YUV 촬영 출력 미지원")
-        captureFormat = if (yuvSize != null) ImageFormat.YUV_420_888 else ImageFormat.JPEG
-        captureSize = yuvSize ?: fallbackJpegSize
+        // RAW가 되면 RAW 우선: 센서 선형값이라 톤커브 추정·역변환 오차가 없다.
+        val rawSize = rawCaptureSize(characteristics)
+        rawStatic = rawSize?.let { rawStaticInfo(characteristics) }
+        captureFormat = when {
+            preferRaw && rawSize != null && rawStatic != null -> ImageFormat.RAW_SENSOR
+            yuvSize != null -> ImageFormat.YUV_420_888
+            else -> ImageFormat.JPEG
+        }
+        captureSize = if (captureFormat == ImageFormat.RAW_SENSOR) rawSize!! else yuvSize ?: fallbackJpegSize
         // 기존 호출부 호환용 이름. 실제 포맷은 captureFormatText를 확인한다.
         jpegSize = captureSize
 
@@ -304,7 +345,20 @@ class CaptureController(
         } else {
             extraReaders.values.forEach { runCatching { it.close() } }
             extraReaders.clear()
-            createSession(listOf(pSurface, reader!!.surface))
+            try {
+                createSession(listOf(pSurface, reader!!.surface))
+            } catch (e: Exception) {
+                if (captureFormat != ImageFormat.RAW_SENSOR) throw e
+                // RAW + 프리뷰 조합을 HAL이 거부하면 YUV로 다시 구성한다.
+                setupNotes += "RAW 세션 구성 실패, YUV로 폴백: ${e.message}"
+                runCatching { reader?.close() }
+                val yuv = yuvSize ?: throw e
+                captureFormat = ImageFormat.YUV_420_888
+                captureSize = yuv
+                jpegSize = yuv
+                reader = ImageReader.newInstance(yuv.width, yuv.height, captureFormat, 3)
+                createSession(listOf(pSurface, reader!!.surface))
+            }
         }
 
         if (tri != null) {
@@ -425,10 +479,16 @@ class CaptureController(
         val rc = manager.getCameraCharacteristics(choice.openId)
         val rMap = rc.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
             ?: throw IllegalStateException("스트림 설정 없음")
-        // 번갈아 촬영은 한 번에 한 대만 쓰므로 보조도 최대 해상도로 받는다.
-        val rSize = rMap.getOutputSizes(ImageFormat.YUV_420_888)?.maxByOrNull { it.width.toLong() * it.height }
-            ?: throw IllegalStateException("YUV 출력 없음")
-        val sReader = ImageReader.newInstance(rSize.width, rSize.height, ImageFormat.YUV_420_888, 2)
+        // 번갈아 촬영은 한 번에 한 대만 쓰므로 보조도 최대 해상도로, 가능하면 RAW로 받는다.
+        val rawSize = if (preferRaw) rawCaptureSize(rc) else null
+        val rawSt = rawSize?.let { rawStaticInfo(rc) }
+        val (rSize, rFormat) = if (rawSize != null && rawSt != null) {
+            rawSize to ImageFormat.RAW_SENSOR
+        } else {
+            (rMap.getOutputSizes(ImageFormat.YUV_420_888)?.maxByOrNull { it.width.toLong() * it.height }
+                ?: throw IllegalStateException("YUV 출력 없음")) to ImageFormat.YUV_420_888
+        }
+        val sReader = ImageReader.newInstance(rSize.width, rSize.height, rFormat, 2)
         val sDevice = try {
             suspendCancellableCoroutine<CameraDevice> { cont -> openCameraById(choice.openId, cont) }
         } catch (e: Exception) {
@@ -449,7 +509,7 @@ class CaptureController(
         }
         if (aux != null) sSession.setRepeatingRequest(repeating.build(), null, handler)
         else sSession.capture(repeating.build(), null, handler) // AF 시작용 한 장
-        return StandaloneCamera(role, choice, sDevice, sSession, sReader)
+        return StandaloneCamera(role, choice, sDevice, sSession, sReader, rawSt.takeIf { rFormat == ImageFormat.RAW_SENSOR })
     }
 
     private suspend fun captureSequentialFrame(cam: StandaloneCamera): CaptureFrame = withTimeout(12_000) {
@@ -458,7 +518,7 @@ class CaptureController(
             r.setOnImageAvailableListener({ rd ->
                 val image = rd.acquireLatestImage() ?: return@setOnImageAvailableListener
                 try {
-                    val frame = image.toCaptureFrame()
+                    val frame = image.toCaptureFrame(cam.raw)
                     if (cont.isActive) cont.resume(frame)
                 } catch (e: Exception) {
                     if (cont.isActive) cont.resumeWithException(e)
@@ -798,11 +858,12 @@ class CaptureController(
             latestExposureTimeNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: latestExposureTimeNs
             latestSensitivityIso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: latestSensitivityIso
             latestAwbGains = result.get(CaptureResult.COLOR_CORRECTION_GAINS) ?: latestAwbGains
+            latestCcm = result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM) ?: latestCcm
             latestFocusDistance = result.get(CaptureResult.LENS_FOCUS_DISTANCE) ?: latestFocusDistance
         }
     }
 
-    private fun Image.toCaptureFrame(): CaptureFrame {
+    private fun Image.toCaptureFrame(rawSt: RawStatic? = rawStatic): CaptureFrame {
         val copiedPlanes = planes.map { plane ->
             val buffer = plane.buffer
             val bytes = ByteArray(buffer.remaining())
@@ -817,6 +878,44 @@ class CaptureController(
             timestampNs = timestamp,
             sensitivityIso = manualSensitivityIso ?: latestSensitivityIso,
             exposureTimeNs = manualExposureTimeNs ?: latestExposureTimeNs,
+            raw = if (format == ImageFormat.RAW_SENSOR) rawInfo(rawSt) else null,
+        )
+    }
+
+    private fun rawCaptureSize(ch: CameraCharacteristics): Size? {
+        val caps = ch.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)?.toSet().orEmpty()
+        if (CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_RAW !in caps) return null
+        val map = ch.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return null
+        return map.getOutputSizes(ImageFormat.RAW_SENSOR)?.maxByOrNull { it.width.toLong() * it.height }
+    }
+
+    private class RawStatic(val cfa: Int, val black: List<Int>, val white: Int)
+
+    private fun rawStaticInfo(ch: CameraCharacteristics): RawStatic? {
+        val cfa = ch.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT) ?: return null
+        if (cfa !in 0..3) return null // RGGB 계열이 아니면(모노·RGBW 등) YUV를 쓴다
+        val pattern = ch.get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN) ?: return null
+        val white = ch.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL) ?: return null
+        // BlackLevelPattern.getOffsetForIndex(column, row) → 2×2 위치 행 우선 순서
+        val black = listOf(
+            pattern.getOffsetForIndex(0, 0), pattern.getOffsetForIndex(1, 0),
+            pattern.getOffsetForIndex(0, 1), pattern.getOffsetForIndex(1, 1),
+        )
+        return RawStatic(cfa, black, white)
+    }
+
+    private fun rawInfo(st: RawStatic?): CaptureFrame.RawInfo? {
+        st ?: return null
+        val g = manualAwbGains ?: latestAwbGains
+        val ccm = latestCcm?.let { t -> List(9) { t.getElement(it % 3, it / 3).toFloat() } }
+        return CaptureFrame.RawInfo(
+            cfa = st.cfa,
+            blackLevel = st.black,
+            whiteLevel = st.white,
+            gainR = g?.red ?: 1f,
+            gainG = g?.let { (it.greenEven + it.greenOdd) / 2f } ?: 1f,
+            gainB = g?.blue ?: 1f,
+            ccm = ccm,
         )
     }
 

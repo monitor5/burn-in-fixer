@@ -22,6 +22,16 @@ internal object CaptureFrameCodec {
                 out.writeInt(plane.bytes.size)
                 out.write(plane.bytes)
             }
+            val raw = frame.raw
+            out.writeBoolean(raw != null)
+            if (raw != null) {
+                out.writeInt(raw.cfa)
+                raw.blackLevel.forEach { out.writeInt(it) }
+                out.writeInt(raw.whiteLevel)
+                out.writeFloat(raw.gainR); out.writeFloat(raw.gainG); out.writeFloat(raw.gainB)
+                out.writeBoolean(raw.ccm != null)
+                raw.ccm?.forEach { out.writeFloat(it) }
+            }
         }
     }
 
@@ -48,6 +58,14 @@ internal object CaptureFrameCodec {
                 input.readFully(bytes)
                 planes += CaptureFrame.Plane(bytes, rowStride, pixelStride)
             }
+            val raw = if (input.readBoolean()) {
+                val cfa = input.readInt()
+                val black = List(4) { input.readInt() }
+                val white = input.readInt()
+                val gr = input.readFloat(); val gg = input.readFloat(); val gb = input.readFloat()
+                val ccm = if (input.readBoolean()) List(9) { input.readFloat() } else null
+                CaptureFrame.RawInfo(cfa, black, white, gr, gg, gb, ccm)
+            } else null
             require(input.read() == -1) { "trailing capture data" }
             return CaptureFrame(
                 format = format,
@@ -57,6 +75,7 @@ internal object CaptureFrameCodec {
                 timestampNs = timestampNs,
                 sensitivityIso = iso,
                 exposureTimeNs = exposure,
+                raw = raw,
             )
         }
     }
