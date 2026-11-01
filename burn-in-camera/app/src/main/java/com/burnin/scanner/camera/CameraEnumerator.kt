@@ -244,6 +244,30 @@ object CameraEnumerator {
         )
     }
 
+    /**
+     * 초고해상도(픽셀 비닝 해제, 예: 200MP) 출력이 서드파티에 열려 있는지 진단한다 (API 31+).
+     * 기본 스트림 맵은 비닝된 해상도(예: 4080x3060)만 주고, 원본 해상도는
+     * SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION 전용 맵에만 나온다.
+     */
+    fun maxResolutionReport(manager: CameraManager, choices: List<CameraChoice>): List<String> {
+        if (Build.VERSION.SDK_INT < 31) return listOf("초고해상도 모드: API 31 미만이라 확인 불가")
+        val out = ArrayList<String>()
+        for (c in choices.filter { it.source == Source.LISTED }) {
+            val ch = runCatching { manager.getCameraCharacteristics(c.openId) }.getOrNull() ?: continue
+            val caps = ch.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)?.toSet().orEmpty()
+            val ultra = CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_ULTRA_HIGH_RESOLUTION_SENSOR in caps
+            val map = ch.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION)
+            fun biggest(format: Int) = runCatching { map?.getOutputSizes(format) }.getOrNull()
+                ?.maxByOrNull { it.width.toLong() * it.height }?.let { "${it.width}x${it.height}" } ?: "-"
+            val pixelArray = ch.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)
+            out += "초고해상도 [${c.openId}]: capability ${if (ultra) "있음" else "없음"}, " +
+                "센서 ${pixelArray?.let { "${it.width}x${it.height}" } ?: "?"}, " +
+                "최대해상도 맵 YUV ${biggest(ImageFormat.YUV_420_888)} / JPEG ${biggest(ImageFormat.JPEG)} / " +
+                "RAW ${biggest(ImageFormat.RAW_SENSOR)}"
+        }
+        return out
+    }
+
     fun report(choices: List<CameraChoice>, tri: TriSelection?): String = buildString {
         appendLine("카메라 진단: 후면 ${choices.size}개 (공개 ${choices.count { it.source == Source.LISTED }}, " +
             "물리 ${choices.count { it.source == Source.LOGICAL_PHYSICAL }}, " +

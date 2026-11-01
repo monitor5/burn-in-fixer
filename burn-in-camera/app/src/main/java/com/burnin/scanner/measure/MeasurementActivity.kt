@@ -66,6 +66,8 @@ class MeasurementActivity : Activity() {
 
     companion object {
         private const val FRAMES_PER_PATTERN = 5
+        /** 원본 해상도 분석에 필요한 힙: RGB 프레임 한 장 크기의 이 배수 이상. */
+        private const val FULL_RES_HEAP_FACTOR = 4
         private const val LOW_LIGHT_PATTERN = "gray25"
         private const val LOW_LIGHT_CODE = 64      // gray25 = round(255·0.25)
         private const val GRAY70_CODE = 179        // gray70 = round(255·0.70)
@@ -221,6 +223,7 @@ class MeasurementActivity : Activity() {
             null
         }
         log(CameraEnumerator.report(choices, triSelection).trimEnd())
+        CameraEnumerator.maxResolutionReport(cameraManager, choices).forEach { log(it) }
         if (concurrentSets.isNotEmpty()) {
             log("OS concurrent camera sets: ${concurrentSets.joinToString { set -> set.joinToString(prefix = "[", postfix = "]") }}")
         } else if (Build.VERSION.SDK_INT >= 30) {
@@ -270,6 +273,24 @@ class MeasurementActivity : Activity() {
                 btnStart.isEnabled = false
             }
         }
+    }
+
+    /**
+     * 분석 해상도: 힙이 넉넉하면 촬영 원본 해상도로, 아니면 긴 변 절반(2의 거듭제곱 다운샘플)으로.
+     * 원본 RGB 한 장이 수백 MB가 될 수 있어 largeMemoryClass로 판단한다.
+     */
+    private fun selectAnalysisResolution(cap: CaptureController) {
+        val heapMb = getSystemService(android.app.ActivityManager::class.java).largeMemoryClass
+        val w = cap.captureSize.width
+        val h = cap.captureSize.height
+        val rgbFrameMb = w.toLong() * h * 3 * 4 / (1 shl 20)
+        val full = heapMb >= rgbFrameMb * FULL_RES_HEAP_FACTOR
+        ImageOps.analysisMaxLongEdge = if (full) ImageOps.FULL_RESOLUTION else 1600
+        val s = ImageOps.downsampleFactor(w, h)
+        log(
+            "분석 해상도: ${w / s}x${h / s} (촬영 ${w}x$h, 1/$s, 힙 ${heapMb}MB" +
+                if (full) ", 원본 해상도 분석)" else " — 원본 분석에는 부족해 절반으로)"
+        )
     }
 
     private fun fmtRefresh(hz: Float): String =
@@ -344,6 +365,7 @@ class MeasurementActivity : Activity() {
         require(screenW > 0 && screenH > 0) { "대상 화면 정보 없음" }
         resultLog.clear()
         log("대상: ${Session.targetName} (${screenW}x${screenH})")
+        selectAnalysisResolution(cap)
 
         // ── 1. 기준 패턴 + 노출 잠금 ─────────────────────────────
         status("1/10 gray70 패턴 표시, 노출 수렴 중...")

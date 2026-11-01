@@ -96,14 +96,24 @@ object ImageOps {
     /** 카메라 출력 코드값(0~255) → 선형 신호 룩업 테이블 (현재 [toneMode]) */
     private val LINEAR_LUT: FloatArray get() = luts.linear
 
-    fun decodeLinearGray(frame: CaptureFrame, maxLongEdge: Int = 1600): GrayImage =
+    /**
+     * 분석 디코드 기본 긴 변 상한. 다운샘플은 2의 거듭제곱이라 4080px 프레임은 1600이면 2040px(1/2),
+     * [FULL_RESOLUTION]이면 원본 그대로다. 측정 시작 시 힙 여유를 보고 정한다. 디코드·호모그래피·
+     * [downsampleFactor]가 모두 이 값을 같이 써야 좌표가 맞는다.
+     */
+    @Volatile
+    var analysisMaxLongEdge: Int = 1600
+
+    const val FULL_RESOLUTION = 1 shl 15
+
+    fun decodeLinearGray(frame: CaptureFrame, maxLongEdge: Int = analysisMaxLongEdge): GrayImage =
         when (frame.format) {
             ImageFormat.YUV_420_888 -> decodeYuvLinearGray(frame, maxLongEdge)
             ImageFormat.JPEG -> decodeLinearGray(frame.planes[0].bytes, maxLongEdge)
             else -> throw IllegalArgumentException("지원하지 않는 이미지 형식: ${frame.format}")
         }
 
-    fun decodeLinearRgb(frame: CaptureFrame, maxLongEdge: Int = 1600): RgbImage =
+    fun decodeLinearRgb(frame: CaptureFrame, maxLongEdge: Int = analysisMaxLongEdge): RgbImage =
         when (frame.format) {
             ImageFormat.YUV_420_888 -> decodeYuvLinearRgb(frame, maxLongEdge)
             ImageFormat.JPEG -> decodeLinearRgb(frame.planes[0].bytes, maxLongEdge)
@@ -115,7 +125,7 @@ object ImageOps {
      * 메모리 절약을 위해 긴 변이 maxLongEdge 이하가 되도록 2^n 다운샘플 디코드한다.
      * (분석 그리드가 저주파이므로 충분한 해상도)
      */
-    fun decodeLinearGray(jpeg: ByteArray, maxLongEdge: Int = 1600): GrayImage {
+    fun decodeLinearGray(jpeg: ByteArray, maxLongEdge: Int = analysisMaxLongEdge): GrayImage {
         require(maxLongEdge > 0) { "maxLongEdge must be positive" }
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, bounds)
@@ -143,7 +153,7 @@ object ImageOps {
         return GrayImage(w, h, out)
     }
 
-    fun decodeLinearRgb(jpeg: ByteArray, maxLongEdge: Int = 1600): RgbImage {
+    fun decodeLinearRgb(jpeg: ByteArray, maxLongEdge: Int = analysisMaxLongEdge): RgbImage {
         require(maxLongEdge > 0) { "maxLongEdge must be positive" }
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, bounds)
@@ -279,7 +289,7 @@ object ImageOps {
      * [decodeLinearGray]가 긴 변 [maxLongEdge]에 맞추려고 쓰는 정수 다운샘플 배율 (YUV 블록 평균,
      * JPEG inSampleSize 공통). 다운샘플 영상의 좌표 x는 풀해상도 좌표 x·s + (s-1)/2에 해당한다.
      */
-    fun downsampleFactor(width: Int, height: Int, maxLongEdge: Int = 1600): Int = yuvSample(width, height, maxLongEdge)
+    fun downsampleFactor(width: Int, height: Int, maxLongEdge: Int = analysisMaxLongEdge): Int = yuvSample(width, height, maxLongEdge)
 
     private fun yuvSample(width: Int, height: Int, maxLongEdge: Int): Int {
         require(width > 0 && height > 0 && maxLongEdge > 0)
