@@ -22,6 +22,7 @@ import com.burnin.scanner.analysis.GrayImage
 import com.burnin.scanner.analysis.Homography
 import com.burnin.scanner.analysis.ImageOps
 import com.burnin.scanner.analysis.LowFrequency
+import com.burnin.scanner.analysis.VignetteCalibration
 import com.burnin.scanner.analysis.NativePixel
 import com.burnin.scanner.analysis.RgbImage
 import com.burnin.scanner.analysis.ScreenDetector
@@ -140,6 +141,13 @@ class MeasurementActivity : Activity() {
     /** 보정 감쇠 상한(0~1). 측정 시작 때 '최대 감쇠(%)' 입력에서 읽는다. */
     private var maxAttenuation = DEFAULT_MAX_ATTENUATION
     private lateinit var editMaxAtt: EditText
+    private lateinit var btnVignette: Button
+    private lateinit var txtVignette: TextView
+    /** 3위치 비네팅 보정 결과(카메라별 저장). 있으면 측정의 카메라 flat-field로 쓴다. */
+    private var vignetteModel: VignetteCalibration.Model? = null
+    /** 0 = 대기, 1..3 = 다음에 확정할 위치 번호. */
+    private var vignetteStep = 0
+    private val vignettePositions = ArrayList<VignetteCalibration.Position>()
     private lateinit var editExtra: EditText
     private lateinit var btnExtra: Button
     private var triSelection: CameraEnumerator.TriSelection? = null
@@ -235,6 +243,21 @@ class MeasurementActivity : Activity() {
         btnExtra = findViewById(R.id.btnExtra)
         findViewById<View>(R.id.rowExtra).visibility = View.VISIBLE
         findViewById<View>(R.id.rowAttenuation).visibility = View.VISIBLE
+        findViewById<View>(R.id.rowVignette).visibility = View.VISIBLE
+        btnVignette = findViewById(R.id.btnVignette)
+        txtVignette = findViewById(R.id.txtVignette)
+        btnVignette.setOnClickListener { onVignetteButton() }
+        btnVignette.setOnLongClickListener {
+            vignetteModel = null
+            vignetteStep = 0
+            vignettePositions.clear()
+            getSharedPreferences("app", MODE_PRIVATE).edit().remove(vignettePrefKey()).apply()
+            btnVignette.text = "비네팅 보정 (3위치)"
+            txtVignette.text = "비네팅 보정값 없음"
+            log("비네팅 보정값을 지웠어요")
+            true
+        }
+        loadVignetteModel()
         editMaxAtt = findViewById(R.id.editMaxAtt)
         findViewById<Button>(R.id.btnCheckAtt).setOnClickListener {
             btnStart.isEnabled = false
@@ -395,6 +418,162 @@ class MeasurementActivity : Activity() {
         resultLog.appendLine(msg)
         txtResult.text = resultLog.toString()
         AppLog.i(msg)
+    }
+
+    private fun vignettePrefKey(): String = "vignette_model_main"
+
+    private fun loadVignetteModel() {
+        val text = getSharedPreferences("app", MODE_PRIVATE).getString(vignettePrefKey(), null) ?: return
+        runCatching {
+            val o = JSONObject(text)
+            vignetteModel = VignetteCalibration.Model.fromJson(o)
+            txtVignette.text = "비네팅 보정값 사용 중 (${o.optString("created")})"
+        }
+    }
+
+    private val vignetteSteps = listOf("위쪽", "아래쪽", "가운데(정방향)")
+
+    /**
+     * 3위치 비네팅 보정 단계 진행. 첫 누름은 안내만 하고, 이후 누를 때마다 지금 위치를 촬영해 확정한다.
+     * 세 위치가 모이면 비네팅 모델을 풀어 저장한다.
+     */
+    private fun onVignetteButton() {
+        if (measuring) return
+        if (vignetteStep == 0) {
+            vignettePositions.clear()
+            vignetteStep = 1
+            guideVignetteStep()
+            return
+        }
+        btnStart.isEnabled = false
+        btnVignette.isEnabled = false
+        scope.launch {
+            try {
+                runMeasurementSafely { captureVignettePosition(vignetteStep) }
+                if (vignettePositions.size == vignetteStep) {
+                    if (vignetteStep < 3) {
+                        vignetteStep++
+                        guideVignetteStep()
+                    } else {
+                        finishVignetteCalibration()
+                    }
+                }
+            } finally {
+                btnVignette.isEnabled = true
+            }
+        }
+    }
+
+    private fun guideVignetteStep() {
+        val where = vignetteSteps[vignetteStep - 1]
+        btnVignette.text = "위치 확정 ($vignetteStep/3 $where)"
+        status("비네팅 보정 $vignetteStep/3: 탭을 카메라 프레임 $where 에 두고(화면 전체가 보이게) [위치 확정]을 누르세요")
+    }
+
+    private suspend fun captureVignettePosition(step: Int) {
+        val client = Session.client ?: throw IllegalStateException("대상 기기 미연결")
+        val cap = capture ?: throw IllegalStateException("카메라 미준비")
+        val screenW = Session.screenWidth
+        val screenH = Session.screenHeight
+        status("비네팅 보정 $step/3 촬영 중...")
+        withContext(Dispatchers.IO) {
+            client.command(Protocol.CMD_DISABLE_CORRECTION)
+            client.command(Protocol.CMD_DISABLE_OVERLAY)
+            client.showPattern("gray70")
+        }
+        if (step == 1) {
+            // 세 위치를 같은 노출로 찍어야 비율이 의미가 있다: 첫 위치에서만 노출을 잠근다.
+            delay(AE_CONVERGE_MS)
+            log("비네팅 보정 노출 고정: ${cap.lockMeasurementControls(inputRefreshHz())}")
+        } else {
+            delay(PATTERN_SETTLE_MS + 500)
+        }
+        val grayStore = captureFrameStore(cap, FRAMES_PER_PATTERN)
+        val gray = try { averageGrayFromStore(grayStore) } finally { grayStore.delete() }
+        val det = withContext(Dispatchers.Default) { ScreenDetector.detect(gray) }
+            ?: throw IllegalStateException("화면 검출 실패 — 탭 화면 전체가 프레임 안에 들어오게 해 주세요")
+        val h = Analyzer.buildHomography(det.quad, screenW, screenH) ?: throw IllegalStateException("호모그래피 실패")
+        withContext(Dispatchers.IO) { client.showPattern("black") }
+        delay(PATTERN_SETTLE_MS)
+        val blackStore = captureFrameStore(cap, 3)
+        val black = try { averageGrayFromStore(blackStore) } finally { blackStore.delete() }
+        withContext(Dispatchers.IO) { client.showPattern("gray70") }
+        val bw = if (screenW >= screenH) 24 else 18
+        val bh = if (screenW >= screenH) 18 else 24
+        val fine = withContext(Dispatchers.Default) {
+            Analyzer.lumaGrid(gray, black, h, screenW, screenH, bw * 4, bh * 4)
+        }
+        val values = FloatArray(bw * bh)
+        val xs = FloatArray(bw * bh)
+        val ys = FloatArray(bw * bh)
+        val out = DoubleArray(2)
+        for (by in 0 until bh) for (bx in 0 until bw) {
+            var sum = 0f
+            for (dy in 0 until 4) for (dx in 0 until 4) sum += fine[(by * 4 + dy) * bw * 4 + bx * 4 + dx]
+            val i = by * bw + bx
+            values[i] = sum / 16f
+            h.map((bx + 0.5) * screenW / bw, (by + 0.5) * screenH / bh, out)
+            val (nx, ny) = VignetteCalibration.normalize(out[0], out[1], gray.w, gray.h)
+            xs[i] = nx.toFloat()
+            ys[i] = ny.toFloat()
+        }
+        vignettePositions += VignetteCalibration.Position(values, xs, ys)
+        val cx = det.quad.corners.map { it.x }.average()
+        val cy = det.quad.corners.map { it.y }.average()
+        log(
+            "비네팅 보정 $step/3 (${vignetteSteps[step - 1]}) 확정: 화면 중심 (${cx.toInt()}, ${cy.toInt()}) / " +
+                "프레임 ${gray.w}x${gray.h}, 점유율 ${(det.areaRatio * 100).toInt()}%"
+        )
+    }
+
+    private suspend fun finishVignetteCalibration() {
+        vignetteStep = 0
+        btnVignette.text = "비네팅 보정 (3위치)"
+        val result = try {
+            withContext(Dispatchers.Default) { VignetteCalibration.fit(vignettePositions) }
+        } catch (e: Exception) {
+            status("비네팅 보정 실패: ${e.message}")
+            log("비네팅 보정 실패: ${e.message} — 세 위치를 서로 더 떨어뜨려 다시 해 주세요")
+            return
+        } finally {
+            vignettePositions.clear()
+        }
+        val m = result.model
+        vignetteModel = m
+        val created = java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.US).format(java.util.Date())
+        getSharedPreferences("app", MODE_PRIVATE).edit()
+            .putString(vignettePrefKey(), m.toJson().put("created", created).put("rms", result.rmsResidual).toString())
+            .apply()
+        txtVignette.text = "비네팅 보정값 사용 중 ($created)"
+        log(
+            "비네팅 보정 완료: 중앙 대비 감도 r=0.5 ${pct(m.gain(0.5, 0.0).toFloat())}, r=0.8 ${pct(m.gain(0.8, 0.0).toFloat())}, " +
+                "r=1 ${pct(result.cornerGain.toFloat())} (모델 잔차 ${pct(result.rmsResidual.toFloat())}) — 이후 측정에 적용, 길게 누르면 삭제"
+        )
+        status("비네팅 보정 완료 — 탭을 측정 위치(가운데)에 둔 채로 측정하세요")
+    }
+
+    /** 비네팅 모델로 만든 카메라 flat-field 격자(화면 좌표). applyFlatField는 이 값으로 나눈다. */
+    private fun modelFlatField(
+        model: VignetteCalibration.Model,
+        h: Homography,
+        imageW: Int,
+        imageH: Int,
+        screenW: Int,
+        screenH: Int,
+        gw: Int,
+        gh: Int,
+    ): FloatArray {
+        val out = FloatArray(gw * gh)
+        val p = DoubleArray(2)
+        for (gy in 0 until gh) for (gx in 0 until gw) {
+            h.map((gx + 0.5) * screenW / gw, (gy + 0.5) * screenH / gh, p)
+            val (nx, ny) = VignetteCalibration.normalize(p[0], p[1], imageW, imageH)
+            out[gy * gw + gx] = model.gain(nx, ny).toFloat().coerceIn(0.5f, 2f)
+        }
+        // applyFlatField는 상대 보정이므로 중앙값 1로 맞춘다
+        val med = out.copyOf().apply { sort() }[out.size / 2]
+        for (i in out.indices) out[i] /= med
+        return out
     }
 
     private fun inputMaxAttenuation(): Float =
@@ -700,7 +879,12 @@ class MeasurementActivity : Activity() {
         val blackFullGrid = withContext(Dispatchers.Default) {
             Analyzer.lumaGrid(blackAvg, null, homography, screenW, screenH, gw, gh)
         }
-        val flatField = withContext(Dispatchers.Default) {
+        // 3위치 비네팅 보정값이 있으면 그것으로 카메라 flat-field를 만든다(화면 번인과 분리된 값).
+        // 없으면 기존처럼 화면 자체에서 방사형으로 추정한다(번인 일부가 섞일 수 있음).
+        val flatField = vignetteModel?.let { m ->
+            log("카메라 flat-field: 3위치 비네팅 보정값 사용")
+            withContext(Dispatchers.Default) { modelFlatField(m, homography, grayAvg.w, grayAvg.h, screenW, screenH, gw, gh) }
+        } ?: withContext(Dispatchers.Default) {
             Analyzer.radialFlatField(lumaBeforeRaw, gw, gh)
         }
         val edgeFalloff = withContext(Dispatchers.Default) {
@@ -747,7 +931,7 @@ class MeasurementActivity : Activity() {
         }
         // 원형(잔여 비네팅) 보정: 반복 보정은 같은 메인 카메라로 다시 재는 폐루프라 카메라 쪽 원형은
         // 반복으로 사라지지 않고 오히려 화면에 새겨진다. 초광각 기준 저주파 비율로 메인 flat-field를 고친다.
-        val lumaBeforePreWb = cross?.referenceBlocks?.let { ref ->
+        val lumaBeforePreWb = cross?.referenceBlocks?.takeIf { vignetteModel == null }?.let { ref ->
             withContext(Dispatchers.Default) {
                 val residual = LowFrequency.cameraResidual(lumaBeforeRadial, ref, gw, gh)
                 val up = LowFrequency.upsample(residual, gw, gh)
@@ -757,7 +941,8 @@ class MeasurementActivity : Activity() {
                 FloatArray(lumaBeforeRadial.size) { (lumaBeforeRadial[it] / up[it].coerceAtLeast(0.5f)).coerceAtLeast(1e-5f) }
             }
         } ?: lumaBeforeRadial.also {
-            if (cross != null) log("초광각 기준 잔여 비네팅 보정 생략: 초광각 화면 정합 실패")
+            if (vignetteModel != null) log("초광각 기준 잔여 비네팅 보정 생략: 3위치 비네팅 보정값 사용 중")
+            else if (cross != null) log("초광각 기준 잔여 비네팅 보정 생략: 초광각 화면 정합 실패")
         }
         // 색 균일화 레이어를 켠 상태에서 다시 찍은 gray70을 휘도 기준으로 쓴다(카메라 flat-field는 위에서 확정).
         val (lumaBefore, confidence70) = if (chromaOn) {

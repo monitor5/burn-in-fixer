@@ -83,6 +83,34 @@
             android:text="측정을 시작하면 진행 상황이 표시됩니다." />
     </ScrollView>
 
+    <!-- 3위치 비네팅 보정: 탭을 프레임 위·아래·가운데에 두고 차례로 확정한다. 측정 화면에서만 보인다. -->
+    <LinearLayout
+        android:id="@+id/rowVignette"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="8dp"
+        android:paddingEnd="8dp"
+        android:visibility="gone">
+
+        <Button
+            android:id="@+id/btnVignette"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="비네팅 보정 (3위치)" />
+
+        <TextView
+            android:id="@+id/txtVignette"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:paddingStart="8dp"
+            android:textSize="12sp"
+            android:text="비네팅 보정값 없음" />
+    </LinearLayout>
+
     <!-- 최대 감쇠(%) 입력과 감쇠 필요도 검증. 측정 화면에서만 보인다. -->
     <LinearLayout
         android:id="@+id/rowAttenuation"
