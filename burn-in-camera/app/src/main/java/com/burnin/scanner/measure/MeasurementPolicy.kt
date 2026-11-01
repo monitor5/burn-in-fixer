@@ -24,6 +24,17 @@ internal object MeasurementPolicy {
         return if (blockDev == null) cellScore else maxOf(cellScore, blockDev / blockLimit)
     }
 
+    /**
+     * 반복 보정의 맵 선택·수렴 판정용 연속 점수(낮을수록 좋음): RMS와 P95를 합격선으로 나눈 평균.
+     * [score]는 최악 지표 하나(max)라 상한으로 못 고치는 한 블록이 있으면 개선이 보이지 않는다.
+     */
+    fun optimizationScore(stats: Analyzer.Stats, rmsLimit: Float, p95Limit: Float): Float {
+        require(rmsLimit.isFinite() && rmsLimit > 0f && p95Limit.isFinite() && p95Limit > 0f)
+        if (!stats.median.isFinite() || stats.median <= 1e-4f ||
+            !stats.rmsDev.isFinite() || stats.rmsDev < 0f || !stats.p95Dev.isFinite() || stats.p95Dev < 0f) return Float.POSITIVE_INFINITY
+        return 0.5f * (stats.rmsDev / rmsLimit) + 0.5f * (stats.p95Dev / p95Limit)
+    }
+
     fun geometryStable(
         reference: ScreenDetector.Quad,
         current: ScreenDetector.Quad,

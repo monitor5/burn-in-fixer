@@ -1166,8 +1166,8 @@ class MeasurementActivity : Activity() {
         }
         val baselineLowStats = Analyzer.stats(lumaLowBefore)
         val baselineScore = maxOf(
-            uniformityScore(statsBefore, lumaBefore, gw, gh),
-            uniformityScore(baselineLowStats, lumaLowBefore, gw, gh),
+            optimizationScore(statsBefore),
+            optimizationScore(baselineLowStats),
         ) * (1f - lowRgbWeight) +
             (if (rgb30.stats.isNotEmpty()) rgb30.meanRms / PASS_RMS else 0f) * lowRgbWeight
         val selection = MeasurementPolicy.Selection(FloatArray(gain.size) { 1f }, baselineScore)
@@ -1300,7 +1300,10 @@ class MeasurementActivity : Activity() {
             val gray70Passed = grayScore70 <= 1f
             val lowLightPassed = grayScoreLow <= 1f
             val bothGrayPassed = gray70Passed && lowLightPassed
-            val grayScore = maxOf(grayScore70, grayScoreLow)
+            // 맵 선택·수렴 판정은 RMS·P95 연속 점수로 한다. 블록 최대 편차는 가장 나쁜 한 칸이
+            // 점수를 지배해(상한으로 못 펴는 블록 31%/2% ≈ 15배) 전체가 좋아져도 기준선을 못 이겼다.
+            // 블록 최대 편차는 합격 판정(gray70Passed 등)에만 쓴다.
+            val grayScore = maxOf(optimizationScore(st), optimizationScore(lowSt))
             val rgbScore = if (rgb30After.stats.isNotEmpty()) {
                 rgb30AfterMeanRms / PASS_RMS
             } else {
@@ -1747,6 +1750,9 @@ class MeasurementActivity : Activity() {
 
     private fun uniformityPassed(stats: Analyzer.Stats, grid: FloatArray, gw: Int, gh: Int): Boolean =
         uniformityScore(stats, grid, gw, gh) <= 1f
+
+    private fun optimizationScore(stats: Analyzer.Stats): Float =
+        MeasurementPolicy.optimizationScore(stats, PASS_RMS, PASS_P95)
 
     private fun uniformityScore(stats: Analyzer.Stats, grid: FloatArray, gw: Int, gh: Int): Float =
         MeasurementPolicy.score(stats, PASS_RMS, PASS_P95, Analyzer.blockMaxDev(grid, gw, gh), PASS_BLOCK)
