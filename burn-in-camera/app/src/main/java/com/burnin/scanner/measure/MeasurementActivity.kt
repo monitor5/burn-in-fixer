@@ -106,6 +106,12 @@ class MeasurementActivity : Activity() {
         /** 희소 촬영 노출 상향 목표: gray70 상위 1% 밝기가 이 값(선형 0~1)이 되도록. */
         private const val SPARSE_TARGET_PEAK = 0.6f
         private const val SPARSE_MAX_EXPOSURE_BOOST = 4f
+        /** 점 탐침 뒤 노출 보정 상한(측정 전 노출 대비 누적). 단색 점은 흰 점보다 훨씬 어둡다. */
+        private const val SPARSE_MAX_TOTAL_BOOST = 16f
+        /** 탐침 프레임에서 점 최고 밝기로 볼 분위수(점 화소는 전체의 수 % 이하). */
+        private const val SPARSE_PROBE_QUANTILE = 0.998f
+        /** 단색(R/G/B) 점 구동 레벨(%). 서브픽셀 하나라 광량이 적어 흰 점(70)보다 올린다. */
+        private const val SPARSE_CHANNEL_LEVEL = 100
         private const val PASS_RMS = 0.015f      // 합격: 잔여 RMS ≤ 1.5%
         private const val PASS_P95 = 0.035f      // 합격: P95 편차 ≤ 3.5%
         private const val PASS_BLOCK = 0.02f     // 합격: 블록 평균 최대 편차 ≤ 2% (좁은 띠 번인)
@@ -2309,33 +2315,36 @@ class MeasurementActivity : Activity() {
             sorted.sort(0, np)
             val p99 = if (np == 0) Float.NaN else sorted[((np - 1) * 0.99f).toInt()]
             val boost = if (p99.isFinite() && p99 > 0f) (SPARSE_TARGET_PEAK / p99).coerceIn(1f, SPARSE_MAX_EXPOSURE_BOOST) else 1f
-            if (boost > 1.05f && cap.scaleManualExposure(boost.toDouble(), inputRefreshHz())) {
+            if (boost > 1.05f && cap.scaleManualExposure(boost.toDouble(), inputRefreshHz(), preferExposureTime = true)) {
                 boosted = true
                 log("희소 점등 측광$label 노출 ×${fmt(boost)} (${cap.manualExposureText()}, gray70 상위1% ${fmt(p99)})")
                 delay(300)
             }
         }
         return try {
-            status("$step 희소 점등 측광$label 준비: black 풀해상도 촬영...")
-            withContext(Dispatchers.IO) { client.showPattern("black") }
-            delay(SPARSE_SETTLE_MS)
-            val blackStore = captureFrameStore(cap, SPARSE_BLACK_FRAMES, SPARSE_INTER_FRAME_DELAY_MS)
-            var black: GrayImage? = try {
-                if (channel == null) averageFullResFromStore(blackStore)
-                else withContext(Dispatchers.Default) { NativePixel.average(blackStore.files, channel, ImageOps.FULL_RESOLUTION) }
-                    ?: averageDecodedFromStore(blackStore) { ImageOps.decodeLinearChannel(it, channel, Int.MAX_VALUE) }
-            } finally {
-                blackStore.delete()
+            suspend fun captureBlack(): GrayImage {
+                status("$step 희소 점등 측광$label 준비: black 풀해상도 촬영...")
+                withContext(Dispatchers.IO) { client.showPattern("black") }
+                delay(SPARSE_SETTLE_MS)
+                val blackStore = captureFrameStore(cap, SPARSE_BLACK_FRAMES, SPARSE_INTER_FRAME_DELAY_MS)
+                return try {
+                    if (channel == null) averageFullResFromStore(blackStore)
+                    else withContext(Dispatchers.Default) { NativePixel.average(blackStore.files, channel, ImageOps.FULL_RESOLUTION) }
+                        ?: averageDecodedFromStore(blackStore) { ImageOps.decodeLinearChannel(it, channel, Int.MAX_VALUE) }
+                } finally {
+                    blackStore.delete()
+                }
             }
+            var black: GrayImage? = captureBlack()
             val bw = black!!.w
             val bh = black.h
             // 네이티브에 보관할 수 있으면 Java 힙의 black(약 50MB)은 바로 놓는다
-            val nativeBlack = NativePixel.storeBlack(black.data)
+            var nativeBlack = NativePixel.storeBlack(black.data)
             if (nativeBlack) black = null
             val sample = ImageOps.downsampleFactor(bw, bh)
             val hFull = homography.withImageAffine(sample.toDouble(), (sample - 1) / 2.0)
             val camPerScreen = SparseSpotPhotometry.cameraPxPerScreenPx(hFull, screenW, screenH)
-            val plan = SparseSpotPhotometry.plan(camPerScreen)
+            val plan = SparseSpotPhotometry.plan(camPerScreen, level = if (channel != null) SPARSE_CHANNEL_LEVEL else 70)
             if (plan == null) {
                 log(
                     "희소 점등 측광 건너뜀: 화면 1px당 카메라 ${fmt(camPerScreen)}px — 획 단위 측정에 부족 " +
@@ -2347,6 +2356,40 @@ class MeasurementActivity : Activity() {
             // 호출 간에 재사용하지 않는다: 붙잡아 두면 조립(약 70MB 임시) 동안 50MB가 더 얹힌다.
             // 놓은 큰 배열은 ART가 OOM 전에 회수하므로 매번 새로 잡는 편이 피크가 낮다.
             var sparseBuffer: FloatArray? = FloatArray(bw * bh)
+            // 점 탐침: 첫 위상 한 장으로 점의 실제 최고 밝기를 재서 노출을 맞춘다. gray70 기준 부스트는
+            // 단색 점(서브픽셀 하나)에 턱없이 모자라고, 레벨을 올린 점은 포화될 수도 있다.
+            if (exposureBefore != null) {
+                val (px0, py0) = plan.phases().first()
+                withContext(Dispatchers.IO) { client.showPattern(plan.patternName(px0, py0, channel)) }
+                delay(SPARSE_SETTLE_MS)
+                val probeStore = captureFrameStore(cap, 1, SPARSE_INTER_FRAME_DELAY_MS)
+                val peak = try {
+                    val file = probeStore.files.first()
+                    val ok = if (nativeBlack) NativePixel.decodeIntoStored(file, mode, ImageOps.FULL_RESOLUTION, sparseBuffer!!)
+                        else NativePixel.decodeInto(file, mode, ImageOps.FULL_RESOLUTION, black!!.data, sparseBuffer!!)
+                    if (ok) withContext(Dispatchers.Default) { probePeak(sparseBuffer!!) } else Float.NaN
+                } finally {
+                    probeStore.delete()
+                }
+                val total = cap.manualExposureRatio(exposureBefore)
+                val factor = if (peak.isFinite() && peak > 0f) {
+                    (SPARSE_TARGET_PEAK / peak).coerceIn(0.25f, (SPARSE_MAX_TOTAL_BOOST / total.toFloat()).coerceAtLeast(0.25f))
+                } else 1f
+                if ((factor < 0.85f || factor > 1.15f) && cap.scaleManualExposure(factor.toDouble(), inputRefreshHz(), preferExposureTime = true)) {
+                    boosted = true
+                    log("희소 점등 측광$label 점 탐침: 최고 밝기 ${fmt(peak)} → 노출 ×${fmt(factor)} (${cap.manualExposureText()}, 측정 전 대비 ×${fmt(cap.manualExposureRatio(exposureBefore).toFloat())})")
+                    delay(300)
+                    // 노출이 바뀌었으니 black도 다시 잰다
+                    black = null
+                    NativePixel.storeBlack(null)
+                    val again = captureBlack()
+                    require(again.w == bw && again.h == bh) { "black 크기 변화" }
+                    nativeBlack = NativePixel.storeBlack(again.data)
+                    black = if (nativeBlack) null else again
+                } else {
+                    log("희소 점등 측광$label 점 탐침: 최고 밝기 ${fmt(peak)} (노출 유지)")
+                }
+            }
             val layouts = ArrayList<SparseSpotPhotometry.PhaseLayout>()
             for ((index, phase) in plan.phases().withIndex()) {
                 status("$step 희소 점등 측광$label ${index + 1}/${plan.patternCount}...")
@@ -2437,6 +2480,20 @@ class MeasurementActivity : Activity() {
             .put("red", reports[0]).put("green", reports[1]).put("blue", reports[2])
         log("RGBW 희소 점등 완료: W/R/G/B 층 평균 감쇠 " + (listOf(white.gain) + gains).joinToString(" / ") { pct(1f - it.average().toFloat()) })
         return StrokeDetail(white.gain, white.compensation, report, gains)
+    }
+
+    /** 탐침 프레임의 점 최고 밝기: 7화소마다 표본을 뽑아 [SPARSE_PROBE_QUANTILE] 분위수(정렬 메모리 줄임). */
+    private fun probePeak(frame: FloatArray): Float {
+        val n = frame.size / 7
+        val tmp = FloatArray(n)
+        var m = 0
+        for (i in 0 until n) {
+            val v = frame[i * 7]
+            if (v.isFinite()) tmp[m++] = v
+        }
+        if (m == 0) return Float.NaN
+        tmp.sort(0, m)
+        return tmp[((m - 1) * SPARSE_PROBE_QUANTILE).toInt()]
     }
 
     private fun buildStrokeDetail(

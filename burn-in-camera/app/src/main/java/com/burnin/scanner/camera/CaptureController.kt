@@ -630,6 +630,13 @@ class CaptureController(
         return if (manualLocked) e to i else null
     }
 
+    /** 현재 수동 노출량(시간×ISO)이 [state] 대비 몇 배인지. 수동이 아니면 1. */
+    fun manualExposureRatio(state: Pair<Long, Int>): Double {
+        val e = manualExposureTimeNs ?: return 1.0
+        val i = manualSensitivityIso ?: return 1.0
+        return e.toDouble() * i / (state.first.toDouble() * state.second)
+    }
+
     fun restoreManualExposure(state: Pair<Long, Int>) {
         if (!manualLocked) return
         manualExposureTimeNs = state.first
@@ -638,20 +645,31 @@ class CaptureController(
         session?.setRepeatingRequest(previewBuilder.build(), previewCallback, handler)
     }
 
-    fun scaleManualExposure(factor: Double, displayRefreshHz: Float = 60f): Boolean {
+    /**
+     * 수동 노출을 [factor]배 한다. 기본은 ISO 먼저(움직임 번짐 방지), [preferExposureTime]이면 노출 시간 먼저
+     * — ISO는 광자를 늘리지 않으므로 정지 화면의 샷 잡음을 줄이려면 시간을 늘려야 한다.
+     */
+    fun scaleManualExposure(factor: Double, displayRefreshHz: Float = 60f, preferExposureTime: Boolean = false): Boolean {
         val exposure = manualExposureTimeNs
         val iso = manualSensitivityIso
         if (!manualLocked || exposure == null || iso == null || !factor.isFinite() || factor <= 0.0) return false
         val exposureRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
         val isoRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
-        // ISO를 먼저 바꾸고, ISO 한계에 걸리면 남은 비율만큼 노출 시간을 바꾼다.
-        val desiredIso = (iso * factor).coerceIn(1.0, Int.MAX_VALUE.toDouble())
-        val newIso = Math.round(desiredIso).toInt().coerceInRange(isoRange)
-        val remaining = factor * iso / newIso
-        val (newExposure, quantIso) = quantizeExposureToRefresh(
-            Math.round(exposure * remaining).coerceAtLeast(1L).coerceInRange(exposureRange),
-            newIso, displayRefreshHz, exposureRange, isoRange,
-        )
+        val (newExposure, quantIso) = if (preferExposureTime) {
+            // 노출 시간을 먼저 바꾸고, 시간 한계에 걸리면 남은 비율만큼 ISO를 바꾼다.
+            val t = Math.round(exposure * factor).coerceAtLeast(1L).coerceInRange(exposureRange)
+            val isoNeeded = Math.round(iso * factor * exposure / t.toDouble()).toInt().coerceInRange(isoRange)
+            quantizeExposureToRefresh(t, isoNeeded, displayRefreshHz, exposureRange, isoRange)
+        } else {
+            // ISO를 먼저 바꾸고, ISO 한계에 걸리면 남은 비율만큼 노출 시간을 바꾼다.
+            val desiredIso = (iso * factor).coerceIn(1.0, Int.MAX_VALUE.toDouble())
+            val newIso = Math.round(desiredIso).toInt().coerceInRange(isoRange)
+            val remaining = factor * iso / newIso
+            quantizeExposureToRefresh(
+                Math.round(exposure * remaining).coerceAtLeast(1L).coerceInRange(exposureRange),
+                newIso, displayRefreshHz, exposureRange, isoRange,
+            )
+        }
         val achieved = newExposure.toDouble() * quantIso / (exposure.toDouble() * iso)
         if (Math.abs(achieved - 1.0) < 0.02) return false
         manualExposureTimeNs = newExposure
