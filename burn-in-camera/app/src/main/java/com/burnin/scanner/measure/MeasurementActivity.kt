@@ -96,6 +96,8 @@ class MeasurementActivity : Activity() {
         private const val STROKE_DETAIL_ENABLED = true
         /** 반복 보정 뒤 보정을 켠 채 흰 점으로 픽셀 잔차를 재고 고주파 층을 다시 맞추는 최대 횟수. */
         private const val PIXEL_REFINE_ROUNDS = 2
+        /** RGBW는 한 회에 희소 측정이 4번(약 7분)이라 고치기 1회 + 확인으로 줄인다. */
+        private const val PIXEL_REFINE_ROUNDS_RGBW = 1
         private const val SPARSE_FRAMES_PER_PATTERN = 8
         private const val SPARSE_BLACK_FRAMES = 8
         private const val SPARSE_INTER_FRAME_DELAY_MS = 0L
@@ -2473,10 +2475,10 @@ class MeasurementActivity : Activity() {
     }
 
     /**
-     * 픽셀 단위 검증: 최적 맵을 켠 채 흰 점 희소 측정으로 화면 픽셀 해상도 잔차를 재고, 잔차로 고주파 층을
-     * 다시 맞춰 적용한 뒤 또 잰다. 잔차 RMS(점 잡음 제외)가 줄어들 때만 채택하고, 나빠지면 직전 층으로 되돌린다.
-     * 채널(RGB) 층은 대상 앱이 희소 점에 알파만 덮으므로 여기서는 휘도 층만 고친다.
-     * 반환: (새 최적 맵이 든 결과, 새 고주파 층). 측정이 안 되면 null.
+     * 픽셀 단위 검증: 최적 맵을 켠 채 희소 점(W, RGBW면 R·G·B도)으로 화면 픽셀 해상도 잔차를 재고,
+     * 잔차로 각 고주파 층을 다시 맞춰 적용한 뒤 또 잰다. 층마다 잔차 RMS(점 잡음 제외)가 줄어들 때만
+     * 채택하고, 나빠진 층은 직전 값으로 되돌려 더 고치지 않는다(탭은 희소 점에도 RGB 보정을 곱해 그린다).
+     * 반환: (새 최적 맵이 든 결과, 새 고주파 층). 바뀐 것이 없으면 null.
      */
     private suspend fun refinePixelDetail(
         client: ControlClient,
@@ -2499,60 +2501,82 @@ class MeasurementActivity : Activity() {
         val lowPassRadius = maxOf(1, smoothRadius) + 1
         val detailMax = maxAttenuation.coerceAtMost(0.5f)
         val allowance = FloatArray(confidence.size) { Analyzer.confidenceAllowance(confidence[it]) }
-        val initialRms = detail.report.optDouble("detailRms", Double.NaN).toFloat()
+        // 층 0 = W(알파), 1..3 = R·G·B
+        val channels: List<Int?> = if (detail.channelGains?.size == 3) listOf(null, 0, 1, 2) else listOf(null)
+        val names = listOf("W", "R", "G", "B")
+        val reportKeys = listOf("white", "red", "green", "blue")
+        val initialRms = channels.indices.map { k ->
+            val r = if (channels.size == 1) detail.report else detail.report.optJSONObject(reportKeys[k])
+            r?.optDouble("detailRms", Double.NaN)?.toFloat() ?: Float.NaN
+        }
+        val best = MutableList(channels.size) { k -> if (k == 0) detail.gain else detail.channelGains!![k - 1] }
+        val current = best.toMutableList()
+        val bestRms = MutableList(channels.size) { Float.NaN }
+        val frozen = BooleanArray(channels.size)
+        val maxRounds = if (channels.size == 1) PIXEL_REFINE_ROUNDS else PIXEL_REFINE_ROUNDS_RGBW
         val rounds = JSONArray()
-        var bestMap = correction.bestMap
-        var bestDetail = detail
-        var bestRms = Float.NaN
-        var candidateMap: CorrectionMap? = null
-        var candidateDetail: StrokeDetail? = null
+        var changed = false
         var round = 0
         while (true) {
-            // 현재 적용 중인 맵(bestMap 또는 방금 바꾼 후보)의 픽셀 잔차를 잰다
-            val residual = captureSparse(client, cap, homography, screenW, screenH, reference, null, "8/10 픽셀 검증 ${round + 1}") { layouts, plan, _ ->
-                SparseSpotPhotometry.assembleAligned(layouts, screenW, screenH, reference, 3 * plan.pitch).first
-                    .takeIf { it.validFraction >= 0.5f }
+            val roundJson = JSONObject().put("round", round + 1)
+            for ((k, channel) in channels.withIndex()) {
+                if (frozen[k]) continue
+                // 지금 적용 중인 층(첫 회는 반복 보정 결과, 이후는 방금 고친 후보)의 픽셀 잔차
+                val residual = captureSparse(client, cap, homography, screenW, screenH, reference, channel, "8/10 픽셀 검증 ${round + 1}") { layouts, plan, _ ->
+                    SparseSpotPhotometry.assembleAligned(layouts, screenW, screenH, reference, 3 * plan.pitch).first
+                        .takeIf { it.validFraction >= 0.5f }
+                }
+                if (residual == null) {
+                    log("픽셀 검증 ${names[k]} 측정 실패 — 이 층은 직전 값 유지")
+                    current[k] = best[k]
+                    frozen[k] = true
+                    continue
+                }
+                val rms = withContext(Dispatchers.Default) { SparseSpotPhotometry.detailRms(residual, lowPassRadius) }
+                val accepted = round == 0 || !(rms >= bestRms[k])
+                log(
+                    "픽셀 검증 ${round + 1} ${names[k]}: 고주파 잔차 RMS ${pct(rms)} (보정 전 ${pct(initialRms[k])}" +
+                        (if (round > 0) ", 직전 ${pct(bestRms[k])}) — ${if (accepted) "채택" else "악화, 직전 층으로 되돌림"}" else ")")
+                )
+                roundJson.put(names[k], JSONObject().put("detailRms", rms.toDouble()).put("accepted", accepted))
+                if (!accepted) {
+                    current[k] = best[k]
+                    frozen[k] = true
+                    continue
+                }
+                if (round > 0) changed = true
+                best[k] = current[k]
+                bestRms[k] = rms
+                if (round >= maxRounds) {
+                    frozen[k] = true
+                } else {
+                    current[k] = withContext(Dispatchers.Default) {
+                        SparseSpotPhotometry.refineDetailGain(best[k], residual, lowPassRadius, detailMax, allowance)
+                    }
+                }
             }
-            if (residual == null) {
-                log("픽셀 단위 검증 실패 — 반복 보정 결과 그대로 사용")
-                if (round > 0) applyGainMap(client, bestMap, gw, gh, screenW, screenH)
-                break
-            }
-            val rms = withContext(Dispatchers.Default) { SparseSpotPhotometry.detailRms(residual, lowPassRadius) }
-            val accepted = round == 0 || !(rms >= bestRms)
-            log(
-                "픽셀 검증 ${round + 1}: 고주파 잔차 RMS ${pct(rms)} (보정 전 ${pct(initialRms)}" +
-                    (if (round > 0) ", 직전 ${pct(bestRms)}) — ${if (accepted) "채택" else "악화, 직전 층으로 되돌림"}" else ")")
-            )
-            rounds.put(JSONObject().put("round", round + 1).put("detailRms", rms.toDouble()).put("accepted", accepted))
-            if (!accepted) {
-                applyGainMap(client, bestMap, gw, gh, screenW, screenH)
-                break
-            }
-            if (round > 0) {
-                bestMap = candidateMap!!
-                bestDetail = candidateDetail!!
-            }
-            bestRms = rms
-            if (round >= PIXEL_REFINE_ROUNDS) break
-            val (newGain, newComp) = withContext(Dispatchers.Default) {
-                val g = SparseSpotPhotometry.refineDetailGain(bestDetail.gain, residual, lowPassRadius, detailMax, allowance)
-                // 저주파 재측정 보상층도 층 변화만큼 옮긴다: comp' ≈ comp · lowPass(new) / lowPass(old)
-                val all = BooleanArray(g.size) { true }
-                val lpNew = SparseSpotPhotometry.weightedBox(SparseSpotPhotometry.weightedBox(g, all, screenW, screenH, lowPassRadius), all, screenW, screenH, lowPassRadius)
-                val lpOld = SparseSpotPhotometry.weightedBox(SparseSpotPhotometry.weightedBox(bestDetail.gain, all, screenW, screenH, lowPassRadius), all, screenW, screenH, lowPassRadius)
-                g to FloatArray(g.size) { bestDetail.compensation[it] * lpNew[it] / lpOld[it].coerceAtLeast(1e-3f) }
-            }
-            candidateDetail = StrokeDetail(newGain, newComp, bestDetail.report, bestDetail.channelGains)
-            candidateMap = bestMap.replaceDetail(newGain)
-            status("8/10 픽셀 검증 ${round + 1} — 고친 고주파 층 적용...")
-            applyGainMap(client, candidateMap!!, gw, gh, screenW, screenH)
+            rounds.put(roundJson)
+            val pending = current.indices.any { current[it] !== best[it] }
+            // 이번 회에 고친 후보(또는 되돌린 층)를 적용한다. 모두 끝났으면 최종 채택 층으로 맞춘다.
+            val layers = if (pending && !frozen.all { it }) current else best
+            applyGainMap(client, correction.bestMap.replaceDetail(layers[0], if (layers.size == 4) layers.subList(1, 4).toList() else null), gw, gh, screenW, screenH)
+            if (!pending || frozen.all { it }) break
             round++
         }
         detail.report.put("pixelRefine", rounds)
-        strokeDetailReport = bestDetail.report
-        if (bestMap === correction.bestMap) return null
-        return correction.copy(bestMap = bestMap) to bestDetail
+        strokeDetailReport = detail.report
+        if (!changed) return null
+        val newComp = withContext(Dispatchers.Default) {
+            // 저주파 재측정 보상층도 W 층 변화만큼 옮긴다: comp' ≈ comp · lowPass(new) / lowPass(old)
+            val all = BooleanArray(best[0].size) { true }
+            fun lp(g: FloatArray) = SparseSpotPhotometry.weightedBox(SparseSpotPhotometry.weightedBox(g, all, screenW, screenH, lowPassRadius), all, screenW, screenH, lowPassRadius)
+            val lpNew = lp(best[0])
+            val lpOld = lp(detail.gain)
+            FloatArray(best[0].size) { detail.compensation[it] * lpNew[it] / lpOld[it].coerceAtLeast(1e-3f) }
+        }
+        val rgb = if (best.size == 4) best.subList(1, 4).toList() else null
+        val refined = StrokeDetail(best[0], newComp, detail.report, rgb)
+        return correction.copy(bestMap = correction.bestMap.replaceDetail(best[0], rgb)) to refined
     }
 
     /** 고주파 층을 켠 상태의 저해상도 재측정에서 층의 평균 감쇠를 되돌린다 (저주파 루프가 이를 상쇄하지 않도록). */

@@ -111,6 +111,8 @@ class PatternView(context: Context) : View(context) {
     private var solidCacheCorrectionMaxAttenuation: Double = -1.0
     private var solidCacheWhiteBalanceMaxAttenuation: Double = -1.0
     private var solidCacheGamma: Double = -1.0
+    /** 단색 캐시 자리에 보정된 희소 패턴이 들어 있으면 그 패턴. */
+    private var solidCacheSparseSpec: PatternSpec? = null
     private var sparseCache: Bitmap? = null
     private var sparseCacheSpec: PatternSpec? = null
 
@@ -173,7 +175,28 @@ class PatternView(context: Context) : View(context) {
 
             PatternSpec.Kind.SPARSE -> {
                 canvas.drawColor(Color.BLACK)
-                if (w > 0 && h > 0) canvas.drawBitmap(sparseBitmap(spec, w, h), 0f, 0f, null)
+                if (w > 0 && h > 0) {
+                    val rgb = correctionRgbBitmap
+                    val wb = whiteBalanceRgbBitmap
+                    // 보정 후 픽셀 단위 검증: 단색과 같은 RGB·색 균일화 감쇠를 켜진 점에 곱한다
+                    // (알파만 덮으면 측정 쪽이 채널 층을 검증할 수 없다).
+                    val corrected = if (correctionEnabled && (rgb != null || wb != null)) {
+                        try {
+                            correctedSparseBitmap(spec, w, h, rgb, wb)
+                        } catch (e: OutOfMemoryError) {
+                            clearSolidCache()
+                            PatternBus.renderError = "보정 희소 화면 생성 메모리 부족 (${w}x${h})"
+                            AppLog.i("!! ${PatternBus.renderError}")
+                            null
+                        }
+                    } else null
+                    if (corrected != null) {
+                        canvas.drawBitmap(corrected, 0f, 0f, null)
+                        usedCorrectionRgbSolid = rgb != null
+                    } else {
+                        canvas.drawBitmap(sparseBitmap(spec, w, h), 0f, 0f, null)
+                    }
+                }
             }
 
             PatternSpec.Kind.DOTGRID -> {
@@ -241,6 +264,7 @@ class PatternView(context: Context) : View(context) {
     ): Bitmap {
         solidCache?.let { cached ->
             if (
+                solidCacheSparseSpec == null &&
                 solidCacheColor == color &&
                 solidCacheW == w &&
                 solidCacheH == h &&
@@ -293,7 +317,80 @@ class PatternView(context: Context) : View(context) {
         if (whiteBalanceMap != null && whiteBalanceMap !== whiteBalanceRgb) whiteBalanceMap.recycle()
         val bmp = Bitmap.createBitmap(out, w, h, Bitmap.Config.ARGB_8888)
         solidCache = bmp
+        solidCacheSparseSpec = null
         solidCacheColor = color
+        solidCacheW = w
+        solidCacheH = h
+        solidCacheStrength = strengthPct
+        solidCacheRgb = rgb
+        solidCacheWhiteBalanceRgb = whiteBalanceRgb
+        solidCacheCorrectionMaxAttenuation = correctionMaxAttenuation
+        solidCacheWhiteBalanceMaxAttenuation = whiteBalanceMaxAttenuation
+        solidCacheGamma = outputGamma
+        return bmp
+    }
+
+    /**
+     * 보정을 켠 희소 패턴: 켜진 픽셀에만 [correctedSolidBitmap]과 같은 코드 gain을 곱한다. 점 하나는
+     * 디더링할 이웃이 없으므로 반올림한다. 단색 캐시 자리를 같이 써서(둘 중 하나만 필요) 힙을 아낀다.
+     */
+    private fun correctedSparseBitmap(spec: PatternSpec, w: Int, h: Int, rgb: Bitmap?, whiteBalanceRgb: Bitmap?): Bitmap {
+        solidCache?.let { cached ->
+            if (
+                solidCacheSparseSpec == spec && solidCacheW == w && solidCacheH == h &&
+                solidCacheStrength == strengthPct && solidCacheRgb === rgb &&
+                solidCacheWhiteBalanceRgb === whiteBalanceRgb &&
+                solidCacheCorrectionMaxAttenuation == correctionMaxAttenuation &&
+                solidCacheWhiteBalanceMaxAttenuation == whiteBalanceMaxAttenuation &&
+                solidCacheGamma == outputGamma
+            ) {
+                return cached
+            }
+        }
+        clearSolidCache()
+        val correctionMap = scaledMap(rgb, w, h)
+        val whiteBalanceMap = scaledMap(whiteBalanceRgb, w, h)
+        val correctionRow = correctionMap?.let { IntArray(w) }
+        val whiteBalanceRow = whiteBalanceMap?.let { IntArray(w) }
+        val strength = strengthPct / 100.0
+        val correctionMaxAtt = correctionMaxAttenuation
+        val whiteBalanceMaxAtt = whiteBalanceMaxAttenuation
+        val gamma = outputGamma
+        val codeGainLut = DoubleArray(256 * 256) { k ->
+            val lum = (1.0 - (k shr 8) / 255.0 * correctionMaxAtt * strength) *
+                (1.0 - (k and 0xFF) / 255.0 * whiteBalanceMaxAtt * strength)
+            OutputTransfer.codeGain(lum, gamma)
+        }
+        val out = IntArray(w * h) { Color.BLACK }
+        val color = spec.color
+        for (y in 0 until h) {
+            var rowLoaded = false
+            for (x in 0 until w) {
+                if (!spec.sparseLit(x, y)) continue
+                if (!rowLoaded) {
+                    if (correctionRow != null) correctionMap?.getPixels(correctionRow, 0, w, 0, y, w, 1)
+                    if (whiteBalanceRow != null) whiteBalanceMap?.getPixels(whiteBalanceRow, 0, w, 0, y, w, 1)
+                    rowLoaded = true
+                }
+                var px = 0xFF000000.toInt()
+                for (channel in 0 until 3) {
+                    val shift = 16 - 8 * channel
+                    val base = (color shr shift) and 0xFF
+                    if (base == 0) continue
+                    val c = if (correctionRow != null) (correctionRow[x] shr shift) and 0xFF else 0
+                    val wbv = if (whiteBalanceRow != null) (whiteBalanceRow[x] shr shift) and 0xFF else 0
+                    val v = Math.round(base * codeGainLut[(c shl 8) or wbv]).toInt().coerceIn(0, 255)
+                    px = px or (v shl shift)
+                }
+                out[y * w + x] = px
+            }
+        }
+        if (correctionMap != null && correctionMap !== rgb) correctionMap.recycle()
+        if (whiteBalanceMap != null && whiteBalanceMap !== whiteBalanceRgb) whiteBalanceMap.recycle()
+        val bmp = Bitmap.createBitmap(out, w, h, Bitmap.Config.ARGB_8888)
+        solidCache = bmp
+        solidCacheSparseSpec = spec
+        solidCacheColor = 0
         solidCacheW = w
         solidCacheH = h
         solidCacheStrength = strengthPct
@@ -334,6 +431,7 @@ class PatternView(context: Context) : View(context) {
     private fun clearSolidCache() {
         solidCache?.recycle()
         solidCache = null
+        solidCacheSparseSpec = null
         solidCacheRgb = null
         solidCacheWhiteBalanceRgb = null
     }
