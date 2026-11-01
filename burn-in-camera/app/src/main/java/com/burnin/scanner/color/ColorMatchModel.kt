@@ -296,6 +296,37 @@ internal class DisplayModel(val black: Rgb, val primaries: Array<Rgb>, val curve
 }
 
 /**
+ * 대조설비가 없을 때 쓰는 가상 기준 화면: 이상적인 sRGB 디스플레이(sRGB primaries, sRGB EOTF).
+ *
+ * 카메라 RGB를 선형 sRGB로 보는 기존 근사를 그대로 따른다. 따라서 primary는 카메라 축 단위벡터,
+ * 흰색은 카메라 무채색(1,1,1)이다. 카메라 WB는 조정 기기 흰 화면에서 수렴한 AWB 값으로 고정되므로
+ * 흰점은 절대 D65가 아니라 "카메라가 무채색으로 보는 흰색"에 맞춰지고, 감마·채널 곡선·primary
+ * 간섭·회색 계조 색틀어짐이 sRGB 쪽으로 보정된다.
+ */
+internal object VirtualSrgbReference {
+    const val NAME = "sRGB D65 가상 기준 (대조설비 없음)"
+
+    fun srgbEotf(v: Double): Double =
+        if (v <= 0.04045) v / 12.92 else ((v + 0.055) / 1.055).pow(2.4)
+
+    /** @param whiteLevel 가상 흰색의 채널 값 (보통 조정 기기 흰색 실측의 luma). @param black 가상 검정. */
+    fun model(whiteLevel: Double, black: Rgb = Rgb.ZERO): DisplayModel {
+        require(whiteLevel.isFinite() && whiteLevel > 0) { "가상 기준 흰색 레벨이 유효하지 않습니다" }
+        val xs = DoubleArray(ColorPatchPlan.LEVELS.size) { ColorPatchPlan.LEVELS[it] / 255.0 }
+        val ys = DoubleArray(xs.size) { srgbEotf(xs[it]) }
+        val primaries = arrayOf(Rgb(whiteLevel, 0.0, 0.0), Rgb(0.0, whiteLevel, 0.0), Rgb(0.0, 0.0, whiteLevel))
+        return DisplayModel(black, primaries, Array(3) { ToneCurve(xs, ys) })
+    }
+
+    /** 패치별 가상 "실측값" (black 포함). 실측 대조설비 값과 같은 자리에 넣어 쓴다. */
+    fun measurements(model: DisplayModel, patches: List<ColorPatchPlan.Patch>): LinkedHashMap<String, Rgb> {
+        val out = LinkedHashMap<String, Rgb>()
+        for (p in patches) out[p.id] = model.predict(p.codes)
+        return out
+    }
+}
+
+/**
  * 조정 기기의 코드값 c' 를 골라 M_adj(c') - K_adj ≈ scale · (M_ref(c) - K_ref) 가 되게 한다.
  *
  * 화면은 밝게 올릴 수 없으므로 scale ≤ 1 범위에서 "기준 기기 흰색이 조정 기기 gamut에 들어가는

@@ -172,8 +172,8 @@ class MainActivity : Activity() {
 
     private fun updateActionButtons() {
         btnMeasure.isEnabled = Session.client?.isConnected == true
-        btnColorCalibrate.isEnabled =
-            Session.client?.isConnected == true && Session.referenceClient?.isConnected == true
+        // 대조설비는 선택: 없으면 색감 맞추기가 sRGB 가상 기준으로 동작한다.
+        btnColorCalibrate.isEnabled = Session.client?.isConnected == true
     }
 
     override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, results: IntArray) {

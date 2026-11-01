@@ -66,7 +66,7 @@ class ColorCalibrationActivity : Activity() {
     /** 근사 Lab의 기준 흰색 = 목표 흰색(기준 기기 실측 흰색 × scale). */
     private var labWhite = Rgb(1.0, 1.0, 1.0)
 
-    private class Quads(val ref: ScreenDetector.Quad, val adj: ScreenDetector.Quad)
+    private class Quads(val ref: ScreenDetector.Quad?, val adj: ScreenDetector.Quad)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -122,11 +122,14 @@ class ColorCalibrationActivity : Activity() {
 
     private suspend fun runMatch() {
         val adjust = Session.client ?: error("조정설비가 연결되지 않았습니다")
-        val reference = Session.referenceClient ?: error("대조설비(A급 기준 기기)가 연결되지 않았습니다")
+        // 대조설비가 없으면 이상적인 sRGB 화면을 가상 기준으로 삼는다.
+        val reference = Session.referenceClient?.takeIf { it.isConnected }
+        val referenceName = if (reference != null) Session.referenceName else VirtualSrgbReference.NAME
         val cap = capture ?: error("카메라가 준비되지 않았습니다")
         val startedAt = System.currentTimeMillis()
         resultLog.setLength(0)
-        log("기준: ${Session.referenceName} / 조정: ${Session.targetName}")
+        log("기준: $referenceName / 조정: ${Session.targetName}")
+        if (reference == null) log("대조설비 없음: sRGB 목표로 맞춥니다. 흰점은 카메라 AWB 기준이라 절대 D65는 아닙니다.")
 
         status("이전 색 프로파일·화이트밸런스 제거, 번인 보정 ON...")
         withContext(Dispatchers.IO) {
@@ -137,7 +140,7 @@ class ColorCalibrationActivity : Activity() {
                 .onFailure { AppLog.i("화이트밸런스 초기화 생략: ${it.message}") }
             runCatching { adjust.command(Protocol.CMD_ENABLE_CORRECTION, "strength" to 100) }
                 .onFailure { log("번인 보정맵 없음/OFF 상태로 측정: ${it.message}") }
-            reference.showPattern(WHITE_PATTERN)
+            reference?.showPattern(WHITE_PATTERN)
             adjust.showPattern(WHITE_PATTERN)
         }
         delay(SETTLE_MS)
@@ -151,22 +154,27 @@ class ColorCalibrationActivity : Activity() {
 
         val white = ColorPatchPlan.Patch("gray255", 255, 255, 255, ColorPatchPlan.Role.GRAY)
         val nativePatches = ColorPatchPlan.fitPatches() + ColorPatchPlan.VALIDATION
-        val refNative = LinkedHashMap<String, Rgb>()
+        var refNative = LinkedHashMap<String, Rgb>()
         val adjNative = LinkedHashMap<String, Rgb>()
         nativePatches.forEachIndexed { i, p ->
             status("원본 측정 ${i + 1}/${nativePatches.size}: ${p.id}")
-            refNative[p.id] = measure(reference, adjust, p.pattern, quads.ref)
+            if (reference != null) refNative[p.id] = measure(reference, adjust, p.pattern, quads.ref!!)
             adjNative[p.id] = measure(adjust, reference, p.pattern, quads.adj)
         }
 
         status("화면 모델 적합...")
-        val refModel = fitModel(refNative)
         val adjModel = fitModel(adjNative)
+        val refModel = if (reference != null) fitModel(refNative) else {
+            val whiteLevel = (adjNative.getValue(white.id) - adjModel.black).luma()
+            VirtualSrgbReference.model(whiteLevel, adjModel.black).also {
+                refNative = VirtualSrgbReference.measurements(it, nativePatches)
+            }
+        }
         val matcher = ColorMatcher(refModel, adjModel, refNative.getValue(white.id), adjNative.getValue(white.id))
         labWhite = matcher.targetFromMeasured(refNative.getValue(white.id))
         log("상대 밝기 배율 scale ${fmt3(matcher.scale)} (조정 기기가 기준 흰색을 낼 수 있는 최대 배율)")
         var lut = withContext(Dispatchers.Default) { matcher.bakeLut() }
-        sendProfile(adjust, lut, matcher.scale)
+        sendProfile(adjust, lut, matcher.scale, referenceName)
 
         val grays = ColorPatchPlan.LEVELS
         val refGray = grays.map { refNative.getValue("gray$it") }
@@ -180,7 +188,7 @@ class ColorCalibrationActivity : Activity() {
             refineLog.put(JSONObject().put("iteration", iter).put("grayMeanDeltaE00", err.average()))
             log("회색 보정 ${iter + 1}: 적용 중 회색 평균 ΔE00 ${fmt2(err.average())}")
             lut = withContext(Dispatchers.Default) { matcher.refinePost(lut, grays, refGray, adjGray) }
-            sendProfile(adjust, lut, matcher.scale)
+            sendProfile(adjust, lut, matcher.scale, referenceName)
         }
 
         val evalPatches = ColorPatchPlan.grayPatches() + ColorPatchPlan.VALIDATION
@@ -190,11 +198,14 @@ class ColorCalibrationActivity : Activity() {
             adjAfter[p.id] = measure(adjust, reference, p.pattern, quads.adj)
         }
 
-        status("drift 확인...")
-        val refWhiteEnd = measure(reference, adjust, white.pattern, quads.ref)
         val refWhiteStart = refNative.getValue(white.id)
-        val drift = (refWhiteEnd.luma() - refWhiteStart.luma()) / refWhiteStart.luma()
-        log("기준 흰색 drift ${pct(drift)}" + if (kotlin.math.abs(drift) > DRIFT_WARN) " — 측정 중 화면/카메라가 변했습니다. 결과를 신뢰하기 어렵습니다." else "")
+        val drift: Double? = if (reference != null) {
+            status("drift 확인...")
+            val refWhiteEnd = measure(reference, adjust, white.pattern, quads.ref!!)
+            ((refWhiteEnd.luma() - refWhiteStart.luma()) / refWhiteStart.luma()).also { d ->
+                log("기준 흰색 drift ${pct(d)}" + if (kotlin.math.abs(d) > DRIFT_WARN) " — 측정 중 화면/카메라가 변했습니다. 결과를 신뢰하기 어렵습니다." else "")
+            }
+        } else null
 
         // 보정 전: 조정 기기 원본을 흰색 휘도 비로만 맞춰 비교(상대 일치 기준), 보정 후: 프로파일 적용 실측
         val adjWhiteSignal = adjNative.getValue(white.id) - adjModel.black
@@ -232,7 +243,8 @@ class ColorCalibrationActivity : Activity() {
         val lutBytes = lut.encode()
         val report = JSONObject()
             .put("type", "color_match")
-            .put("referenceDevice", Session.referenceName)
+            .put("referenceDevice", referenceName)
+            .put("referenceMode", if (reference != null) "device" else "virtual_srgb")
             .put("adjustmentDevice", Session.targetName)
             .put("scannerDevice", "${Build.MANUFACTURER} ${Build.MODEL}")
             .put("camera", cap.manualExposureText())
@@ -241,7 +253,7 @@ class ColorCalibrationActivity : Activity() {
             .put("lut", JSONObject().put("size", lut.size).put("format", ColorLut.FORMAT).put("checksumMd5", md5(lutBytes)))
             .put("referencePrimaries", JSONArray(refModel.primaries.map { rgbJson(it) }))
             .put("adjustmentPrimaries", JSONArray(adjModel.primaries.map { rgbJson(it) }))
-            .put("referenceWhiteDrift", drift)
+            .put("referenceWhiteDrift", drift ?: JSONObject.NULL)
             .put("refinement", refineLog)
             .put("summary", JSONObject()
                 .put("validationBefore", vb).put("validationAfter", va)
@@ -259,12 +271,15 @@ class ColorCalibrationActivity : Activity() {
                 "ΔE00은 카메라 RGB를 선형 sRGB로 가정한 근사값",
                 "두 기기 위치의 비네팅 차이 때문에 절대 밝기는 맞추지 않고 상대 밝기만 맞춤",
                 "프로파일은 Target 앱 자체 렌더링에만 적용됨",
-            )))
+            ) + if (reference == null) listOf(
+                "대조설비 없음: 이상적인 sRGB 화면을 가상 기준으로 사용. 흰점은 카메라 AWB 고정값 기준이라 절대 D65가 아님",
+                "대조설비 없음: 기준 흰색 drift를 잴 수 없음",
+            ) else emptyList()))
         withContext(Dispatchers.IO) {
             val dir = ReportStore.newSessionDir(this@ColorCalibrationActivity)
             ReportStore.save(dir, report, mapOf("color_lut.bin" to lutBytes))
             log("리포트 저장: ${dir.absolutePath}")
-            reference.showPattern(WHITE_PATTERN)
+            reference?.showPattern(WHITE_PATTERN)
             adjust.showPattern(WHITE_PATTERN)
         }
         profileEnabled = true
@@ -272,17 +287,21 @@ class ColorCalibrationActivity : Activity() {
         status("색감 맞추기 완료 — [색감 보정 ON/OFF]로 두 기기를 비교하세요")
     }
 
-    private suspend fun detectQuads(adjust: ControlClient, reference: ControlClient): Quads {
-        val ref = detectQuad(reference, adjust, "대조설비")
+    private suspend fun detectQuads(adjust: ControlClient, reference: ControlClient?): Quads {
         val adj = detectQuad(adjust, reference, "조정설비")
+        if (reference == null) {
+            log("화면 검출: 조정설비 $adj")
+            return Quads(null, adj)
+        }
+        val ref = detectQuad(reference, adjust, "대조설비")
         require(!ColorSampling.overlaps(ref, adj)) { "두 기기 화면이 같은 위치로 검출되었습니다. 두 화면이 모두 프레임에 들어오게 배치하세요" }
         log("화면 검출: 대조설비 $ref, 조정설비 $adj")
         return Quads(ref, adj)
     }
 
-    private suspend fun detectQuad(lit: ControlClient, dark: ControlClient, name: String): ScreenDetector.Quad {
+    private suspend fun detectQuad(lit: ControlClient, dark: ControlClient?, name: String): ScreenDetector.Quad {
         withContext(Dispatchers.IO) {
-            dark.showPattern("black")
+            dark?.showPattern("black")
             lit.showPattern(WHITE_PATTERN)
         }
         delay(SWITCH_SETTLE_MS)
@@ -293,10 +312,11 @@ class ColorCalibrationActivity : Activity() {
     }
 
     /** 흰색(255)에서 두 화면 중 밝은 쪽 최대 채널이 TARGET_PEAK 근처가 되게 노출을 맞춘다 (포화·신호 부족 방지). */
-    private suspend fun adjustExposure(cap: CaptureController, adjust: ControlClient, reference: ControlClient, quads: Quads) {
+    private suspend fun adjustExposure(cap: CaptureController, adjust: ControlClient, reference: ControlClient?, quads: Quads) {
         val white = ColorPatchPlan.patternName(255, 255, 255)
         repeat(4) {
-            val peak = maxOf(measure(reference, adjust, white, quads.ref).max(), measure(adjust, reference, white, quads.adj).max())
+            val refPeak = if (reference != null) measure(reference, adjust, white, quads.ref!!).max() else 0.0
+            val peak = maxOf(refPeak, measure(adjust, reference, white, quads.adj).max())
             if (peak in MIN_PEAK..MAX_PEAK) {
                 log("노출 확인: 흰색 최대 채널 ${fmt3(peak)} (${cap.manualExposureText()})")
                 return
@@ -310,9 +330,9 @@ class ColorCalibrationActivity : Activity() {
         }
     }
 
-    private suspend fun measure(lit: ControlClient, dark: ControlClient, pattern: String, quad: ScreenDetector.Quad): Rgb {
+    private suspend fun measure(lit: ControlClient, dark: ControlClient?, pattern: String, quad: ScreenDetector.Quad): Rgb {
         withContext(Dispatchers.IO) {
-            dark.showPattern("black")
+            dark?.showPattern("black")
             lit.showPattern(pattern)
         }
         delay(SWITCH_SETTLE_MS)
@@ -336,7 +356,7 @@ class ColorCalibrationActivity : Activity() {
     private fun deltaE(matcher: ColorMatcher, refMeasured: Rgb, adjSignal: Rgb): Double =
         ColorDifference.deltaE2000(matcher.targetFromMeasured(refMeasured), adjSignal, labWhite)
 
-    private suspend fun sendProfile(adjust: ControlClient, lut: ColorLut, scale: Double) {
+    private suspend fun sendProfile(adjust: ControlClient, lut: ColorLut, scale: Double, referenceName: String) {
         val bytes = withContext(Dispatchers.Default) { lut.encode() }
         withContext(Dispatchers.IO) {
             adjust.request(
@@ -346,7 +366,7 @@ class ColorCalibrationActivity : Activity() {
                     .put("format", ColorLut.FORMAT)
                     .put("checksumMd5", md5(bytes))
                     .put("sourceDevice", "${Build.MANUFACTURER} ${Build.MODEL}")
-                    .put("referenceDevice", Session.referenceName)
+                    .put("referenceDevice", referenceName)
                     .put("scale", scale)
                     .put("data", Base64.encodeToString(bytes, Base64.NO_WRAP)),
                 timeoutMs = 60_000,

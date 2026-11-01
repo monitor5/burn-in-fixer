@@ -123,6 +123,37 @@ class ColorMatchModelTest {
         }
     }
 
+    @Test fun virtualSrgbReferenceFollowsSrgbEotfAndUnitPrimaries() {
+        val black = Rgb(0.01, 0.01, 0.01)
+        val model = VirtualSrgbReference.model(0.5, black)
+        val m = VirtualSrgbReference.measurements(model, ColorPatchPlan.fitPatches() + ColorPatchPlan.VALIDATION)
+        assertEquals(0.01, m.getValue("black").r, 1e-12)
+        assertEquals(0.51, m.getValue("gray255").g, 1e-9)
+        assertEquals(0.01 + 0.5 * VirtualSrgbReference.srgbEotf(128 / 255.0), m.getValue("r128").r, 1e-9)
+        assertEquals(0.01, m.getValue("r128").g, 1e-12)
+        assertEquals(0.214, VirtualSrgbReference.srgbEotf(0.5), 1e-3)
+    }
+
+    @Test fun matchingToVirtualSrgbReducesErrorAgainstIdealSrgbPanel() {
+        // 대조설비 없이 노후 패널을 이상적인 sRGB 화면(카메라 축 primary, sRGB 감마)으로 맞춘다.
+        val adj = fitModel(::measureAdj)
+        val whiteCodes = doubleArrayOf(1.0, 1.0, 1.0)
+        val adjWhite = measureAdj(whiteCodes)
+        val ref = VirtualSrgbReference.model((adjWhite - adj.black).luma(), adj.black)
+        val matcher = ColorMatcher(ref, adj, ref.predict(whiteCodes), adjWhite)
+        val labWhite = matcher.targetFromMeasured(ref.predict(whiteCodes))
+        fun err(lut: ColorLut?) = ColorPatchPlan.VALIDATION.map { p ->
+            val target = matcher.targetFromMeasured(ref.predict(p.codes))
+            val shown = lut?.apply8(p.r, p.g, p.b)?.let { o -> DoubleArray(3) { o[it] / 255.0 } } ?: p.codes
+            var got = measureAdj(shown) - adj.black
+            if (lut == null) got = got * (labWhite.luma() / (adjWhite - adj.black).luma())
+            ColorDifference.deltaE2000(target, got, labWhite)
+        }.average()
+        val before = err(null)
+        val after = err(matcher.bakeLut())
+        assertTrue("virtual sRGB before=$before after=$after", after < before * 0.5)
+    }
+
     @Test fun dimmerUniformPanelOnlyNeedsNoChangeInRelativeMode() {
         // 전체가 균일하게 어두운 패널(또는 비네팅 차이)은 상대 일치에서 보정이 필요 없다.
         val ref = fitModel(::measureRef)

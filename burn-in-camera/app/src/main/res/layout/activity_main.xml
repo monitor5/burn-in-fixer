@@ -9,7 +9,7 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:textSize="14sp"
-        android:text="조정설비와 대조설비에 표시된 IP를 입력하고 연결하세요. 세 기기는 같은 Wi-Fi에 있어야 합니다." />
+        android:text="조정설비에 표시된 IP를 입력하고 연결하세요. 대조설비는 선택이며, 연결할 기기는 모두 같은 Wi-Fi에 있어야 합니다." />
 
     <TextView
         android:layout_width="match_parent"
@@ -53,7 +53,7 @@
         android:layout_height="wrap_content"
         android:layout_marginTop="8dp"
         android:textStyle="bold"
-        android:text="대조설비" />
+        android:text="대조설비 (선택)" />
 
     <LinearLayout
         android:layout_width="match_parent"
@@ -99,7 +99,7 @@
         android:layout_height="wrap_content"
         android:layout_marginTop="6dp"
         android:enabled="false"
-        android:text="색감 맞추기 (대조설비 기준)" />
+        android:text="색감 맞추기 (대조설비 없으면 sRGB 기준)" />
 
     <TextView
         android:layout_width="match_parent"
