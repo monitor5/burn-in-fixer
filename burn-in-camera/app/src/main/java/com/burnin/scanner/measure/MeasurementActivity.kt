@@ -69,8 +69,6 @@ class MeasurementActivity : Activity() {
 
     companion object {
         private const val FRAMES_PER_PATTERN = 5
-        /** 초기 측정의 희소 점등을 R·G·B 점으로 따로 잰다(서브픽셀별 픽셀 단위 층). */
-        private const val STROKE_DETAIL_RGB = true
         /** 색 균일화(화이트밸런스 레이어) 최대 감쇠. 탭 앱 WhiteBalanceStore 기본값과 같다. */
         private const val CHROMA_MAX_ATTENUATION = 0.10f
         /** 저주파(잔여 비네팅·색 얼룩) 블록 수: 긴 변 기준. */
@@ -144,6 +142,8 @@ class MeasurementActivity : Activity() {
     /** 보정 감쇠 상한(0~1). 측정 시작 때 '최대 감쇠(%)' 입력에서 읽는다. */
     private var maxAttenuation = DEFAULT_MAX_ATTENUATION
     private lateinit var editMaxAtt: EditText
+    /** 초기 측정의 희소 점등을 R·G·B 점으로 따로 잴지(끄면 흰 점). 원인 분리 비교용으로 화면에서 바꾼다. */
+    private lateinit var chkRgbDots: CheckBox
     private lateinit var btnVignette: Button
     private lateinit var txtVignette: TextView
     /** 3위치 비네팅 보정 결과(카메라별 저장). 있으면 측정의 카메라 flat-field로 쓴다. */
@@ -262,6 +262,7 @@ class MeasurementActivity : Activity() {
         }
         loadVignetteModel()
         editMaxAtt = findViewById(R.id.editMaxAtt)
+        chkRgbDots = findViewById(R.id.chkRgbDots)
         findViewById<Button>(R.id.btnCheckAtt).setOnClickListener {
             btnStart.isEnabled = false
             btnExtra.isEnabled = false
@@ -704,7 +705,7 @@ class MeasurementActivity : Activity() {
         chromaBefore = null
         resultLog.clear()
         log("대상: ${Session.targetName} (${screenW}x${screenH})")
-        log("보정 감쇠 상한: ${pct(maxAttenuation)}")
+        log("보정 감쇠 상한: ${pct(maxAttenuation)}, 희소 점: ${if (chkRgbDots.isChecked) "R·G·B 따로" else "흰 점"}, 비네팅 보정값: ${if (vignetteModel != null) "사용" else "없음(방사형 추정)"}")
         selectAnalysisResolution(cap)
 
         // ── 1. 기준 패턴 + 노출 잠금 ─────────────────────────────
@@ -1005,7 +1006,7 @@ class MeasurementActivity : Activity() {
 
         // ── 4.5 희소 점등 측광: 글씨 획·버튼 테두리 단위 고주파 층 ──────
         val strokeDetail = if (STROKE_DETAIL_ENABLED) {
-            if (STROKE_DETAIL_RGB) {
+            if (chkRgbDots.isChecked) {
                 measureStrokeDetailRgb(client, cap, homography, screenW, screenH, gw, gh, smoothRadius, confidence70, lumaBefore)
             } else {
                 measureStrokeDetail(client, cap, homography, screenW, screenH, gw, gh, smoothRadius, confidence70, lumaBefore)

@@ -136,6 +136,14 @@
             android:maxLines="1"
             android:text="10" />
 
+        <CheckBox
+            android:id="@+id/chkRgbDots"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:checked="true"
+            android:textSize="12sp"
+            android:text="RGB점" />
+
         <Button
             android:id="@+id/btnCheckAtt"
             android:layout_width="0dp"
