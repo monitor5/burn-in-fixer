@@ -391,11 +391,16 @@ class MeasurementActivity : Activity() {
         var markerTriFrames: Map<String, CaptureFrame> = emptyMap()
         val markerOrientation = try {
             withContext(Dispatchers.IO) { client.showPattern("marker") }
-            delay(800)
+            delay(500)
             val markerAvg = captureAveraged(cap)
             if (cap.isTriActive) {
                 // 보조 화각도 방향 판별이 필요하다 (교차 그리드 180° 뒤집힘 방지)
-                markerTriFrames = runCatching { cap.captureTriFrames() }.getOrDefault(emptyMap())
+                val frames = LinkedHashMap(runCatching { cap.captureTriFrames() }.getOrDefault(emptyMap()))
+                if (cap.hasSequentialRoles) {
+                    runCatching { cap.captureSequential(1, 0L) { role, frame -> frames[role] = frame } }
+                        .onFailure { log("보조 화각 마커 번갈아 촬영 실패: ${it.message}") }
+                }
+                markerTriFrames = frames
             }
             withContext(Dispatchers.Default) {
                 Analyzer.buildHomographyWithMarker(det.quad, markerAvg, screenW, screenH)
@@ -421,7 +426,7 @@ class MeasurementActivity : Activity() {
         status("2/10 dot-grid 기준점 촬영, 호모그래피 보강...")
         val dotGrid = try {
             withContext(Dispatchers.IO) { client.showPattern("dotgrid") }
-            delay(800)
+            delay(500)
             val dotAvg = captureAveraged(cap)
             withContext(Dispatchers.Default) {
                 DotGridDetector.refineHomography(dotAvg, initialHomography, screenW, screenH)
@@ -446,7 +451,7 @@ class MeasurementActivity : Activity() {
         // ── 3. 블랙 오프셋 (활성 화각 전체 동시 캡처) ─────────────
         status("3/10 black 패턴 촬영 (오프셋/미광 검증)...")
         withContext(Dispatchers.IO) { client.showPattern("black") }
-        delay(700)
+        delay(500)
         val triBlackStores = captureTriStores(cap, FRAMES_PER_PATTERN)
         val blackStore = triBlackStores.getValue(CameraEnumerator.ROLE_MAIN)
         val blackAvg = averageGrayFromStore(blackStore)
@@ -1890,6 +1895,19 @@ class MeasurementActivity : Activity() {
                         interFrameDelayMs +
                             FLICKER_PHASE_JITTER_MS[index % FLICKER_PHASE_JITTER_MS.size],
                     )
+                }
+            }
+            if (cap.hasSequentialRoles) {
+                // 동시 오픈이 막힌 보조 화각은 메인 촬영이 끝난 뒤 같은 패턴에서 번갈아 찍는다.
+                status("보조 화각 번갈아 촬영 (${frameCount}장)...")
+                cap.captureSequential(frameCount, interFrameDelayMs) { role, frame ->
+                    if (frame.timestampNs > 0L) {
+                        if (!firstTs.containsKey(role)) firstTs[role] = frame.timestampNs
+                        lastTs[role] = frame.timestampNs
+                    }
+                    val file = File.createTempFile("capture_${role}_${System.nanoTime()}_", ".bin", cacheDir)
+                    filesByRole.getOrPut(role) { ArrayList() } += file
+                    writeCaptureFrame(file, frame)
                 }
             }
             val wallSpanMs = (System.currentTimeMillis() - wallStartMs).coerceAtLeast(0L)

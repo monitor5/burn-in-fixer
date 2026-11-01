@@ -85,19 +85,30 @@ class CaptureController(
     /** 동시 3각 촬영용 보조 화각 리더 (role → reader). 비어 있으면 메인 단독. */
     private val extraReaders = LinkedHashMap<String, ImageReader>()
     private val standaloneCameras = LinkedHashMap<String, StandaloneCamera>()
+    /** 동시 오픈이 막힌 보조 화각: 메인을 잠시 닫고 번갈아 연다 (role → choice). */
+    private val sequentialRoles = LinkedHashMap<String, CameraEnumerator.CameraChoice>()
     private var triSelection: CameraEnumerator.TriSelection? = null
     private val setupNotes = ArrayList<String>()
 
     /** 마지막 동시 촬영에서 물리 카메라별 실제 노출(ns). 플리커 싱크 검증용. */
     private val lastPhysicalExposureNs = LinkedHashMap<String, Long>()
 
-    val isTriActive: Boolean get() = extraReaders.isNotEmpty() || standaloneCameras.isNotEmpty()
+    val isTriActive: Boolean
+        get() = extraReaders.isNotEmpty() || standaloneCameras.isNotEmpty() || sequentialRoles.isNotEmpty()
+
+    /** 번갈아 촬영하는 보조 화각이 있는지. 있으면 [captureSequential]로 따로 찍어야 한다. */
+    val hasSequentialRoles: Boolean get() = sequentialRoles.isNotEmpty()
 
     /** 보조 화각 프리뷰가 실제로 흘러가고 있는지. */
     val isAuxPreviewActive: Boolean get() = isTriActive && auxPreviewSurface != null
 
+    private companion object {
+        /** 번갈아 촬영 시 보조 카메라를 연 뒤 AF·센서가 안정될 때까지 기다리는 시간. */
+        const val SEQUENTIAL_SETTLE_MS = 700L
+    }
+
     val activeRoles: List<String>
-        get() = listOf(CameraEnumerator.ROLE_MAIN) + extraReaders.keys + standaloneCameras.keys
+        get() = listOf(CameraEnumerator.ROLE_MAIN) + extraReaders.keys + standaloneCameras.keys + sequentialRoles.keys
 
     fun triSummary(): String {
         val tri = triSelection ?: return "메인 단독 [$cameraId]"
@@ -105,10 +116,15 @@ class CaptureController(
             .filter { (role, _) ->
                 role == CameraEnumerator.ROLE_MAIN ||
                     extraReaders.containsKey(role) ||
-                    standaloneCameras.containsKey(role)
+                    standaloneCameras.containsKey(role) ||
+                    sequentialRoles.containsKey(role)
             }
             .joinToString(" + ") { (role, c) ->
-                val mode = if (standaloneCameras.containsKey(role)) ", 독립동시오픈" else ""
+                val mode = when {
+                    standaloneCameras.containsKey(role) -> ", 독립동시오픈"
+                    sequentialRoles.containsKey(role) -> ", 번갈아촬영"
+                    else -> ""
+                }
                 "$role[${c.key}] FOV ${c.fovDeg.toInt()}°$mode"
             }
     }
@@ -245,6 +261,7 @@ class CaptureController(
         extraReaders.clear()
         standaloneCameras.values.forEach { runCatching { it.close() } }
         standaloneCameras.clear()
+        sequentialRoles.clear()
         if (tri != null) {
             for ((role, choice) in tri.roles()) {
                 if (role == CameraEnumerator.ROLE_MAIN) continue
@@ -294,7 +311,10 @@ class CaptureController(
             for ((role, choice) in tri.roles()) {
                 if (!tri.isStandalone(role)) continue
                 val standalone = runCatching { openStandaloneCamera(role, choice) }
-                    .onFailure { setupNotes += "독립 $role[${choice.key}] 동시 오픈 실패: ${it.message}" }
+                    .onFailure {
+                        setupNotes += "독립 $role[${choice.key}] 동시 오픈 실패: ${it.message} — 메인과 번갈아 촬영으로 전환"
+                        sequentialRoles[role] = choice
+                    }
                     .getOrNull()
                 if (standalone != null) {
                     standaloneCameras[role] = standalone
@@ -305,18 +325,29 @@ class CaptureController(
                 // 동시 오픈이 보장되지 않는 기기는 두 번째 카메라를 열 때 메인을 끊어 버린다.
                 delay(500)
                 if (mainLost) {
-                    val notes = setupNotes.toList()
-                    closeCameras()
-                    start(null)
-                    setupNotes.addAll(0, notes)
-                    setupNotes += "보조 카메라를 열자 메인 카메라가 끊김 — 이 기기는 동시 오픈 불가, 메인 단독으로 폴백"
-                    return
+                    // 동시에 둘 다 쥘 수 없다: 보조를 닫고 메인을 다시 연 뒤 번갈아 촬영으로 쓴다.
+                    standaloneCameras.forEach { (role, cam) ->
+                        sequentialRoles[role] = cam.choice
+                        runCatching { cam.close() }
+                    }
+                    standaloneCameras.clear()
+                    setupNotes += "보조 카메라를 열자 메인 카메라가 끊김 — 메인과 번갈아 촬영으로 전환"
+                    reopenMain()
                 }
             }
         }
 
+        startMainPreview()
+        if (sequentialRoles.isNotEmpty() && auxPreviewSurface != null) {
+            // 정렬 확인용: 보조 화각을 한 번 열어 보조 프리뷰에 장면을 띄워 둔다.
+            runCatching { captureSequential(0, 0L) { _, _ -> } }
+                .onFailure { setupNotes += "보조 프리뷰 미리보기 실패: ${it.message}" }
+        }
+    }
+
+    private fun startMainPreview() {
         previewBuilder = device!!.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-            addTarget(pSurface)
+            addTarget(previewSurface!!)
             // 논리 멀티카메라 세션이면 보조 프리뷰도 같은 반복 요청으로 흘린다.
             if (auxPreviewRole?.let { it in extraReaders } == true) auxPreviewSurface?.let { addTarget(it) }
             set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
@@ -327,8 +358,128 @@ class CaptureController(
                 CameraMetadata.CONTROL_AE_ANTIBANDING_MODE_AUTO,
             )
             set(CaptureRequest.FLASH_MODE, CameraMetadata.FLASH_MODE_OFF)
+            // 번갈아 촬영 뒤 다시 열 때 잠금 상태를 이어 간다.
+            if (manualLocked) applyMeasurementControls(this)
+            else if (aeLocked) {
+                set(CaptureRequest.CONTROL_AE_LOCK, true)
+                set(CaptureRequest.CONTROL_AWB_LOCK, true)
+            }
         }
         session!!.setRepeatingRequest(previewBuilder.build(), previewCallback, handler)
+    }
+
+    /** 메인 카메라(와 같은 논리 카메라의 보조 스트림)를 다시 열고 프리뷰를 이어 간다. */
+    private suspend fun reopenMain() {
+        runCatching { session?.close() }
+        runCatching { device?.close() }
+        session = null
+        device = null
+        mainLost = false
+        device = openCamera()
+        val tri = triSelection
+        session = if (tri != null && extraReaders.isNotEmpty() && Build.VERSION.SDK_INT >= 28) {
+            createTriSession(tri, previewSurface!!, auxPreviewSurface?.takeIf { auxPreviewRole in extraReaders })
+        } else {
+            createSession(listOf(previewSurface!!, reader!!.surface))
+        }
+        startMainPreview()
+    }
+
+    /**
+     * 동시 오픈이 막힌 보조 화각을 메인과 번갈아 촬영한다. 메인을 닫고 보조를 같은 수동 노출·
+     * 화이트밸런스·톤커브로 열어 [count]장을 찍은 뒤 메인을 다시 연다. 화면 패턴은 그동안 그대로라
+     * 동시 촬영과 같은 장면을 다른 광학 경로로 기록한다(시점만 수 초 다름).
+     * 보조 프리뷰가 있으면 보조가 열려 있는 동안 그쪽이 살아 있고, 메인 프리뷰는 마지막 장면에 멈춘다.
+     */
+    suspend fun captureSequential(
+        count: Int,
+        interFrameDelayMs: Long,
+        onFrame: suspend (role: String, frame: CaptureFrame) -> Unit,
+    ) {
+        if (sequentialRoles.isEmpty()) return
+        runCatching { session?.stopRepeating() }
+        runCatching { session?.close() }
+        runCatching { device?.close() }
+        session = null
+        device = null
+        try {
+            for ((role, choice) in sequentialRoles) {
+                val cam = openSequentialCamera(role, choice)
+                try {
+                    // 보조 렌즈는 메인 초점거리를 쓸 수 없어 AF로 맞추고, 노출·WB·톤커브는 메인 값으로 고정한다.
+                    delay(SEQUENTIAL_SETTLE_MS)
+                    repeat(count) { i ->
+                        onFrame(role, captureSequentialFrame(cam))
+                        if (i != count - 1) delay(interFrameDelayMs)
+                    }
+                } finally {
+                    cam.close()
+                }
+            }
+        } finally {
+            reopenMain()
+        }
+    }
+
+    private suspend fun openSequentialCamera(role: String, choice: CameraEnumerator.CameraChoice): StandaloneCamera {
+        val rc = manager.getCameraCharacteristics(choice.openId)
+        val rMap = rc.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            ?: throw IllegalStateException("스트림 설정 없음")
+        // 번갈아 촬영은 한 번에 한 대만 쓰므로 보조도 최대 해상도로 받는다.
+        val rSize = rMap.getOutputSizes(ImageFormat.YUV_420_888)?.maxByOrNull { it.width.toLong() * it.height }
+            ?: throw IllegalStateException("YUV 출력 없음")
+        val sReader = ImageReader.newInstance(rSize.width, rSize.height, ImageFormat.YUV_420_888, 2)
+        val sDevice = try {
+            suspendCancellableCoroutine<CameraDevice> { cont -> openCameraById(choice.openId, cont) }
+        } catch (e: Exception) {
+            sReader.close()
+            throw e
+        }
+        val aux = auxPreviewSurface?.takeIf { role == auxPreviewRole }
+        val sSession = try {
+            createSession(sDevice, listOfNotNull(sReader.surface, aux))
+        } catch (e: Exception) {
+            runCatching { sDevice.close() }
+            sReader.close()
+            throw e
+        }
+        val repeating = sDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+            addTarget(aux ?: sReader.surface)
+            applySequentialControls(this)
+        }
+        if (aux != null) sSession.setRepeatingRequest(repeating.build(), null, handler)
+        else sSession.capture(repeating.build(), null, handler) // AF 시작용 한 장
+        return StandaloneCamera(role, choice, sDevice, sSession, sReader)
+    }
+
+    private suspend fun captureSequentialFrame(cam: StandaloneCamera): CaptureFrame = withTimeout(12_000) {
+        suspendCancellableCoroutine { cont ->
+            val r = cam.reader
+            r.setOnImageAvailableListener({ rd ->
+                val image = rd.acquireLatestImage() ?: return@setOnImageAvailableListener
+                try {
+                    val frame = image.toCaptureFrame()
+                    if (cont.isActive) cont.resume(frame)
+                } catch (e: Exception) {
+                    if (cont.isActive) cont.resumeWithException(e)
+                } finally {
+                    image.close()
+                    rd.setOnImageAvailableListener(null, null)
+                }
+            }, handler)
+            cont.invokeOnCancellation { handler.post { runCatching { r.setOnImageAvailableListener(null, null) } } }
+            val req = cam.device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                addTarget(r.surface)
+                applySequentialControls(this)
+            }
+            cam.session.capture(req.build(), standaloneCallback(cam.choice.key), handler)
+        }
+    }
+
+    /** 번갈아 촬영 보조 화각: 메인과 같은 노출·WB·톤커브, 초점만 AF. */
+    private fun applySequentialControls(builder: CaptureRequest.Builder) {
+        applyStandaloneMeasurementControls(builder)
+        builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
     }
 
     /** AE/AWB 잠금. 이후 모든 촬영이 같은 노출·화이트밸런스로 이루어진다. */
@@ -778,6 +929,8 @@ class CaptureController(
 
     private fun applyStandaloneMeasurementControls(builder: CaptureRequest.Builder) {
         builder.set(CaptureRequest.FLASH_MODE, CameraMetadata.FLASH_MODE_OFF)
+        // 디코더는 모든 프레임에 같은 톤커브 역변환을 쓰므로 보조 화각도 같은 곡선으로 찍는다.
+        applyToneControls(builder)
         if (manualLocked) {
             builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
             builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
@@ -873,6 +1026,7 @@ class CaptureController(
         runCatching { reader?.close() }
         standaloneCameras.values.forEach { runCatching { it.close() } }
         standaloneCameras.clear()
+        sequentialRoles.clear()
         extraReaders.values.forEach { runCatching { it.close() } }
         extraReaders.clear()
         releaseAuxPreview()
