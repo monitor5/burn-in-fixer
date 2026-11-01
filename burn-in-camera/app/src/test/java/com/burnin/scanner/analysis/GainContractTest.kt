@@ -73,7 +73,9 @@ class GainContractTest {
         val confidence=floatArrayOf(0f,.5f,1f)
         val mixed=Analyzer.mixGainGrids(FloatArray(3){1f},FloatArray(3){.9f},.8f,.1f)
         val limited=Analyzer.limitGainByConfidence(mixed,confidence,.1f)
-        assertArrayEquals(floatArrayOf(1f,.95f,.92f),limited,1e-6f)
+        // 신뢰도 0은 영구 마스크(감쇠 금지), 0.3 이상은 상한을 다 쓴다
+        assertArrayEquals(floatArrayOf(1f,.92f,.92f),limited,1e-6f)
+        assertEquals(1f,Analyzer.limitGainByConfidence(FloatArray(1){.92f},floatArrayOf(.05f),.1f)[0],0f)
         val next=Analyzer.refineGain(limited,FloatArray(3){1f},.5f,.3f,3,1,.1f)
         assertEquals(1f,Analyzer.limitGainByConfidence(next,confidence,.1f)[0],0f)
         assertArrayEquals(floatArrayOf(.92f,.92f,.92f),mixed,1e-6f)

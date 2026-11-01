@@ -885,15 +885,28 @@ object Analyzer {
         require(gain.size == confidence.size && gain.all { it.isFinite() && it in 0f..1f })
         requireConfidence(confidence)
         requireAttenuation(maxAtt)
-        return FloatArray(gain.size) { maxOf(gain[it], 1f - maxAtt * confidence[it]) }
+        return FloatArray(gain.size) { maxOf(gain[it], 1f - maxAtt * confidenceAllowance(confidence[it])) }
     }
+
+    /**
+     * 신뢰도 → 감쇠 허용 비율. 신뢰도에 비례해 깎으면(평균 신뢰도 55%면 상한의 절반만 씀) 번인이
+     * 덜 잡히고 전체만 어두워졌다. 0.1 이하는 막고(가림·반사 등 영구 마스크), 0.3 이상은 상한을 다 쓰며
+     * 그 사이는 부드럽게 잇는다.
+     */
+    fun confidenceAllowance(c: Float): Float {
+        val t = ((c - CONF_BLOCK) / (CONF_FULL - CONF_BLOCK)).coerceIn(0f, 1f)
+        return t * t * (3f - 2f * t)
+    }
+
+    private const val CONF_BLOCK = 0.1f
+    private const val CONF_FULL = 0.3f
 
     /** [limitGainByConfidence]의 제자리 버전. 새 격자를 만들지 않고 [gain]을 고쳐 돌려준다. */
     fun limitGainByConfidenceInPlace(gain: FloatArray, confidence: FloatArray, maxAtt: Float): FloatArray {
         require(gain.size == confidence.size && gain.all { it.isFinite() && it in 0f..1f })
         requireConfidence(confidence)
         requireAttenuation(maxAtt)
-        for (i in gain.indices) gain[i] = maxOf(gain[i], 1f - maxAtt * confidence[i])
+        for (i in gain.indices) gain[i] = maxOf(gain[i], 1f - maxAtt * confidenceAllowance(confidence[i]))
         return gain
     }
 

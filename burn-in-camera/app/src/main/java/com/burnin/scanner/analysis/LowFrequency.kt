@@ -144,6 +144,25 @@ object LowFrequency {
             gg[i] = (m / v[1]).coerceIn(1f - maxAtt, 1f)
             gb[i] = (m / v[2]).coerceIn(1f - maxAtt, 1f)
         }
-        return Triple(Blocks(c.r.bw, c.r.bh, gr), Blocks(c.g.bw, c.g.bh, gg), Blocks(c.b.bw, c.b.bh, gb))
+        val bw = c.r.bw
+        val bh = c.r.bh
+        return Triple(softenEdges(Blocks(bw, bh, gr)), softenEdges(Blocks(bw, bh, gg)), softenEdges(Blocks(bw, bh, gb)))
+    }
+
+    /**
+     * 가장자리 한 줄 블록은 비네팅·색 셰이딩이 커 색 비율이 덜 정확해 과보정(붉은 테)이 났다.
+     * 가장자리 블록의 감쇠를 바로 안쪽 블록 감쇠의 절반으로 둔다.
+     */
+    fun softenEdges(b: Blocks): Blocks {
+        if (b.bw < 3 || b.bh < 3) return b
+        val v = b.values.copyOf()
+        for (y in 0 until b.bh) for (x in 0 until b.bw) {
+            if (x != 0 && y != 0 && x != b.bw - 1 && y != b.bh - 1) continue
+            val ix = x.coerceIn(1, b.bw - 2)
+            val iy = y.coerceIn(1, b.bh - 2)
+            val inner = b.values[iy * b.bw + ix]
+            v[y * b.bw + x] = 1f - 0.5f * (1f - inner)
+        }
+        return Blocks(b.bw, b.bh, v)
     }
 }

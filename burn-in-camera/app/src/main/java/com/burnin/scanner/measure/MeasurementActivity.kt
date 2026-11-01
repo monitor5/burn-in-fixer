@@ -928,7 +928,7 @@ class MeasurementActivity : Activity() {
         val grayAvgPng = if (cross != null) withContext(Dispatchers.Default) { Analyzer.grayImagePng(grayAvg) } else null
         val confidence70PreWb = if (cross != null) {
             withContext(Dispatchers.Default) {
-                Analyzer.combineConfidence(confidence70Single, cross.agreement)
+                Analyzer.combineConfidence(confidence70Single, crossAgreement(cross))
             }
         } else {
             confidence70Single
@@ -961,7 +961,7 @@ class MeasurementActivity : Activity() {
             flickerStability70 = Analyzer.meanConfidence(flicker)
             val conf = withContext(Dispatchers.Default) {
                 val single = Analyzer.combineConfidence(baseConf, flicker)
-                if (cross == null) single else Analyzer.combineConfidence(single, cross.agreement)
+                if (cross == null) single else Analyzer.combineConfidence(single, crossAgreement(cross))
             }
             log("휘도 기준: 색 균일화 레이어를 켠 상태로 gray70 재측정(반복 보정과 같은 조건)")
             luma to conf
@@ -1038,7 +1038,7 @@ class MeasurementActivity : Activity() {
             flickerStabilityLow = Analyzer.meanConfidence(flickerConfidenceLow)
             withContext(Dispatchers.Default) {
                 val single = Analyzer.combineConfidence(baseConfidenceLow, flickerConfidenceLow)
-                if (cross == null) single else Analyzer.combineConfidence(single, cross.agreement)
+                if (cross == null) single else Analyzer.combineConfidence(single, crossAgreement(cross))
             }
         }
         val lowStatsBefore = Analyzer.stats(lumaLowBefore)
@@ -2041,6 +2041,14 @@ class MeasurementActivity : Activity() {
 
     private fun uniformityPassed(stats: Analyzer.Stats, grid: FloatArray, gw: Int, gh: Int): Boolean =
         uniformityScore(stats, grid, gw, gh) <= 1f
+
+    /**
+     * 초광각 교차 일치도를 신뢰도로 쓸 때의 가중. 3위치 비네팅 보정값이 있으면 카메라 쪽 원형은 이미
+     * 분리됐고, 남는 불일치는 주로 초광각의 낮은 해상도(경계 번짐) 때문이라 절반만 반영한다.
+     */
+    private fun crossAgreement(cross: CrossResult): FloatArray =
+        if (vignetteModel == null) cross.agreement
+        else FloatArray(cross.agreement.size) { 0.5f + 0.5f * cross.agreement[it] }
 
     private fun optimizationScore(stats: Analyzer.Stats): Float =
         MeasurementPolicy.optimizationScore(stats, PASS_RMS, PASS_P95)
