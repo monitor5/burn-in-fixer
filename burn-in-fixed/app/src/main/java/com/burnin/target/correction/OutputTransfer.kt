@@ -33,8 +33,10 @@ object OutputTransfer {
      * 행 두 개 분량의 오차 버퍼만 써서 큰 화면(Tab S2 2048×1536)에서도 메모리를 적게 쓴다.
      * [value]는 픽셀 인덱스(y·w+x)의 연속 값, [sink]는 (인덱스, 정수 값)을 받는다.
      * 같은 입력이면 항상 같은 결과를 낸다(측정 반복 간 재현성).
+     * inline: 픽셀마다 람다를 부르면 Int/Double 박싱이 생겨 Tab S2에서 전체 화면 한 장에
+     * 수 초가 걸리고 패턴 표시 ACK(ControlServer)가 시간 초과된다.
      */
-    fun dither(w: Int, h: Int, max: Int, value: (Int) -> Double, sink: (Int, Int) -> Unit) {
+    inline fun dither(w: Int, h: Int, max: Int, value: (Int) -> Double, sink: (Int, Int) -> Unit) {
         require(w > 0 && h > 0 && max > 0)
         var cur = DoubleArray(w + 2)
         var next = DoubleArray(w + 2)

@@ -135,7 +135,9 @@ object ControlServer {
                 }
                 val latch = CountDownLatch(1)
                 PatternBus.showPattern(context, spec) { latch.countDown() }
-                val applied = latch.await(7, TimeUnit.SECONDS)
+                // 보정 ON 단색은 전체 화면 dither 비트맵을 새로 굽기 때문에 구형 기기에서 몇 초 걸린다.
+                // Scanner 요청 기본 타임아웃(20초)보다 짧게 둔다.
+                val applied = latch.await(15, TimeUnit.SECONDS)
                 if (!applied) return err(cmd, "패턴 표시 시간 초과")
                 AppLog.i("패턴 표시: $name")
                 reply.put("pattern", name)
