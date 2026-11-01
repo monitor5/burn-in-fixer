@@ -24,10 +24,29 @@ internal object MeasurementPolicy {
         return if (blockDev == null) cellScore else maxOf(cellScore, blockDev / blockLimit)
     }
 
-    fun geometryStable(reference: ScreenDetector.Quad, current: ScreenDetector.Quad, tolerancePx: Float = 4f): Boolean =
-        reference.corners.zip(current.corners).all { (a, b) ->
-            Math.hypot((a.x - b.x).toDouble(), (a.y - b.y).toDouble()) <= tolerancePx
-        }
+    fun geometryStable(
+        reference: ScreenDetector.Quad,
+        current: ScreenDetector.Quad,
+        tolerancePx: Float = geometryTolerance(reference),
+    ): Boolean = maxCornerShift(reference, current) <= tolerancePx
+
+    fun maxCornerShift(reference: ScreenDetector.Quad, current: ScreenDetector.Quad): Float =
+        reference.corners.zip(current.corners).maxOf { (a, b) ->
+            Math.hypot((a.x - b.x).toDouble(), (a.y - b.y).toDouble())
+        }.toFloat()
+
+    /**
+     * 화면 이동 허용치: 4px 또는 화면 대각선의 0.5% 중 큰 값. 보정 패턴은 가장자리 밝기를 바꿔
+     * 검출 경계가 1~2px 움직일 수 있어, 크게 잡힌 화면에서 고정 4px는 실제 이동이 아닌데도 중단시켰다.
+     */
+    fun geometryTolerance(reference: ScreenDetector.Quad): Float {
+        val c = reference.corners
+        val diag = maxOf(
+            Math.hypot((c[0].x - c[2].x).toDouble(), (c[0].y - c[2].y).toDouble()),
+            Math.hypot((c[1].x - c[3].x).toDouble(), (c[1].y - c[3].y).toDouble()),
+        ).toFloat()
+        return maxOf(4f, diag * 0.005f)
+    }
 
     /** A perfect baseline has no relative improvement; keep the report finite and deterministic. */
     fun improvement(before: Float, after: Float): Double {

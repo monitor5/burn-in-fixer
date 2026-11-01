@@ -5,6 +5,7 @@ import android.app.Activity
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Looper
 import android.util.Base64
 import android.hardware.camera2.CameraManager
 import android.view.TextureView
@@ -285,11 +286,20 @@ class MeasurementActivity : Activity() {
     }
 
     private fun status(msg: String) {
+        // 분석 코드가 Dispatchers.Default 안에서 로그를 남기기도 하므로 뷰 갱신은 항상 메인 스레드로 보낸다.
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            runOnUiThread { status(msg) }
+            return
+        }
         txtStatus.text = msg
         AppLog.i(msg)
     }
 
     private fun log(msg: String) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            runOnUiThread { log(msg) }
+            return
+        }
         resultLog.appendLine(msg)
         txtResult.text = resultLog.toString()
         AppLog.i(msg)
@@ -901,7 +911,10 @@ class MeasurementActivity : Activity() {
             val afterAvg = afterCapture.average
             val detAfter = withContext(Dispatchers.Default) { ScreenDetector.detect(afterAvg) }
             checkNotNull(detAfter) { "반복 화면 검출 실패 — 재측정 필요" }
-            check(MeasurementPolicy.geometryStable(det.quad, detAfter.quad)) { "화면 이동 — black/flat-field 재측정 필요" }
+            check(MeasurementPolicy.geometryStable(det.quad, detAfter.quad)) {
+                "화면 이동 — black/flat-field 재측정 필요 (모서리 최대 ${fmt(MeasurementPolicy.maxCornerShift(det.quad, detAfter.quad))}px, " +
+                    "허용 ${fmt(MeasurementPolicy.geometryTolerance(det.quad))}px)"
+            }
             val hAfter = checkNotNull(Analyzer.buildHomography(detAfter.quad, screenW, screenH, cornerMapping))
             val lumaAfterRaw = withContext(Dispatchers.Default) {
                 Analyzer.lumaGrid(afterAvg, blackAvg, hAfter, screenW, screenH, gw, gh)
@@ -1092,7 +1105,10 @@ class MeasurementActivity : Activity() {
         val finalAvg = captureAveraged(cap)
         val detFinal = withContext(Dispatchers.Default) { ScreenDetector.detect(finalAvg) }
         checkNotNull(detFinal) { "최종 화면 검출 실패 — 평가 무효" }
-        check(MeasurementPolicy.geometryStable(referenceQuad, detFinal.quad)) { "최종 화면 이동 — black/flat-field 재측정 필요" }
+        check(MeasurementPolicy.geometryStable(referenceQuad, detFinal.quad)) {
+            "최종 화면 이동 — black/flat-field 재측정 필요 (모서리 최대 ${fmt(MeasurementPolicy.maxCornerShift(referenceQuad, detFinal.quad))}px, " +
+                "허용 ${fmt(MeasurementPolicy.geometryTolerance(referenceQuad))}px)"
+        }
         val hFinal = checkNotNull(Analyzer.buildHomography(detFinal.quad, screenW, screenH, cornerMapping)) { "최종 좌표 정합 실패" }
         val finalGridRaw = withContext(Dispatchers.Default) {
             Analyzer.lumaGrid(finalAvg, blackAvg, hFinal, screenW, screenH, gw, gh)
