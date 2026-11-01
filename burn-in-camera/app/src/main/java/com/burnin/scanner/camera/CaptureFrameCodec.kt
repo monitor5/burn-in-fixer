@@ -31,6 +31,12 @@ internal object CaptureFrameCodec {
                 out.writeFloat(raw.gainR); out.writeFloat(raw.gainG); out.writeFloat(raw.gainB)
                 out.writeBoolean(raw.ccm != null)
                 raw.ccm?.forEach { out.writeFloat(it) }
+                val sh = raw.shading
+                out.writeBoolean(sh != null)
+                if (sh != null) {
+                    out.writeInt(sh.cols); out.writeInt(sh.rows)
+                    sh.gains.forEach { out.writeFloat(it) }
+                }
             }
         }
     }
@@ -64,7 +70,12 @@ internal object CaptureFrameCodec {
                 val white = input.readInt()
                 val gr = input.readFloat(); val gg = input.readFloat(); val gb = input.readFloat()
                 val ccm = if (input.readBoolean()) List(9) { input.readFloat() } else null
-                CaptureFrame.RawInfo(cfa, black, white, gr, gg, gb, ccm)
+                val shading = if (input.readBoolean()) {
+                    val cols = input.readInt(); val rows = input.readInt()
+                    require(cols in 2..256 && rows in 2..256) { "invalid shading map" }
+                    CaptureFrame.RawInfo.Shading(cols, rows, List(cols * rows * 4) { input.readFloat() })
+                } else null
+                CaptureFrame.RawInfo(cfa, black, white, gr, gg, gb, ccm, shading)
             } else null
             require(input.read() == -1) { "trailing capture data" }
             return CaptureFrame(

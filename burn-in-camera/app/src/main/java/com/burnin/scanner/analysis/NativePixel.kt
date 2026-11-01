@@ -44,6 +44,28 @@ object NativePixel {
             Analyzer.SCREEN_SAMPLE_MARGIN)
     }
 
+    /**
+     * 프레임마다 디코드해 바로 [gw]×[gh] 격자로 샘플링한 목록(프레임 안정도용).
+     * 원본 크기 디코드 버퍼는 네이티브에만 두고 Java에는 작은 격자만 돌려준다.
+     */
+    fun frameGrids(
+        files: List<File>, mode: Int, black: GrayImage?, h: Homography,
+        screenW: Int, screenH: Int, gw: Int, gh: Int,
+    ): List<FloatArray>? {
+        if (!available || !enabled || files.isEmpty()) return null
+        val all = frameGridsNative(files.map { it.absolutePath }.toTypedArray(), mode, ImageOps.analysisMaxLongEdge,
+            ImageOps.yLinearLut(), black?.data, black?.w ?: 0, black?.h ?: 0, h.coefficients(),
+            screenW, screenH, gw, gh, Analyzer.SCREEN_SAMPLE_MARGIN) ?: return null
+        val cell = gw * gh
+        return List(files.size) { all.copyOfRange(it * cell, (it + 1) * cell) }
+    }
+
+    private external fun frameGridsNative(
+        paths: Array<String>, mode: Int, maxLongEdge: Int, yLut: FloatArray,
+        black: FloatArray?, bw: Int, bh: Int, homography: DoubleArray,
+        screenW: Int, screenH: Int, gw: Int, gh: Int, margin: Float,
+    ): FloatArray?
+
     private external fun averageNative(paths: Array<String>, mode: Int, maxLongEdge: Int, yLut: FloatArray): GrayImage?
 
     private external fun lumaGridNative(

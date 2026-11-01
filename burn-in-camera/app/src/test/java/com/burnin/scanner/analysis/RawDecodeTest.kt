@@ -70,6 +70,28 @@ class RawDecodeTest {
         }
     }
 
+    @Test fun lensShadingMapUndoesVignetting() {
+        // 가장자리로 갈수록 센서 신호가 1/gain만큼 줄어든 균일 화면: 셰이딩 맵을 곱하면 평평해야 한다
+        val w = 8
+        val h = 6
+        val cols = 3
+        val rows = 3
+        fun gainAt(c: Int, r: Int) = if (c == 1 && r == 1) 1f else 1.5f
+        val gains = List(cols * rows * 4) { i -> val cell = i / 4; gainAt(cell % cols, cell / cols) }
+        val shading = CaptureFrame.RawInfo.Shading(cols, rows, gains)
+        val vignetted = neutralFrame(w, h, { x, y ->
+            0.6f / RawDecode.shadingGain(shading, 0, x, y, w, h)
+        }, floatArrayOf(1f, 1f, 1f))
+        val corrected = vignetted.copy(raw = vignetted.raw!!.copy(shading = shading))
+        val flat = RawDecode.gray(corrected, 1)
+        for (v in flat.data) assertEquals(0.6f, v, 3e-3f)
+        val uncorrected = RawDecode.gray(vignetted, 1)
+        assertEquals(0.4f, uncorrected[0, 0], 3e-3f)
+        val file = temp.newFile()
+        CaptureFrameCodec.write(file, corrected)
+        assertEquals(shading, CaptureFrameCodec.read(file).raw!!.shading)
+    }
+
     @Test fun spatialDetailSurvivesAtFullResolution() {
         // 한 열만 밝은 무채색 줄: 원본 해상도 회색에서 그 열만 높아야 한다
         val f = neutralFrame(8, 4, { x, _ -> if (x == 3) 0.8f else 0.2f }, floatArrayOf(1f, 1f, 1f))

@@ -24,6 +24,27 @@ object RawDecode {
         else -> throw IllegalArgumentException("지원하지 않는 CFA 배열: $cfa")
     }
 
+    fun shadingChannelsFor(cfa: Int): IntArray = when (cfa) {
+        CaptureFrame.RawInfo.CFA_RGGB -> intArrayOf(0, 1, 2, 3)
+        CaptureFrame.RawInfo.CFA_GRBG -> intArrayOf(1, 0, 3, 2)
+        CaptureFrame.RawInfo.CFA_GBRG -> intArrayOf(2, 3, 0, 1)
+        CaptureFrame.RawInfo.CFA_BGGR -> intArrayOf(3, 2, 1, 0)
+        else -> throw IllegalArgumentException("지원하지 않는 CFA 배열: $cfa")
+    }
+
+    /** 셰이딩 맵 이중선형 보간 gain. */
+    fun shadingGain(s: CaptureFrame.RawInfo.Shading, ch: Int, x: Int, y: Int, w: Int, h: Int): Float {
+        val fx = if (w > 1) x.toFloat() * (s.cols - 1) / (w - 1) else 0f
+        val fy = if (h > 1) y.toFloat() * (s.rows - 1) / (h - 1) else 0f
+        val x0 = fx.toInt().coerceIn(0, s.cols - 2)
+        val y0 = fy.toInt().coerceIn(0, s.rows - 2)
+        val dx = fx - x0
+        val dy = fy - y0
+        fun g(c: Int, r: Int) = s.gains[(r * s.cols + c) * 4 + ch]
+        return (g(x0, y0) * (1 - dx) + g(x0 + 1, y0) * dx) * (1 - dy) +
+            (g(x0, y0 + 1) * (1 - dx) + g(x0 + 1, y0 + 1) * dx) * dy
+    }
+
     private class Prepared(frame: CaptureFrame) {
         val info = frame.raw ?: throw IllegalArgumentException("RAW 메타데이터 없음")
         val plane = frame.planes.firstOrNull() ?: throw IllegalArgumentException("RAW plane 없음")
@@ -33,6 +54,9 @@ object RawDecode {
         /** 위치별 1 / (white − black) × gain(정규화). */
         val scale = FloatArray(4)
         val black = FloatArray(4)
+        private val shading = info.shading
+        /** 2×2 위치 → 셰이딩 맵 채널(0 R, 1 G_even(R행), 2 G_odd(B행), 3 B). */
+        private val shadingChannel = shadingChannelsFor(info.cfa)
 
         init {
             require(plane.pixelStride == 2 && plane.rowStride >= w * 2) { "RAW plane 형식 오류" }
@@ -52,7 +76,8 @@ object RawDecode {
             val i = y * plane.rowStride + x * 2
             val raw = (plane.bytes[i].toInt() and 0xFF) or ((plane.bytes[i + 1].toInt() and 0xFF) shl 8)
             val p = ((y and 1) shl 1) or (x and 1)
-            return ((raw - black[p]) * scale[p]).coerceAtLeast(0f)
+            val v = ((raw - black[p]) * scale[p]).coerceAtLeast(0f)
+            return if (shading == null) v else v * shadingGain(shading, shadingChannel[p], x, y, w, h)
         }
 
         fun pos(x: Int, y: Int) = ((y and 1) shl 1) or (x and 1)

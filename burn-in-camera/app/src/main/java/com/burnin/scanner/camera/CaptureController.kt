@@ -59,7 +59,17 @@ data class CaptureFrame(
         val gainG: Float,
         val gainB: Float,
         val ccm: List<Float>?,
+        /** 렌즈 셰이딩(비네팅) 보정 gain 맵. RAW에는 ISP 셰이딩 보정이 빠져 있어 디코드에서 곱한다. */
+        val shading: Shading? = null,
     ) {
+        /**
+         * Camera2 LensShadingMap: [rows]×[cols] 격자, 칸마다 [R, G_even, G_odd, B] gain(행 우선).
+         * 격자는 센서 전체를 덮고, 픽셀 (x, y)의 gain은 격자 좌표 x·(cols−1)/(w−1)에서 이중선형 보간한다.
+         */
+        data class Shading(val cols: Int, val rows: Int, val gains: List<Float>) {
+            init { require(cols >= 2 && rows >= 2 && gains.size == cols * rows * 4) { "셰이딩 맵 크기 오류" } }
+        }
+
         companion object {
             const val CFA_RGGB = 0
             const val CFA_GRBG = 1
@@ -179,6 +189,8 @@ class CaptureController(
     private var latestSensitivityIso: Int? = null
     private var latestAwbGains: RggbChannelVector? = null
     private var latestCcm: android.hardware.camera2.params.ColorSpaceTransform? = null
+    /** 카메라(키)별 최근 렌즈 셰이딩 맵. RAW 프레임에 실어 디코드에서 비네팅을 보정한다. */
+    private val shadingByCamera = java.util.concurrent.ConcurrentHashMap<String, CaptureFrame.RawInfo.Shading>()
     private var rawStatic: RawStatic? = null
 
     /** RAW_SENSOR를 쓸 수 있으면 RAW로 촬영한다(센서 선형값). */
@@ -412,6 +424,7 @@ class CaptureController(
                 CameraMetadata.CONTROL_AE_ANTIBANDING_MODE_AUTO,
             )
             set(CaptureRequest.FLASH_MODE, CameraMetadata.FLASH_MODE_OFF)
+            applyShadingMapMode(this)
             // 번갈아 촬영 뒤 다시 열 때 잠금 상태를 이어 간다.
             if (manualLocked) applyMeasurementControls(this)
             else if (aeLocked) {
@@ -507,8 +520,9 @@ class CaptureController(
             addTarget(aux ?: sReader.surface)
             applySequentialControls(this)
         }
-        if (aux != null) sSession.setRepeatingRequest(repeating.build(), null, handler)
-        else sSession.capture(repeating.build(), null, handler) // AF 시작용 한 장
+        // 반복 요청 결과로 이 카메라의 셰이딩 맵을 미리 받아 둔다(첫 RAW 프레임부터 보정되게).
+        if (aux != null) sSession.setRepeatingRequest(repeating.build(), standaloneCallback(choice.key), handler)
+        else sSession.capture(repeating.build(), standaloneCallback(choice.key), handler) // AF 시작용 한 장
         return StandaloneCamera(role, choice, sDevice, sSession, sReader, rawSt.takeIf { rFormat == ImageFormat.RAW_SENSOR })
     }
 
@@ -518,7 +532,7 @@ class CaptureController(
             r.setOnImageAvailableListener({ rd ->
                 val image = rd.acquireLatestImage() ?: return@setOnImageAvailableListener
                 try {
-                    val frame = image.toCaptureFrame(cam.raw)
+                    val frame = image.toCaptureFrame(cam.raw, cam.choice.key)
                     if (cont.isActive) cont.resume(frame)
                 } catch (e: Exception) {
                     if (cont.isActive) cont.resumeWithException(e)
@@ -743,6 +757,7 @@ class CaptureController(
 
     private fun applyMeasurementControls(builder: CaptureRequest.Builder) {
         builder.set(CaptureRequest.FLASH_MODE, CameraMetadata.FLASH_MODE_OFF)
+        applyShadingMapMode(builder)
         applyToneControls(builder)
         if (manualLocked) {
             builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
@@ -859,11 +874,35 @@ class CaptureController(
             latestSensitivityIso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: latestSensitivityIso
             latestAwbGains = result.get(CaptureResult.COLOR_CORRECTION_GAINS) ?: latestAwbGains
             latestCcm = result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM) ?: latestCcm
+            recordShading(cameraId, result)
             latestFocusDistance = result.get(CaptureResult.LENS_FOCUS_DISTANCE) ?: latestFocusDistance
         }
     }
 
-    private fun Image.toCaptureFrame(rawSt: RawStatic? = rawStatic): CaptureFrame {
+    private fun recordShading(key: String, result: CaptureResult) {
+        val map = result.get(CaptureResult.STATISTICS_LENS_SHADING_CORRECTION_MAP) ?: return
+        val cols = map.columnCount
+        val rows = map.rowCount
+        if (cols < 2 || rows < 2) return
+        val gains = FloatArray(map.gainFactorCount)
+        map.copyGainFactors(gains, 0)
+        shadingByCamera[key] = CaptureFrame.RawInfo.Shading(cols, rows, gains.toList())
+    }
+
+    /** 측정 로그용: 카메라별 셰이딩 맵 크기와 모서리 G gain(중앙 대비). */
+    fun shadingSummary(): String =
+        if (shadingByCamera.isEmpty()) "렌즈 셰이딩 맵 없음 — RAW 비네팅 보정 불가(flat-field만 사용)"
+        else shadingByCamera.entries.joinToString(", ") { (key, s) ->
+            fun g(c: Int, r: Int) = s.gains[(r * s.cols + c) * 4 + 1]
+            val center = g(s.cols / 2, s.rows / 2)
+            "렌즈 셰이딩 맵 [$key] ${s.cols}x${s.rows}, 모서리/중앙 G gain ${"%.2f".format(g(0, 0) / center)}"
+        }
+
+    private fun applyShadingMapMode(builder: CaptureRequest.Builder) {
+        builder.set(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE, CameraMetadata.STATISTICS_LENS_SHADING_MAP_MODE_ON)
+    }
+
+    private fun Image.toCaptureFrame(rawSt: RawStatic? = rawStatic, key: String = cameraId): CaptureFrame {
         val copiedPlanes = planes.map { plane ->
             val buffer = plane.buffer
             val bytes = ByteArray(buffer.remaining())
@@ -878,7 +917,7 @@ class CaptureController(
             timestampNs = timestamp,
             sensitivityIso = manualSensitivityIso ?: latestSensitivityIso,
             exposureTimeNs = manualExposureTimeNs ?: latestExposureTimeNs,
-            raw = if (format == ImageFormat.RAW_SENSOR) rawInfo(rawSt) else null,
+            raw = if (format == ImageFormat.RAW_SENSOR) rawInfo(rawSt)?.copy(shading = shadingByCamera[key]) else null,
         )
     }
 
@@ -1030,6 +1069,7 @@ class CaptureController(
         builder.set(CaptureRequest.FLASH_MODE, CameraMetadata.FLASH_MODE_OFF)
         // 디코더는 모든 프레임에 같은 톤커브 역변환을 쓰므로 보조 화각도 같은 곡선으로 찍는다.
         applyToneControls(builder)
+        applyShadingMapMode(builder)
         if (manualLocked) {
             builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
             builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
@@ -1054,6 +1094,7 @@ class CaptureController(
             request: CaptureRequest,
             result: TotalCaptureResult,
         ) {
+            recordShading(key, result)
             result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
                 ?.let { lastPhysicalExposureNs[key] = it }
         }

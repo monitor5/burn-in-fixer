@@ -444,6 +444,7 @@ class MeasurementActivity : Activity() {
         log("캡처 고정: $lockText (입력 주사율 ${fmtRefresh(refreshHz)}Hz)")
         if (cap.isTriActive) log("동시 3각 촬영 활성: ${cap.triSummary()}")
         cap.diagnosticNotes().forEach { log(it) }
+        if (cap.isRaw) log(cap.shadingSummary())
         log(
             if (cap.isRaw) "측정 프레임: RAW_SENSOR 선형값 (톤커브 역변환 불필요, 보조 화각 YUV는 ${cap.toneMode.label})"
             else "측정 톤커브(디코더 역변환): ${cap.toneMode.label}"
@@ -2479,11 +2480,10 @@ class MeasurementActivity : Activity() {
             try {
                 if (frameStore.files.size < 2) return@withContext FloatArray(gw * gh) { 1f }
                 val (tw, th) = stabilityGridSize(gw, gh)
-                val grids = ArrayList<FloatArray>(frameStore.files.size)
-                for (file in frameStore.files) {
-                    val frame = ImageOps.decodeLinearGray(readCaptureFrame(file))
-                    grids += Analyzer.lumaGrid(frame, black, h, screenW, screenH, tw, th)
-                }
+                val grids = NativePixel.frameGrids(frameStore.files, NativePixel.MODE_GRAY, black, h, screenW, screenH, tw, th)
+                    ?: frameStore.files.map { file ->
+                        Analyzer.lumaGrid(ImageOps.decodeLinearGray(readCaptureFrame(file)), black, h, screenW, screenH, tw, th)
+                    }
                 Analyzer.temporalStabilityConfidence(
                     grids,
                     tw,
@@ -2512,11 +2512,12 @@ class MeasurementActivity : Activity() {
             try {
                 if (frameStore.files.size < 2) return@withContext FloatArray(gw * gh) { 1f }
                 val (tw, th) = stabilityGridSize(gw, gh)
-                val grids = ArrayList<FloatArray>(frameStore.files.size)
-                for (file in frameStore.files) {
-                    val frame = ImageOps.decodeLinearChannel(readCaptureFrame(file), channel)
-                    grids += Analyzer.lumaGrid(frame, black?.let { channelImage(it, channel) }, h, screenW, screenH, tw, th)
-                }
+                val blackChannel = black?.let { channelImage(it, channel) }
+                val grids = NativePixel.frameGrids(frameStore.files, channel, blackChannel, h, screenW, screenH, tw, th)
+                    ?: frameStore.files.map { file ->
+                        val frame = ImageOps.decodeLinearChannel(readCaptureFrame(file), channel)
+                        Analyzer.lumaGrid(frame, blackChannel, h, screenW, screenH, tw, th)
+                    }
                 Analyzer.temporalStabilityConfidence(
                     grids,
                     tw,
