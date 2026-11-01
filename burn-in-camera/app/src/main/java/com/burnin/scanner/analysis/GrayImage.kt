@@ -114,6 +114,15 @@ object ImageOps {
             else -> throw IllegalArgumentException("지원하지 않는 이미지 형식: ${frame.format}")
         }
 
+    /** 한 채널만 선형 디코드. RAW는 그 채널만 계산하고, 다른 형식은 RGB 디코드 후 채널을 꺼낸다. */
+    fun decodeLinearChannel(frame: CaptureFrame, channel: Int, maxLongEdge: Int = analysisMaxLongEdge): GrayImage =
+        if (frame.format == ImageFormat.RAW_SENSOR) {
+            RawDecode.channel(frame, yuvSample(frame.width, frame.height, maxLongEdge), channel)
+        } else {
+            val rgb = decodeLinearRgb(frame, maxLongEdge)
+            GrayImage(rgb.w, rgb.h, when (channel) { 0 -> rgb.r; 1 -> rgb.g; else -> rgb.b })
+        }
+
     fun decodeLinearRgb(frame: CaptureFrame, maxLongEdge: Int = analysisMaxLongEdge): RgbImage =
         when (frame.format) {
             ImageFormat.YUV_420_888 -> decodeYuvLinearRgb(frame, maxLongEdge)

@@ -1578,11 +1578,12 @@ class MeasurementActivity : Activity() {
 
         for (pattern in patterns) {
             val channel = rgbChannel(pattern)
-            val capture = capturePatternRgb(client, cap, pattern, frameCount)
+            // 단색 패턴은 해당 채널만 쓰므로 한 채널만 디코드·평균한다(RGB 전체 대비 메모리 1/3).
+            val capture = capturePatternChannel(client, cap, pattern, frameCount, channel)
             try {
                 val avg = capture.average
                 val rawGrid = withContext(Dispatchers.Default) {
-                    Analyzer.channelGrid(avg, blackRgb, channel, h, screenW, screenH, gw, gh)
+                    Analyzer.lumaGrid(avg, channelImage(blackRgb, channel), h, screenW, screenH, gw, gh)
                 }
                 val grid = withContext(Dispatchers.Default) { Analyzer.applyFlatField(rawGrid, flatField) }
                 val st = Analyzer.stats(grid)
@@ -1965,6 +1966,24 @@ class MeasurementActivity : Activity() {
         return capture.average
     }
 
+    private fun channelImage(rgb: RgbImage, channel: Int): GrayImage =
+        GrayImage(rgb.w, rgb.h, when (channel) { 0 -> rgb.r; 1 -> rgb.g; else -> rgb.b })
+
+    private suspend fun capturePatternChannel(
+        client: ControlClient,
+        cap: CaptureController,
+        pattern: String,
+        frameCount: Int,
+        channel: Int,
+    ): GrayCapture {
+        val store = prefetched.remove(pattern) ?: run {
+            withContext(Dispatchers.IO) { client.showPattern(pattern) }
+            delay(PATTERN_SETTLE_MS)
+            captureFrameStore(cap, frameCount)
+        }
+        return GrayCapture(averageDecodedFromStore(store) { ImageOps.decodeLinearChannel(it, channel) }, store)
+    }
+
     private suspend fun capturePatternRgb(
         client: ControlClient,
         cap: CaptureController,
@@ -2274,6 +2293,13 @@ class MeasurementActivity : Activity() {
      * (min/max 추적만 추가하면 되어 스트리밍 처리 그대로 유지)
      */
     private suspend fun averageGrayFromStore(store: CaptureFrameStore): GrayImage =
+        averageDecodedFromStore(store) { ImageOps.decodeLinearGray(it) }
+
+    /** 프레임마다 [decode]한 단일 평면을 양끝값 제외 평균한다(4장 이상). */
+    private suspend fun averageDecodedFromStore(
+        store: CaptureFrameStore,
+        decode: (CaptureFrame) -> GrayImage,
+    ): GrayImage =
         withContext(Dispatchers.Default) {
             var width = 0
             var height = 0
@@ -2281,7 +2307,7 @@ class MeasurementActivity : Activity() {
             var minArr: FloatArray? = null
             var maxArr: FloatArray? = null
             for (file in store.files) {
-                val img = ImageOps.decodeLinearGray(readCaptureFrame(file))
+                val img = decode(readCaptureFrame(file))
                 if (acc == null) {
                     width = img.w
                     height = img.h
@@ -2444,8 +2470,8 @@ class MeasurementActivity : Activity() {
                 val (tw, th) = stabilityGridSize(gw, gh)
                 val grids = ArrayList<FloatArray>(frameStore.files.size)
                 for (file in frameStore.files) {
-                    val frame = ImageOps.decodeLinearRgb(readCaptureFrame(file))
-                    grids += Analyzer.channelGrid(frame, black, channel, h, screenW, screenH, tw, th)
+                    val frame = ImageOps.decodeLinearChannel(readCaptureFrame(file), channel)
+                    grids += Analyzer.lumaGrid(frame, black?.let { channelImage(it, channel) }, h, screenW, screenH, tw, th)
                 }
                 Analyzer.temporalStabilityConfidence(
                     grids,

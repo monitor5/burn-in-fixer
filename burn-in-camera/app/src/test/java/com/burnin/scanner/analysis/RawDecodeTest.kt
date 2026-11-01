@@ -56,6 +56,20 @@ class RawDecodeTest {
         assertEquals(0.5f, mixed.r[0], 2e-3f)
     }
 
+    @Test fun singleChannelDecodeMatchesRgbChannel() {
+        val ccm = listOf(0.9f, 0.1f, 0f, 0.05f, 0.9f, 0.05f, 0f, 0.2f, 0.8f)
+        val f = neutralFrame(8, 6, { x, y -> 0.1f + 0.05f * x + 0.02f * y }, floatArrayOf(2f, 1f, 1.5f), ccm)
+        for (s in listOf(1, 2)) {
+            val rgb = RawDecode.rgb(f, s)
+            val chans = listOf(rgb.r, rgb.g, rgb.b)
+            for (c in 0..2) {
+                val one = RawDecode.channel(f, s, c)
+                assertEquals(rgb.w, one.w)
+                for (i in one.data.indices) assertEquals(chans[c][i], one.data[i], 1e-6f)
+            }
+        }
+    }
+
     @Test fun spatialDetailSurvivesAtFullResolution() {
         // 한 열만 밝은 무채색 줄: 원본 해상도 회색에서 그 열만 높아야 한다
         val f = neutralFrame(8, 4, { x, _ -> if (x == 3) 0.8f else 0.2f }, floatArrayOf(1f, 1f, 1f))

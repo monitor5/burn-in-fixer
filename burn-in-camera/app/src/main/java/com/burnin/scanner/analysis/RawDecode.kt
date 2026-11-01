@@ -79,6 +79,41 @@ object RawDecode {
         return GrayImage(outW, outH, out)
     }
 
+    /** [rgb]와 같은 계산에서 한 채널(0 R, 1 G, 2 B)만 만든다. 단색 패턴 분석의 메모리를 1/3로 줄인다. */
+    fun channel(frame: CaptureFrame, sample: Int, channel: Int): GrayImage {
+        require(sample >= 1 && channel in 0..2)
+        val r = Prepared(frame)
+        val ccm = r.info.ccm?.takeIf { it.size == 9 && it.all { v -> v.isFinite() } }
+        val outW = Math.max(1, (r.w + sample - 1) / sample)
+        val outH = Math.max(1, (r.h + sample - 1) / sample)
+        val out = FloatArray(outW * outH)
+        Analyzer.parallelRows(outH) { oy ->
+            val sum = FloatArray(3)
+            val cnt = IntArray(3)
+            var i = oy * outW
+            val y0 = (oy * sample) and 1.inv()
+            val y1 = Math.min(Math.max(oy * sample + sample, y0 + 2), r.h)
+            for (ox in 0 until outW) {
+                val x0 = (ox * sample) and 1.inv()
+                val x1 = Math.min(Math.max(ox * sample + sample, x0 + 2), r.w)
+                sum.fill(0f); cnt.fill(0)
+                for (y in y0 until y1) for (x in x0 until x1) {
+                    val c = r.channel[r.pos(x, y)]
+                    sum[c] += r.value(x, y)
+                    cnt[c]++
+                }
+                val cr = if (cnt[0] > 0) sum[0] / cnt[0] else 0f
+                val cg = if (cnt[1] > 0) sum[1] / cnt[1] else 0f
+                val cb = if (cnt[2] > 0) sum[2] / cnt[2] else 0f
+                out[i++] = if (ccm != null) {
+                    val k = channel * 3
+                    (ccm[k] * cr + ccm[k + 1] * cg + ccm[k + 2] * cb).coerceAtLeast(0f)
+                } else when (channel) { 0 -> cr; 1 -> cg; else -> cb }
+            }
+        }
+        return GrayImage(outW, outH, out)
+    }
+
     fun rgb(frame: CaptureFrame, sample: Int): RgbImage {
         require(sample >= 1)
         val r = Prepared(frame)
