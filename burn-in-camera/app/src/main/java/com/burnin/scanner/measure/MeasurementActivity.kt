@@ -1972,6 +1972,7 @@ class MeasurementActivity : Activity() {
                 return null
             }
             log("희소 점등 측광: 화면 1px당 카메라 ${fmt(camPerScreen)}px (풀해상도 ${black.w}x${black.h}), $plan")
+            val sparseBuffer = FloatArray(black.w * black.h)
             val layouts = ArrayList<SparseSpotPhotometry.PhaseLayout>()
             for ((index, phase) in plan.phases().withIndex()) {
                 status("4/10 희소 점등 측광 ${index + 1}/${plan.patternCount}...")
@@ -1982,7 +1983,12 @@ class MeasurementActivity : Activity() {
                     var layout: SparseSpotPhotometry.PhaseLayout? = null
                     for (file in store.files) {
                         val frame = withContext(Dispatchers.Default) {
-                            fullResMinusBlack(readCaptureFrame(file), black)
+                            // 네이티브로 재사용 버퍼에 디코드·black 차감(프레임마다 50MB 배열을 새로 만들지 않음)
+                            if (NativePixel.decodeInto(file, NativePixel.MODE_GRAY, ImageOps.FULL_RESOLUTION, black.data, sparseBuffer)) {
+                                SparseSpotPhotometry.Frame(black.w, black.h, sparseBuffer)
+                            } else {
+                                fullResMinusBlack(readCaptureFrame(file), black)
+                            }
                         }
                         withContext(Dispatchers.Default) {
                             val current = layout ?: SparseSpotPhotometry.locate(
@@ -2071,6 +2077,8 @@ class MeasurementActivity : Activity() {
     /** 풀해상도 선형 휘도 평균 (black 측정용). 프레임을 하나씩 디코드해 메모리를 아낀다. */
     private suspend fun averageFullResFromStore(store: CaptureFrameStore): GrayImage =
         withContext(Dispatchers.Default) {
+            // 네이티브: 원본 해상도 디코드·평균을 네이티브 메모리에서(4장 이상이면 양끝값 제외 평균)
+            NativePixel.average(store.files, NativePixel.MODE_GRAY, ImageOps.FULL_RESOLUTION)?.let { return@withContext it }
             var acc: FloatArray? = null
             var w = 0
             var h = 0

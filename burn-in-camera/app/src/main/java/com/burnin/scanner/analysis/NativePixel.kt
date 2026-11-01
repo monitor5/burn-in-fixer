@@ -60,6 +60,19 @@ object NativePixel {
         return List(files.size) { all.copyOfRange(it * cell, (it + 1) * cell) }
     }
 
+    /**
+     * 프레임 파일 하나를 디코드해 [out](재사용 버퍼, 디코드 크기와 같아야 함)에 쓰고 [black]을 뺀다.
+     * 실패하거나 네이티브가 없으면 false — 호출부가 Kotlin 디코드로 폴백한다.
+     */
+    fun decodeInto(file: File, mode: Int, maxLongEdge: Int, black: FloatArray?, out: FloatArray): Boolean {
+        if (!available || !enabled) return false
+        return decodeIntoNative(file.absolutePath, mode, maxLongEdge, ImageOps.yLinearLut(), black, out)
+    }
+
+    private external fun decodeIntoNative(
+        path: String, mode: Int, maxLongEdge: Int, yLut: FloatArray, black: FloatArray?, out: FloatArray,
+    ): Boolean
+
     private external fun frameGridsNative(
         paths: Array<String>, mode: Int, maxLongEdge: Int, yLut: FloatArray,
         black: FloatArray?, bw: Int, bh: Int, homography: DoubleArray,

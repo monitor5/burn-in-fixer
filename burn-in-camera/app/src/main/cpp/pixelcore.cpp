@@ -437,3 +437,35 @@ Java_com_burnin_scanner_analysis_NativePixel_frameGridsNative(
     if (arr) env->SetFloatArrayRegion(arr, 0, (jsize) out.size(), out.data());
     return arr;
 }
+
+// 프레임 하나를 디코드해 Java 배열 [out]에 쓴다(재사용 버퍼). [black]이 있으면 뺀다.
+// 희소 점등 측광처럼 원본 해상도 프레임을 여러 장 차례로 처리할 때 Java 힙 할당 없이 쓴다.
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_burnin_scanner_analysis_NativePixel_decodeIntoNative(
+        JNIEnv* env, jobject, jstring jpath, jint mode, jint maxLongEdge, jfloatArray yLutArr,
+        jfloatArray blackArr, jfloatArray outArr) {
+    float yLut[256];
+    env->GetFloatArrayRegion(yLutArr, 0, 256, yLut);
+    const char* cpath = env->GetStringUTFChars(jpath, nullptr);
+    Frame fr;
+    bool ok = readFrame(cpath, fr);
+    env->ReleaseStringUTFChars(jpath, cpath);
+    if (!ok) return JNI_FALSE;
+    int w = 0, h = 0;
+    std::vector<float> cur;
+    if (!decodeFrame(fr, mode, maxLongEdge, yLut, w, h, cur)) return JNI_FALSE;
+    fr.planes.clear();
+    const jsize total = (jsize) cur.size();
+    if (env->GetArrayLength(outArr) != total) return JNI_FALSE;
+    if (blackArr && env->GetArrayLength(blackArr) != total) return JNI_FALSE;
+    auto* out = (float*) env->GetPrimitiveArrayCritical(outArr, nullptr);
+    float* black = blackArr ? (float*) env->GetPrimitiveArrayCritical(blackArr, nullptr) : nullptr;
+    parallelRows(h, [&](int y) {
+        size_t o = (size_t) y * w;
+        if (black) for (int x = 0; x < w; x++) out[o + x] = cur[o + x] - black[o + x];
+        else std::memcpy(out + o, cur.data() + o, sizeof(float) * w);
+    });
+    if (black) env->ReleasePrimitiveArrayCritical(blackArr, black, JNI_ABORT);
+    env->ReleasePrimitiveArrayCritical(outArr, out, 0);
+    return JNI_TRUE;
+}
