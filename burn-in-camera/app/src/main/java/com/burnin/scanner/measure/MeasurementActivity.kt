@@ -1167,7 +1167,7 @@ class MeasurementActivity : Activity() {
         val refined = currentDetail?.let {
             // 반복 중 미리 찍어 둔 묶음을 지우고 GC를 권해 풀해상도 희소 측정 여유를 만든다
             clearPrefetched()
-            System.gc()
+            Runtime.getRuntime().gc()
             log("픽셀 단위 검증 시작, ${heapText()}")
             refinePixelDetail(client, cap, homography, screenW, screenH, smoothRadius, confidence70, lumaBefore, iterated, it, gw, gh)
         }
@@ -1793,7 +1793,7 @@ class MeasurementActivity : Activity() {
                     "색 균일화 결과: 블록 색 편차 평균 ${pct(beforeMean)} → ${pct(after.meanSpread())}, " +
                         "P95 ${pct(beforeP95)} → ${pct(after.p95Spread())}"
                 )
-            }.onFailure { log("색 균일화 재측정 실패: ${it.message}") }
+            }.onFailure { log("색 균일화 재측정 실패(${it::class.java.simpleName}): ${it.message}, ${heapText()}") }
         }
         withContext(Dispatchers.IO) { client.showPattern("gray70") }
 
@@ -2344,6 +2344,8 @@ class MeasurementActivity : Activity() {
                 return null
             }
             log("희소 점등 측광$label: 화면 1px당 카메라 ${fmt(camPerScreen)}px (풀해상도 ${bw}x$bh), $plan")
+            // 호출 간에 재사용하지 않는다: 붙잡아 두면 조립(약 70MB 임시) 동안 50MB가 더 얹힌다.
+            // 놓은 큰 배열은 ART가 OOM 전에 회수하므로 매번 새로 잡는 편이 피크가 낮다.
             var sparseBuffer: FloatArray? = FloatArray(bw * bh)
             val layouts = ArrayList<SparseSpotPhotometry.PhaseLayout>()
             for ((index, phase) in plan.phases().withIndex()) {
