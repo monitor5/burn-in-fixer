@@ -88,7 +88,9 @@ class MeasurementActivity : Activity() {
         private const val LOW_RGB_FRAMES = 5
         private const val LOW_RGB_GAIN_WEIGHT = 0.18f
         private const val LOW_RGB_WEAK_GAIN_WEIGHT = 0.06f
-        private const val MAX_ATTENUATION = 0.10f
+        private const val DEFAULT_MAX_ATTENUATION = 0.10f
+        /** 탭 앱 CorrectionStore가 받아들이는 최대 감쇠 상한. */
+        private const val MAX_ALLOWED_ATTENUATION = 0.30f
         /** 희소 점등 측광(글씨 획 단위 고주파 층) 사용 여부 */
         private const val STROKE_DETAIL_ENABLED = true
         private const val SPARSE_FRAMES_PER_PATTERN = 8
@@ -133,6 +135,9 @@ class MeasurementActivity : Activity() {
     private val prefetched = LinkedHashMap<String, CaptureFrameStore>()
     /** 직전 측정의 최적 맵에서 반복 보정을 n회 더 돌리는 작업. 측정이 끝나야 생긴다. */
     private var extraImprovement: (suspend (Int) -> Unit)? = null
+    /** 보정 감쇠 상한(0~1). 측정 시작 때 '최대 감쇠(%)' 입력에서 읽는다. */
+    private var maxAttenuation = DEFAULT_MAX_ATTENUATION
+    private lateinit var editMaxAtt: EditText
     private lateinit var editExtra: EditText
     private lateinit var btnExtra: Button
     private var triSelection: CameraEnumerator.TriSelection? = null
@@ -225,6 +230,13 @@ class MeasurementActivity : Activity() {
         editExtra = findViewById(R.id.editExtra)
         btnExtra = findViewById(R.id.btnExtra)
         findViewById<View>(R.id.rowExtra).visibility = View.VISIBLE
+        findViewById<View>(R.id.rowAttenuation).visibility = View.VISIBLE
+        editMaxAtt = findViewById(R.id.editMaxAtt)
+        findViewById<Button>(R.id.btnCheckAtt).setOnClickListener {
+            btnStart.isEnabled = false
+            btnExtra.isEnabled = false
+            scope.launch { runMeasurementSafely { checkAttenuationNeed() } }
+        }
         editExtra.addTextChangedListener(object : android.text.TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
@@ -381,6 +393,70 @@ class MeasurementActivity : Activity() {
         AppLog.i(msg)
     }
 
+    private fun inputMaxAttenuation(): Float =
+        ((editMaxAtt.text.toString().trim().toFloatOrNull() ?: DEFAULT_MAX_ATTENUATION * 100f) / 100f)
+            .coerceIn(0.01f, MAX_ALLOWED_ATTENUATION)
+
+    /**
+     * 감쇠 필요도 검증: gray70·black만 빠르게 찍어(마커·dot-grid·희소 측광 없이) 블록 휘도 분포에서
+     * 가장 어두운 쪽(하위 1% 블록)에 나머지를 맞추려면 얼마나 감쇠해야 하는지 보여 준다.
+     * 화면은 밝게 올릴 수 없으므로 밝은 쪽을 낮추는 감쇠량이 곧 필요한 상한이다.
+     */
+    private suspend fun checkAttenuationNeed() {
+        val client = Session.client ?: throw IllegalStateException("대상 기기 미연결")
+        val cap = capture ?: throw IllegalStateException("카메라 미준비")
+        val screenW = Session.screenWidth
+        val screenH = Session.screenHeight
+        status("감쇠 필요도 검증: gray70 촬영...")
+        log("──────────────")
+        withContext(Dispatchers.IO) {
+            client.command(Protocol.CMD_DISABLE_CORRECTION)
+            client.command(Protocol.CMD_DISABLE_OVERLAY)
+            client.showPattern("gray70")
+        }
+        delay(AE_CONVERGE_MS)
+        cap.lockMeasurementControls(inputRefreshHz())
+        val grayStore = captureFrameStore(cap, FRAMES_PER_PATTERN)
+        val gray = try { averageGrayFromStore(grayStore) } finally { grayStore.delete() }
+        val det = withContext(Dispatchers.Default) { ScreenDetector.detect(gray) }
+            ?: throw IllegalStateException("화면 검출 실패 — 차광 상태와 카메라 정렬을 확인하세요")
+        val h = Analyzer.buildHomography(det.quad, screenW, screenH)
+            ?: throw IllegalStateException("호모그래피 계산 실패")
+        status("감쇠 필요도 검증: black 촬영...")
+        withContext(Dispatchers.IO) { client.showPattern("black") }
+        delay(PATTERN_SETTLE_MS)
+        val blackStore = captureFrameStore(cap, FRAMES_PER_PATTERN)
+        val black = try { averageGrayFromStore(blackStore) } finally { blackStore.delete() }
+        withContext(Dispatchers.IO) { client.showPattern("gray70") }
+        // 블록 통계만 보면 되므로 작은 격자로 계산한다(긴 변 256칸).
+        val gw = if (screenW >= screenH) 256 else (256L * screenW / screenH).toInt()
+        val gh = if (screenW >= screenH) (256L * screenH / screenW).toInt() else 256
+        val lumaRaw = withContext(Dispatchers.Default) { Analyzer.lumaGrid(gray, black, h, screenW, screenH, gw, gh) }
+        val ff = withContext(Dispatchers.Default) { Analyzer.radialFlatField(lumaRaw, gw, gh) }
+        val luma = Analyzer.applyFlatField(lumaRaw, ff)
+        val blocks = LowFrequency.blocks(luma, gw, gh, 48).values.filter { it.isFinite() && it > 0f }.sorted()
+        require(blocks.size >= 16) { "유효 블록 부족" }
+        val median = blocks[blocks.size / 2]
+        val target = blocks[(blocks.size * 0.01f).toInt()]
+        val att = blocks.map { (1f - target / it).coerceAtLeast(0f) }.sorted()
+        val att95 = att[((att.size - 1) * 0.95f).toInt()]
+        val att99 = att[((att.size - 1) * 0.99f).toInt()]
+        val attMax = att.last()
+        val meanLoss = att.average().toFloat()
+        val current = inputMaxAttenuation()
+        val verdict = when {
+            current >= att99 -> "보정 가능(블록 99% 이상)"
+            current >= att95 -> "대부분 보정 가능(블록 95%), 가장 밝은 일부는 덜 맞춰짐"
+            else -> "상한 부족 — 블록 95%를 맞추려면 ${pct(att95)} 이상 필요"
+        }
+        log("감쇠 필요도 검증 (gray70, 블록 48칸, 하위 1% 블록 기준):")
+        log("   블록 95% 보정에 최대 ${pct(att95)}, 99%에 ${pct(att99)}, 전체에 ${pct(attMax)} 감쇠 필요")
+        log("   그만큼 감쇠하면 평균 밝기 손실 약 ${pct(meanLoss)} (중앙 블록 대비 가장 어두운 쪽 ${pct(1f - target / median)})")
+        log("   현재 상한 ${pct(current)} → $verdict")
+        log("   참고: 빠른 검증이라 초광각 기준 잔여 비네팅 보정이 빠져 있어 필요량이 약간 크게 나올 수 있어요")
+        status("감쇠 필요도: 95% ${pct(att95)} / 99% ${pct(att99)} — 현재 ${pct(current)} → $verdict")
+    }
+
     private fun extraIterations(): Int =
         (editExtra.text.toString().trim().toIntOrNull() ?: DEFAULT_EXTRA_ITERATIONS).coerceIn(1, MAX_ITERATIONS)
 
@@ -437,10 +513,12 @@ class MeasurementActivity : Activity() {
         val screenH = Session.screenHeight
         require(screenW > 0 && screenH > 0) { "대상 화면 정보 없음" }
         extraImprovement = null
+        maxAttenuation = inputMaxAttenuation()
         whiteBalanceActive = false
         chromaBefore = null
         resultLog.clear()
         log("대상: ${Session.targetName} (${screenW}x${screenH})")
+        log("보정 감쇠 상한: ${pct(maxAttenuation)}")
         selectAnalysisResolution(cap)
 
         // ── 1. 기준 패턴 + 노출 잠금 ─────────────────────────────
@@ -710,7 +788,7 @@ class MeasurementActivity : Activity() {
         }
         val blackStats = Analyzer.stats(blackGrid)
         val statsBefore = Analyzer.stats(lumaBefore)
-        val target = Analyzer.correctionTarget(lumaBefore, gw, gh, MAX_ATTENUATION)
+        val target = Analyzer.correctionTarget(lumaBefore, gw, gh, maxAttenuation)
         val strayRatio = blackStats.median / statsBefore.median
         log(
             "카메라 flat-field 보정: radial max ${pct(Analyzer.flatFieldStrength(flatField))}, " +
@@ -767,7 +845,7 @@ class MeasurementActivity : Activity() {
             }
         }
         val lowStatsBefore = Analyzer.stats(lumaLowBefore)
-        val lowTarget = Analyzer.correctionTarget(lumaLowBefore, gw, gh, MAX_ATTENUATION)
+        val lowTarget = Analyzer.correctionTarget(lumaLowBefore, gw, gh, maxAttenuation)
         val lowStrayRatio = blackStats.median / lowStatsBefore.median
         val lowSignalValid = lowStrayRatio <= LOW_LIGHT_STRAY_WARN
         val lowLightWeight = if (lowSignalValid) LOW_LIGHT_GAIN_WEIGHT else LOW_LIGHT_WEAK_GAIN_WEIGHT
@@ -819,9 +897,9 @@ class MeasurementActivity : Activity() {
         val rgb30 = rgb30Measured.copy(
             // 측정 원본 gain은 이후 쓰지 않으므로 제자리로 제한해 복사본 4장(약 50MB)을 만들지 않는다.
             channelGains = rgb30Measured.channelGains.mapValuesTo(LinkedHashMap()) { (_, gain) ->
-                Analyzer.limitGainByConfidenceInPlace(gain, confidence70, MAX_ATTENUATION)
+                Analyzer.limitGainByConfidenceInPlace(gain, confidence70, maxAttenuation)
             },
-            aggregateGain = rgb30Measured.aggregateGain?.let { Analyzer.limitGainByConfidenceInPlace(it, confidence70, MAX_ATTENUATION) },
+            aggregateGain = rgb30Measured.aggregateGain?.let { Analyzer.limitGainByConfidenceInPlace(it, confidence70, maxAttenuation) },
             // 초기 RGB30 신뢰도 격자 3장은 gain 계산에만 쓰고 이후엔 안 쓴다(반복은 재측정 값을 씀).
             confidences = LinkedHashMap(),
         )
@@ -1119,13 +1197,13 @@ class MeasurementActivity : Activity() {
         smoothRadius: Int,
     ): FloatArray = withContext(Dispatchers.Default) {
         val grayMixedGain = run {
-            val gray70Gain = Analyzer.gainGrid(lumaBefore, gw, gh, MAX_ATTENUATION, confidence70, smoothRadius)
-            val lowLightGain = Analyzer.gainGrid(lumaLowBefore, gw, gh, MAX_ATTENUATION, confidenceLow, smoothRadius)
-            Analyzer.mixGainGrids(gray70Gain, lowLightGain, lowLightWeight, MAX_ATTENUATION)
+            val gray70Gain = Analyzer.gainGrid(lumaBefore, gw, gh, maxAttenuation, confidence70, smoothRadius)
+            val lowLightGain = Analyzer.gainGrid(lumaLowBefore, gw, gh, maxAttenuation, confidenceLow, smoothRadius)
+            Analyzer.mixGainGrids(gray70Gain, lowLightGain, lowLightWeight, maxAttenuation)
         }
-        val mixed = rgb30.aggregateGain?.let { Analyzer.mixGainGrids(grayMixedGain, it, lowRgbWeight, MAX_ATTENUATION) }
+        val mixed = rgb30.aggregateGain?.let { Analyzer.mixGainGrids(grayMixedGain, it, lowRgbWeight, maxAttenuation) }
             ?: grayMixedGain
-        Analyzer.limitGainByConfidenceInPlace(mixed, confidence70, MAX_ATTENUATION)
+        Analyzer.limitGainByConfidenceInPlace(mixed, confidence70, maxAttenuation)
     }
 
     private suspend fun runCorrectionIterations(
@@ -1197,7 +1275,7 @@ class MeasurementActivity : Activity() {
             status("7/10 반복 $iter/$maxIterations — 보정맵 전송·적용...")
             applyGainMap(
                 client,
-                CorrectionMap(gain, rgb30.channelGains, lowRgbWeight, detail = strokeDetail?.gain, maxAttenuation = MAX_ATTENUATION, shareChannels = true),
+                CorrectionMap(gain, rgb30.channelGains, lowRgbWeight, detail = strokeDetail?.gain, maxAttenuation = maxAttenuation, shareChannels = true),
                 gw, gh, screenW, screenH,
             )
             lastAppliedIsBest = false
@@ -1258,13 +1336,13 @@ class MeasurementActivity : Activity() {
             val grayScoreLow = uniformityScore(lowSt, lumaLowAfter, gw, gh)
             val refined70 = withContext(Dispatchers.Default) {
                 Analyzer.refineGain(
-                    gain, lumaAfter, target, DAMPING_ALPHA, gw, gh, MAX_ATTENUATION,
+                    gain, lumaAfter, target, DAMPING_ALPHA, gw, gh, maxAttenuation,
                     confidenceAfter, smoothRadius
                 )
             }
             val refined30 = withContext(Dispatchers.Default) {
                 Analyzer.refineGain(
-                    gain, lumaLowAfter, lowTarget, DAMPING_ALPHA, gw, gh, MAX_ATTENUATION,
+                    gain, lumaLowAfter, lowTarget, DAMPING_ALPHA, gw, gh, maxAttenuation,
                     confidenceLowAfter, smoothRadius
                 )
             }
@@ -1284,7 +1362,7 @@ class MeasurementActivity : Activity() {
                         if (t != null) {
                             val r = withContext(Dispatchers.Default) {
                                 Analyzer.refineGain(
-                                    gainForRgb, grid, t, DAMPING_ALPHA, gw, gh, MAX_ATTENUATION,
+                                    gainForRgb, grid, t, DAMPING_ALPHA, gw, gh, maxAttenuation,
                                     confidence, smoothRadius
                                 )
                             }
@@ -1369,20 +1447,20 @@ class MeasurementActivity : Activity() {
             val refinedRgb30 = if (rgbAttSum != null && rgbRefinedCount > 0) {
                 // averageGainGrids와 같은 평균: 감쇠 평균을 gain으로 되돌리고 상한으로 자른다.
                 val n = rgbRefinedCount.toFloat()
-                FloatArray(rgbAttSum.size) { (1f - rgbAttSum[it] / n).coerceIn(1f - MAX_ATTENUATION, 1f) }
+                FloatArray(rgbAttSum.size) { (1f - rgbAttSum[it] / n).coerceIn(1f - maxAttenuation, 1f) }
             } else null
             val refinedGray = withContext(Dispatchers.Default) {
-                Analyzer.mixGainGrids(refined70, refined30, lowLightWeight, MAX_ATTENUATION)
+                Analyzer.mixGainGrids(refined70, refined30, lowLightWeight, maxAttenuation)
             }
             gain = refinedRgb30?.let { rgbGain ->
                 withContext(Dispatchers.Default) {
-                    Analyzer.mixGainGrids(refinedGray, rgbGain, lowRgbWeight, MAX_ATTENUATION)
+                    Analyzer.mixGainGrids(refinedGray, rgbGain, lowRgbWeight, maxAttenuation)
                 }
             } ?: refinedGray
-            gain = Analyzer.limitGainByConfidenceInPlace(gain, confidence70, MAX_ATTENUATION)
+            gain = Analyzer.limitGainByConfidenceInPlace(gain, confidence70, maxAttenuation)
         }
 
-        val bestMap = selection.correctionMap(rgb30.channelGains, lowRgbWeight, strokeDetail?.gain, MAX_ATTENUATION)
+        val bestMap = selection.correctionMap(rgb30.channelGains, lowRgbWeight, strokeDetail?.gain, maxAttenuation)
         if (!lastAppliedIsBest) {
             status("9/10 최적 반복 맵으로 롤백 적용...")
             applyGainMap(client, bestMap, gw, gh, screenW, screenH)
@@ -1552,10 +1630,10 @@ class MeasurementActivity : Activity() {
         grayAvgPng: ByteArray?,
     ): File {
         val bestPng = withContext(Dispatchers.Default) {
-            bestMap.alphaPng(gw, gh, screenW, screenH, MAX_ATTENUATION)
+            bestMap.alphaPng(gw, gh, screenW, screenH, maxAttenuation)
         }
         val bestRgbPng = withContext(Dispatchers.Default) {
-            bestMap.rgbPng(gw, gh, screenW, screenH, MAX_ATTENUATION)
+            bestMap.rgbPng(gw, gh, screenW, screenH, maxAttenuation)
         }
         val lowIterations = floatListJson(iterLowRmsList)
         val rgb70Json = statsMapJson(rgb70.stats)
@@ -1659,7 +1737,7 @@ class MeasurementActivity : Activity() {
             .put("rgbChannelCorrectionMap", bestRgbPng != null)
             .put("estimatedBrightnessLoss", brightnessLoss)
             .put("strokeDetail", strokeDetailReport ?: JSONObject().put("used", false))
-            .put("maxAttenuation", MAX_ATTENUATION.toDouble())
+            .put("maxAttenuation", maxAttenuation.toDouble())
             .put("outputGamma", outputGamma?.toDouble() ?: JSONObject.NULL)
             .put("cameraToneCurve", capture?.let { if (it.isRaw) "RAW_LINEAR" else it.toneMode.name } ?: JSONObject.NULL)
             .put("captureFormat", capture?.captureFormatText ?: JSONObject.NULL)
@@ -1711,17 +1789,17 @@ class MeasurementActivity : Activity() {
         screenH: Int,
     ) {
         val png = withContext(Dispatchers.Default) {
-            map.alphaPng(gw, gh, screenW, screenH, MAX_ATTENUATION)
+            map.alphaPng(gw, gh, screenW, screenH, maxAttenuation)
         }
         val rgbPng = withContext(Dispatchers.Default) {
-            map.rgbPng(gw, gh, screenW, screenH, MAX_ATTENUATION)
+            map.rgbPng(gw, gh, screenW, screenH, maxAttenuation)
         }
         withContext(Dispatchers.IO) {
             val request = JSONObject()
                 .put("cmd", Protocol.CMD_APPLY_MAP)
                 .put("width", screenW)
                 .put("height", screenH)
-                .put("maxAttenuation", MAX_ATTENUATION.toDouble())
+                .put("maxAttenuation", maxAttenuation.toDouble())
                 .put("defaultStrength", 100)
             outputGamma?.let { request.put("outputGamma", it.toDouble()) }
             request
@@ -1834,11 +1912,11 @@ class MeasurementActivity : Activity() {
                 if (includeGain) {
                     val confidence = confidences[pattern]
                     val gain = withContext(Dispatchers.Default) {
-                        Analyzer.gainGrid(grid, gw, gh, MAX_ATTENUATION, confidence, smoothRadius)
+                        Analyzer.gainGrid(grid, gw, gh, maxAttenuation, confidence, smoothRadius)
                     }
                     gains += gain
                     channelGains[channel] = gain
-                    targets[pattern] = Analyzer.correctionTarget(grid, gw, gh, MAX_ATTENUATION)
+                    targets[pattern] = Analyzer.correctionTarget(grid, gw, gh, maxAttenuation)
                 }
             } finally {
                 if (!includeGain && !keepGrids) {
@@ -1851,7 +1929,7 @@ class MeasurementActivity : Activity() {
         stats.values.forEach { rmsSum += it.rmsDev }
         val meanRms = if (stats.isEmpty()) 0f else rmsSum / stats.size
         val aggregateGain = if (includeGain) {
-            withContext(Dispatchers.Default) { Analyzer.averageGainGrids(gains, MAX_ATTENUATION) }
+            withContext(Dispatchers.Default) { Analyzer.averageGainGrids(gains, maxAttenuation) }
         } else {
             null
         }

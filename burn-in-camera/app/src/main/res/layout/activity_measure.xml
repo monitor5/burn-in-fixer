@@ -83,6 +83,39 @@
             android:text="측정을 시작하면 진행 상황이 표시됩니다." />
     </ScrollView>
 
+    <!-- 최대 감쇠(%) 입력과 감쇠 필요도 검증. 측정 화면에서만 보인다. -->
+    <LinearLayout
+        android:id="@+id/rowAttenuation"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="8dp"
+        android:paddingEnd="8dp"
+        android:visibility="gone">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textSize="13sp"
+            android:text="최대 감쇠(%)" />
+
+        <EditText
+            android:id="@+id/editMaxAtt"
+            android:layout_width="64dp"
+            android:layout_height="wrap_content"
+            android:inputType="number"
+            android:maxLines="1"
+            android:text="10" />
+
+        <Button
+            android:id="@+id/btnCheckAtt"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="감쇠 필요도 검증" />
+    </LinearLayout>
+
     <!-- 측정 뒤, 그 측정의 최적 맵에서 반복 보정을 n회 더 돌린다. 측정 화면에서만 보인다. -->
     <LinearLayout
         android:id="@+id/rowExtra"
