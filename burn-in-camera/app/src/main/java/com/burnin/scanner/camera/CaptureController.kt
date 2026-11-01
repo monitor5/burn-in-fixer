@@ -621,6 +621,21 @@ class CaptureController(
      * 주사 주기의 정수배로 유지한다. 수동 고정이 아니거나 범위 한계로 거의 바뀌지 않으면 false.
      * (색감 측정에서 흰색 포화/신호 부족을 피하려고 사용)
      */
+    /** 현재 수동 노출(노출 시간, ISO). 수동 고정이 아니면 null. 잠깐 바꿨다 되돌릴 때 쓴다. */
+    fun manualExposureState(): Pair<Long, Int>? {
+        val e = manualExposureTimeNs ?: return null
+        val i = manualSensitivityIso ?: return null
+        return if (manualLocked) e to i else null
+    }
+
+    fun restoreManualExposure(state: Pair<Long, Int>) {
+        if (!manualLocked) return
+        manualExposureTimeNs = state.first
+        manualSensitivityIso = state.second
+        applyMeasurementControls(previewBuilder)
+        session?.setRepeatingRequest(previewBuilder.build(), previewCallback, handler)
+    }
+
     fun scaleManualExposure(factor: Double, displayRefreshHz: Float = 60f): Boolean {
         val exposure = manualExposureTimeNs
         val iso = manualSensitivityIso

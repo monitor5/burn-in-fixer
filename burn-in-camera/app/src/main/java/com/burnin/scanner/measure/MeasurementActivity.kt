@@ -100,6 +100,9 @@ class MeasurementActivity : Activity() {
         private const val SPARSE_BLACK_FRAMES = 8
         private const val SPARSE_INTER_FRAME_DELAY_MS = 0L
         private const val SPARSE_SETTLE_MS = 300L
+        /** 희소 촬영 노출 상향 목표: gray70 상위 1% 밝기가 이 값(선형 0~1)이 되도록. */
+        private const val SPARSE_TARGET_PEAK = 0.6f
+        private const val SPARSE_MAX_EXPOSURE_BOOST = 4f
         private const val PASS_RMS = 0.015f      // 합격: 잔여 RMS ≤ 1.5%
         private const val PASS_P95 = 0.035f      // 합격: P95 편차 ≤ 3.5%
         private const val PASS_BLOCK = 0.02f     // 합격: 블록 평균 최대 편차 ≤ 2% (좁은 띠 번인)
@@ -2248,6 +2251,20 @@ class MeasurementActivity : Activity() {
             log("희소 점등 측광 건너뜀: 보정맵이 화면 해상도와 1:1이 아님 (${gw}x$gh)")
             return null
         }
+        // 희소 패턴은 점 픽셀 하나하나가 gray70 전체 화면보다 밝지 않으므로, gray70에 맞춘 노출을 올려
+        // 점당 광자를 늘린다(잡음 ∝ 1/√광자). gray70 상위 1% 밝기가 0.6을 넘지 않게 최대 4배까지.
+        val exposureBefore = cap.manualExposureState()
+        var boosted = false
+        if (exposureBefore != null) {
+            val sorted = reference.filter { it.isFinite() && it > 0f }.sorted()
+            val p99 = if (sorted.isEmpty()) Float.NaN else sorted[((sorted.size - 1) * 0.99f).toInt()]
+            val boost = if (p99.isFinite() && p99 > 0f) (SPARSE_TARGET_PEAK / p99).coerceIn(1f, SPARSE_MAX_EXPOSURE_BOOST) else 1f
+            if (boost > 1.05f && cap.scaleManualExposure(boost.toDouble(), inputRefreshHz())) {
+                boosted = true
+                log("희소 점등 측광$label 노출 ×${fmt(boost)} (${cap.manualExposureText()}, gray70 상위1% ${fmt(p99)})")
+                delay(300)
+            }
+        }
         return try {
             status("4/10 희소 점등 측광$label 준비: black 풀해상도 촬영...")
             withContext(Dispatchers.IO) { client.showPattern("black") }
@@ -2312,6 +2329,9 @@ class MeasurementActivity : Activity() {
             log("희소 점등 측광$label 실패 — 저주파 보정만 진행: ${e.message}")
             runCatching { withContext(Dispatchers.IO) { client.showPattern("gray70") } }
             null
+        } finally {
+            // 이후 패턴(gray25·RGB·반복)은 원래 노출로 찍어야 기준과 비교가 맞는다
+            if (boosted && exposureBefore != null) cap.restoreManualExposure(exposureBefore)
         }
     }
 
