@@ -635,7 +635,7 @@ class MeasurementActivity : Activity() {
                 Analyzer.confidenceGrid(lumaBeforeRaw, blackFullGrid, strayWarn = 0.05f)
             }
             val flickerConfidence70 = temporalLumaConfidence(
-                grayCapture.frameStore, blackAvg, homography, screenW, screenH, gw, gh
+                grayCapture.frameStore, blackAvg, homography, screenW, screenH, gw, gh, label = "gray70",
             )
             flickerStability70 = Analyzer.meanConfidence(flickerConfidence70)
             withContext(Dispatchers.Default) { Analyzer.combineConfidence(baseConfidence70, flickerConfidence70) }
@@ -686,7 +686,7 @@ class MeasurementActivity : Activity() {
             }
             val luma = withContext(Dispatchers.Default) { Analyzer.applyFlatField(raw, flatField) }
             val baseConf = withContext(Dispatchers.Default) { Analyzer.confidenceGrid(raw, blackFullGrid, strayWarn = 0.05f) }
-            val flicker = temporalLumaConfidence(base.frameStore, blackAvg, homography, screenW, screenH, gw, gh)
+            val flicker = temporalLumaConfidence(base.frameStore, blackAvg, homography, screenW, screenH, gw, gh, label = "gray70(색 레이어)")
             flickerStability70 = Analyzer.meanConfidence(flicker)
             val conf = withContext(Dispatchers.Default) {
                 val single = Analyzer.combineConfidence(baseConf, flicker)
@@ -758,7 +758,7 @@ class MeasurementActivity : Activity() {
                 Analyzer.confidenceGrid(lumaLowBeforeRaw, blackFullGrid, strayWarn = LOW_LIGHT_STRAY_WARN)
             }
             val flickerConfidenceLow = temporalLumaConfidence(
-                lowBeforeCapture.frameStore, blackAvg, homography, screenW, screenH, gw, gh
+                lowBeforeCapture.frameStore, blackAvg, homography, screenW, screenH, gw, gh, label = LOW_LIGHT_PATTERN,
             )
             flickerStabilityLow = Analyzer.meanConfidence(flickerConfidenceLow)
             withContext(Dispatchers.Default) {
@@ -1811,7 +1811,8 @@ class MeasurementActivity : Activity() {
                         Analyzer.confidenceGrid(rawGrid, blackFull, strayWarn = LOW_LIGHT_STRAY_WARN)
                     }
                     val flickerConfidence = temporalChannelConfidence(
-                        capture.frameStore, blackRgb, channel, h, screenW, screenH, gw, gh
+                        capture.frameStore, blackRgb, channel, h, screenW, screenH, gw, gh,
+                        label = if (makeHeatmaps || includeGain) pattern else "",
                     )
                     val confidence = withContext(Dispatchers.Default) {
                         Analyzer.combineConfidence(baseConfidence, flickerConfidence)
@@ -2663,6 +2664,25 @@ class MeasurementActivity : Activity() {
             RgbImage(width, height, r, g, b)
         }
 
+    /**
+     * 패턴 전환 직후 이전 패턴이 남아 첫 프레임에 섞였는지 점검한다. 프레임별 중앙값을 비교해
+     * 첫 프레임만 튀면(나머지 프레임 간 흔들림보다 확연히 크면) 잔상 의심으로 경고한다.
+     */
+    private fun checkCarryOver(label: String, grids: List<FloatArray>) {
+        if (grids.size < 3) return
+        val med = grids.map { g -> g.filter { it.isFinite() && it > 0f }.sorted().let { if (it.isEmpty()) Float.NaN else it[it.size / 2] } }
+        if (med.any { !it.isFinite() || it <= 0f }) return
+        val rest = med.drop(1).sorted()
+        val ref = rest[rest.size / 2]
+        val first = med[0] / ref - 1f
+        val restSpread = rest.maxOf { Math.abs(it / ref - 1f) }
+        val suspicious = Math.abs(first) > maxOf(0.005f, restSpread * 3f)
+        log(
+            "프레임 잔상 점검 $label: 첫 프레임 ${String.format(java.util.Locale.US, "%+.2f%%", first * 100)}, " +
+                "나머지 간 최대 ${pct(restSpread)}" + if (suspicious) " — 잔상 의심(패턴 전환 대기 부족)" else ""
+        )
+    }
+
     private suspend fun temporalLumaConfidence(
         frameStore: CaptureFrameStore,
         black: GrayImage?,
@@ -2671,6 +2691,7 @@ class MeasurementActivity : Activity() {
         screenH: Int,
         gw: Int,
         gh: Int,
+        label: String = "",
     ): FloatArray =
         withContext(Dispatchers.Default) {
             try {
@@ -2680,6 +2701,7 @@ class MeasurementActivity : Activity() {
                     ?: frameStore.files.map { file ->
                         Analyzer.lumaGrid(ImageOps.decodeLinearGray(readCaptureFrame(file)), black, h, screenW, screenH, tw, th)
                     }
+                if (label.isNotEmpty()) checkCarryOver(label, grids)
                 Analyzer.temporalStabilityConfidence(
                     grids,
                     tw,
@@ -2703,6 +2725,7 @@ class MeasurementActivity : Activity() {
         screenH: Int,
         gw: Int,
         gh: Int,
+        label: String = "",
     ): FloatArray =
         withContext(Dispatchers.Default) {
             try {
@@ -2714,6 +2737,7 @@ class MeasurementActivity : Activity() {
                         val frame = ImageOps.decodeLinearChannel(readCaptureFrame(file), channel)
                         Analyzer.lumaGrid(frame, blackChannel, h, screenW, screenH, tw, th)
                     }
+                if (label.isNotEmpty()) checkCarryOver(label, grids)
                 Analyzer.temporalStabilityConfidence(
                     grids,
                     tw,
