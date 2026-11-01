@@ -2390,6 +2390,9 @@ class MeasurementActivity : Activity() {
             attMax = maxOf(attMax, 1f - g)
         }
         val meanAtt = (attSum / gain.size).toFloat()
+        // 점 하나의 측정 잡음(프레임 간 상대 표준오차) 중앙값: 픽셀 단위 번인을 가려낼 수 있는지 판단용
+        val noiseMedian = map.relNoise.filterIndexed { i, v -> map.valid[i] && v.isFinite() }.sorted().let { if (it.isEmpty()) Float.NaN else it[it.size / 2] }
+        log("희소 점등 측광$label 점 잡음: 상대 표준오차 중앙값 ${pct(noiseMedian)} (이보다 작은 픽셀 단위 번인은 구분하기 어려움)")
         log(
             "희소 점등 측광$label 완료: 측정 픽셀 ${pct(map.validFraction)}, 고주파 기준 ${fmt(q)}, " +
                 "고주파 층 평균 감쇠 ${pct(meanAtt)} / 최대 ${pct(attMax)} (스무딩 없이 픽셀 단위 적용)"
@@ -2406,6 +2409,7 @@ class MeasurementActivity : Activity() {
             .put("lowPassRadius", lowPassRadius)
             .put("reference", q.toDouble())
             .put("meanAttenuation", meanAtt.toDouble())
+            .put("medianRelNoise", noiseMedian.toDouble())
             .put("maxAttenuation", attMax.toDouble())
         return StrokeDetail(gain, compensation, report)
     }
