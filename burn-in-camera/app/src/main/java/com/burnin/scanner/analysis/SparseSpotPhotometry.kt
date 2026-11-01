@@ -327,9 +327,12 @@ object SparseSpotPhotometry {
         for (layout in layouts) {
             if (layout.frames == 0) continue
             val mean = DoubleArray(layout.size) { k -> if (layout.located[k]) layout.fluxSum[k] / layout.frames else Double.NaN }
-            val positive = mean.filter { it.isFinite() && it > 0.0 }.sorted()
-            if (positive.isEmpty()) continue
-            val typical = positive[positive.size / 2]
+            var np = 0
+            val positive = DoubleArray(mean.size)
+            for (m in mean) if (m.isFinite() && m > 0.0) positive[np++] = m
+            if (np == 0) continue
+            positive.sort(0, np)
+            val typical = positive[np / 2]
             for (k in mean.indices) {
                 if (!(mean[k] > typical * MIN_VALID_FLUX_FRACTION)) mean[k] = Double.NaN
             }
@@ -512,8 +515,7 @@ object SparseSpotPhotometry {
         require(lowPassRadius >= 1)
         val low = weightedBox(weightedBox(map.value, map.valid, w, h, lowPassRadius), map.valid, w, h, lowPassRadius)
         // 프레임 몇 장으로 구한 블록별 분산은 그 자체가 흔들리므로, 전체 중앙값을 노이즈 하한으로 쓴다.
-        val noiseFloor = map.relNoise.indices.filter { map.valid[it] }.map { map.relNoise[it] }.sorted()
-            .let { if (it.isEmpty()) 0f else it[it.size / 2] }
+        val noiseFloor = medianWhere(map.relNoise, map.valid).let { if (it.isNaN()) 0f else it }
         val out = FloatArray(w * h) { 1f }
         for (i in out.indices) {
             if (!map.valid[i] || low[i] <= 0f) continue
@@ -534,18 +536,21 @@ object SparseSpotPhotometry {
         val w = map.width
         val h = map.height
         val low = weightedBox(weightedBox(map.value, map.valid, w, h, lowPassRadius), map.valid, w, h, lowPassRadius)
-        val raw = ArrayList<Float>()
-        val noise = ArrayList<Float>()
+        // 화면 해상도(300만 픽셀)라 박싱 리스트 대신 원시 배열로 모은다(힙 512MB 한도)
+        val raw = FloatArray(map.value.size)
+        val noise = FloatArray(map.value.size)
+        var n = 0
         for (i in map.value.indices) {
             if (!map.valid[i] || low[i] <= 0f) continue
-            raw += map.value[i] / low[i]
-            noise += map.relNoise[i]
+            raw[n] = map.value[i] / low[i]
+            noise[n] = map.relNoise[i]
+            n++
         }
-        if (raw.isEmpty()) return 1f
-        raw.sort()
-        noise.sort()
-        val sigma = noise[noise.size / 2]
-        return (raw[(raw.size * 0.005f).toInt().coerceAtMost(raw.size - 1)] + 2.58f * sigma).coerceIn(1f - maxAtt, 1f)
+        if (n == 0) return 1f
+        raw.sort(0, n)
+        noise.sort(0, n)
+        val sigma = noise[n / 2]
+        return (raw[(n * 0.005f).toInt().coerceAtMost(n - 1)] + 2.58f * sigma).coerceIn(1f - maxAtt, 1f)
     }
 
     /**
@@ -593,17 +598,16 @@ object SparseSpotPhotometry {
         val low = weightedBox(weightedBox(map.value, map.valid, w, h, lowPassRadius), map.valid, w, h, lowPassRadius)
         var ss = 0.0
         var n = 0
-        val noise = ArrayList<Float>()
+        val noise = FloatArray(map.value.size)
         for (i in map.value.indices) {
             if (!map.valid[i] || low[i] <= 0f) continue
             val d = map.value[i] / low[i] - 1.0
             ss += d * d
-            n++
-            noise += map.relNoise[i]
+            noise[n++] = map.relNoise[i]
         }
         if (n == 0) return Float.NaN
-        noise.sort()
-        val sigma = noise[noise.size / 2].toDouble()
+        noise.sort(0, n)
+        val sigma = noise[n / 2].toDouble()
         return Math.sqrt(maxOf(0.0, ss / n - sigma * sigma)).toFloat()
     }
 
@@ -630,6 +634,19 @@ object SparseSpotPhotometry {
                 old[i] + (target - old[i]) * a
             }
         }
+    }
+
+    /** [mask]가 참인 유한 값의 중앙값(원시 배열). 없으면 NaN. */
+    fun medianWhere(values: FloatArray, mask: BooleanArray? = null): Float {
+        val tmp = FloatArray(values.size)
+        var n = 0
+        for (i in values.indices) {
+            val v = values[i]
+            if ((mask == null || mask[i]) && v.isFinite()) tmp[n++] = v
+        }
+        if (n == 0) return Float.NaN
+        tmp.sort(0, n)
+        return tmp[n / 2]
     }
 
     private fun highPass(src: FloatArray, valid: BooleanArray, w: Int, h: Int, radius: Int): FloatArray {

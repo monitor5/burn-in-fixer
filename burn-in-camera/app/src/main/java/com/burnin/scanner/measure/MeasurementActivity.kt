@@ -1164,6 +1164,10 @@ class MeasurementActivity : Activity() {
         suspend fun finish(iterated: CorrectionIterations) {
         // ── 7.5 픽셀 단위 검증·재귀 개선: 전면 gray/RGB 격자로는 획 단위 잔차가 안 보인다 ──
         val refined = currentDetail?.let {
+            // 반복 중 미리 찍어 둔 묶음을 지우고 GC를 권해 풀해상도 희소 측정 여유를 만든다
+            clearPrefetched()
+            System.gc()
+            log("픽셀 단위 검증 시작, ${heapText()}")
             refinePixelDetail(client, cap, homography, screenW, screenH, smoothRadius, confidence70, lumaBefore, iterated, it, gw, gh)
         }
         if (refined != null) currentDetail = refined.second
@@ -2297,8 +2301,12 @@ class MeasurementActivity : Activity() {
         val exposureBefore = cap.manualExposureState()
         var boosted = false
         if (exposureBefore != null) {
-            val sorted = reference.filter { it.isFinite() && it > 0f }.sorted()
-            val p99 = if (sorted.isEmpty()) Float.NaN else sorted[((sorted.size - 1) * 0.99f).toInt()]
+            // 화면 해상도 배열이라 박싱 리스트(수십 MB) 대신 원시 배열로 정렬한다
+            val sorted = FloatArray(reference.size)
+            var np = 0
+            for (v in reference) if (v.isFinite() && v > 0f) sorted[np++] = v
+            sorted.sort(0, np)
+            val p99 = if (np == 0) Float.NaN else sorted[((np - 1) * 0.99f).toInt()]
             val boost = if (p99.isFinite() && p99 > 0f) (SPARSE_TARGET_PEAK / p99).coerceIn(1f, SPARSE_MAX_EXPOSURE_BOOST) else 1f
             if (boost > 1.05f && cap.scaleManualExposure(boost.toDouble(), inputRefreshHz())) {
                 boosted = true
@@ -2311,14 +2319,16 @@ class MeasurementActivity : Activity() {
             withContext(Dispatchers.IO) { client.showPattern("black") }
             delay(SPARSE_SETTLE_MS)
             val blackStore = captureFrameStore(cap, SPARSE_BLACK_FRAMES, SPARSE_INTER_FRAME_DELAY_MS)
-            val black = try {
+            var black: GrayImage? = try {
                 if (channel == null) averageFullResFromStore(blackStore)
                 else withContext(Dispatchers.Default) { NativePixel.average(blackStore.files, channel, ImageOps.FULL_RESOLUTION) }
                     ?: averageDecodedFromStore(blackStore) { ImageOps.decodeLinearChannel(it, channel, Int.MAX_VALUE) }
             } finally {
                 blackStore.delete()
             }
-            val sample = ImageOps.downsampleFactor(black.w, black.h)
+            val bw = black!!.w
+            val bh = black.h
+            val sample = ImageOps.downsampleFactor(bw, bh)
             val hFull = homography.withImageAffine(sample.toDouble(), (sample - 1) / 2.0)
             val camPerScreen = SparseSpotPhotometry.cameraPxPerScreenPx(hFull, screenW, screenH)
             val plan = SparseSpotPhotometry.plan(camPerScreen)
@@ -2329,8 +2339,8 @@ class MeasurementActivity : Activity() {
                 )
                 return null
             }
-            log("희소 점등 측광$label: 화면 1px당 카메라 ${fmt(camPerScreen)}px (풀해상도 ${black.w}x${black.h}), $plan")
-            val sparseBuffer = FloatArray(black.w * black.h)
+            log("희소 점등 측광$label: 화면 1px당 카메라 ${fmt(camPerScreen)}px (풀해상도 ${bw}x$bh), $plan")
+            var sparseBuffer: FloatArray? = FloatArray(bw * bh)
             val layouts = ArrayList<SparseSpotPhotometry.PhaseLayout>()
             for ((index, phase) in plan.phases().withIndex()) {
                 status("$step 희소 점등 측광$label ${index + 1}/${plan.patternCount}...")
@@ -2342,10 +2352,10 @@ class MeasurementActivity : Activity() {
                     for (file in store.files) {
                         val frame = withContext(Dispatchers.Default) {
                             // 네이티브로 재사용 버퍼에 디코드·black 차감(프레임마다 50MB 배열을 새로 만들지 않음)
-                            if (NativePixel.decodeInto(file, mode, ImageOps.FULL_RESOLUTION, black.data, sparseBuffer)) {
-                                SparseSpotPhotometry.Frame(black.w, black.h, sparseBuffer)
+                            if (NativePixel.decodeInto(file, mode, ImageOps.FULL_RESOLUTION, black!!.data, sparseBuffer!!)) {
+                                SparseSpotPhotometry.Frame(bw, bh, sparseBuffer!!)
                             } else {
-                                fullResMinusBlack(readCaptureFrame(file), black, channel)
+                                fullResMinusBlack(readCaptureFrame(file), black!!, channel)
                             }
                         }
                         withContext(Dispatchers.Default) {
@@ -2361,6 +2371,9 @@ class MeasurementActivity : Activity() {
                 }
             }
             withContext(Dispatchers.IO) { client.showPattern("gray70") }
+            // 조립 전에 풀해상도 black·디코드 버퍼(약 100MB)를 놓는다
+            black = null
+            sparseBuffer = null
             withContext(Dispatchers.Default) { onLayouts(layouts, plan, camPerScreen) }
         } catch (e: CancellationException) {
             throw e
@@ -2450,7 +2463,7 @@ class MeasurementActivity : Activity() {
         }
         val meanAtt = (attSum / gain.size).toFloat()
         // 점 하나의 측정 잡음(프레임 간 상대 표준오차) 중앙값: 픽셀 단위 번인을 가려낼 수 있는지 판단용
-        val noiseMedian = map.relNoise.filterIndexed { i, v -> map.valid[i] && v.isFinite() }.sorted().let { if (it.isEmpty()) Float.NaN else it[it.size / 2] }
+        val noiseMedian = SparseSpotPhotometry.medianWhere(map.relNoise, map.valid)
         log("희소 점등 측광$label 점 잡음: 상대 표준오차 중앙값 ${pct(noiseMedian)} (이보다 작은 픽셀 단위 번인은 구분하기 어려움)")
         log(
             "희소 점등 측광$label 완료: 측정 픽셀 ${pct(map.validFraction)}, 고주파 기준 ${fmt(q)}, " +
