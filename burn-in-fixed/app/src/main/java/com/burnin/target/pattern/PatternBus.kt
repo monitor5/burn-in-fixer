@@ -26,6 +26,8 @@ object PatternBus {
         private set
     @Volatile var correctionEnabled: Boolean = false
     @Volatile var strengthPct: Int = 100
+    /** 마지막 패턴 그리기 실패 사유. ControlServer가 표시 요청마다 비우고 ACK 전에 확인한다. */
+    @Volatile var renderError: String? = null
 
     @Volatile private var host: Host? = null
 

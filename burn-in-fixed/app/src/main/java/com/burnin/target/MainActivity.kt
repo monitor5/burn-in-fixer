@@ -23,6 +23,7 @@ import com.burnin.target.pattern.PatternActivity
 import com.burnin.target.pattern.PatternBus
 import com.burnin.target.pattern.PatternSpec
 import com.burnin.target.util.AppLog
+import com.burnin.target.util.CrashLog
 import com.burnin.target.util.NetUtils
 
 /**
@@ -91,12 +92,15 @@ class MainActivity : Activity() {
             requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 1)
         }
 
-        CorrectionStore.loadFromDisk(this)
-        WhiteBalanceStore.loadFromDisk(this)
-        ColorProfileStore.loadFromDisk(this)
+        CrashLog.install(this)
+        // 액티비티만 다시 만들어진 경우(같은 프로세스)에는 이미 적재된 프로파일을 다시 굽지 않는다.
+        if (CorrectionStore.meta == null) CorrectionStore.loadFromDisk(this)
+        if (WhiteBalanceStore.meta == null) WhiteBalanceStore.loadFromDisk(this)
+        if (ColorProfileStore.meta == null) ColorProfileStore.loadFromDisk(this)
         ControlServer.start(this)
         showDisclaimerOnce()
-        AppLog.i("대상 기기 앱 시작")
+        val rt = Runtime.getRuntime()
+        AppLog.i("대상 기기 앱 시작 (pid ${android.os.Process.myPid()}, heap max ${rt.maxMemory() shr 20}MB)")
     }
 
     override fun onResume() {

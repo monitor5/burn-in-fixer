@@ -9,6 +9,7 @@ import android.graphics.Rect
 import android.view.View
 import com.burnin.target.correction.ColorLut
 import com.burnin.target.correction.OutputTransfer
+import com.burnin.target.util.AppLog
 import kotlin.math.min
 
 /**
@@ -122,8 +123,19 @@ class PatternView(context: Context) : View(context) {
                 val rgb = correctionRgbBitmap
                 val wb = whiteBalanceRgbBitmap
                 val base = colorLut?.transformArgb(spec.color) ?: spec.color
-                if (correctionEnabled && (rgb != null || wb != null)) {
-                    canvas.drawBitmap(correctedSolidBitmap(base, w, h, rgb, wb), 0f, 0f, null)
+                val corrected = if (correctionEnabled && (rgb != null || wb != null)) {
+                    try {
+                        correctedSolidBitmap(base, w, h, rgb, wb)
+                    } catch (e: OutOfMemoryError) {
+                        // 죽지 않고 측정 쪽에 패턴 표시 실패로 알린다(보정 없는 화면을 보정된 것으로 재지 않게).
+                        clearSolidCache()
+                        PatternBus.renderError = "보정 화면 생성 메모리 부족 (${w}x${h})"
+                        AppLog.i("!! ${PatternBus.renderError}")
+                        null
+                    }
+                } else null
+                if (corrected != null) {
+                    canvas.drawBitmap(corrected, 0f, 0f, null)
                     usedCorrectionRgbSolid = rgb != null
                 } else {
                     canvas.drawColor(base)
@@ -245,14 +257,10 @@ class PatternView(context: Context) : View(context) {
         clearSolidCache()
         val correctionMap = scaledMap(rgb, w, h)
         val whiteBalanceMap = scaledMap(whiteBalanceRgb, w, h)
-        val correctionAtt = correctionMap?.let {
-            IntArray(w * h).also { out -> it.getPixels(out, 0, w, 0, 0, w, h) }
-        }
-        val whiteBalanceAtt = whiteBalanceMap?.let {
-            IntArray(w * h).also { out -> it.getPixels(out, 0, w, 0, 0, w, h) }
-        }
-        if (correctionMap != null && correctionMap !== rgb) correctionMap.recycle()
-        if (whiteBalanceMap != null && whiteBalanceMap !== whiteBalanceRgb) whiteBalanceMap.recycle()
+        // 감쇠 맵은 한 행씩만 읽는다(전체 화면 IntArray 두 장을 피해 구형 기기 힙 사용을 줄인다).
+        val correctionRow = correctionMap?.let { IntArray(w) }
+        val whiteBalanceRow = whiteBalanceMap?.let { IntArray(w) }
+        var loadedRow = -1
         val strength = strengthPct / 100.0
         val correctionMaxAtt = correctionMaxAttenuation
         val whiteBalanceMaxAtt = whiteBalanceMaxAttenuation
@@ -267,12 +275,22 @@ class PatternView(context: Context) : View(context) {
         for (channel in 0 until 3) {
             val shift = 16 - 8 * channel
             val base = (color shr shift) and 0xFF
+            loadedRow = -1
             OutputTransfer.dither(w, h, 255, { i ->
-                val c = correctionAtt?.let { (it[i] shr shift) and 0xFF } ?: 0
-                val wbv = whiteBalanceAtt?.let { (it[i] shr shift) and 0xFF } ?: 0
+                val y = i / w
+                if (y != loadedRow) {
+                    if (correctionRow != null) correctionMap?.getPixels(correctionRow, 0, w, 0, y, w, 1)
+                    if (whiteBalanceRow != null) whiteBalanceMap?.getPixels(whiteBalanceRow, 0, w, 0, y, w, 1)
+                    loadedRow = y
+                }
+                val x = i - y * w
+                val c = if (correctionRow != null) (correctionRow[x] shr shift) and 0xFF else 0
+                val wbv = if (whiteBalanceRow != null) (whiteBalanceRow[x] shr shift) and 0xFF else 0
                 base * codeGainLut[(c shl 8) or wbv]
             }) { i, v -> out[i] = out[i] or (v shl shift) }
         }
+        if (correctionMap != null && correctionMap !== rgb) correctionMap.recycle()
+        if (whiteBalanceMap != null && whiteBalanceMap !== whiteBalanceRgb) whiteBalanceMap.recycle()
         val bmp = Bitmap.createBitmap(out, w, h, Bitmap.Config.ARGB_8888)
         solidCache = bmp
         solidCacheColor = color
