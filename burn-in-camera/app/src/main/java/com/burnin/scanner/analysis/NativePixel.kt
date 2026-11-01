@@ -69,6 +69,23 @@ object NativePixel {
         return decodeIntoNative(file.absolutePath, mode, maxLongEdge, ImageOps.yLinearLut(), black, out)
     }
 
+    /** 풀해상도 black을 네이티브에 보관한다(null이면 해제). 이후 [decodeIntoStored]가 이 black을 뺀다. */
+    fun storeBlack(black: FloatArray?): Boolean {
+        if (!available || !enabled) return false
+        storeBlackNative(black)
+        return true
+    }
+
+    /** [decodeInto]와 같되 [storeBlack]으로 보관한 black을 뺀다(크기가 다르면 false). */
+    fun decodeIntoStored(file: File, mode: Int, maxLongEdge: Int, out: FloatArray): Boolean {
+        if (!available || !enabled) return false
+        return decodeIntoStoredNative(file.absolutePath, mode, maxLongEdge, ImageOps.yLinearLut(), out)
+    }
+
+    private external fun storeBlackNative(black: FloatArray?)
+
+    private external fun decodeIntoStoredNative(path: String, mode: Int, maxLongEdge: Int, yLut: FloatArray, out: FloatArray): Boolean
+
     private external fun decodeIntoNative(
         path: String, mode: Int, maxLongEdge: Int, yLut: FloatArray, black: FloatArray?, out: FloatArray,
     ): Boolean

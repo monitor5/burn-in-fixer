@@ -438,6 +438,46 @@ Java_com_burnin_scanner_analysis_NativePixel_frameGridsNative(
     return arr;
 }
 
+// 희소 측정용 풀해상도 black(약 50MB)을 Java 힙 대신 네이티브에 둔다(측정 앱 힙 512MB 한도).
+static std::vector<float> gStoredBlack;
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_burnin_scanner_analysis_NativePixel_storeBlackNative(JNIEnv* env, jobject, jfloatArray blackArr) {
+    if (!blackArr) {
+        std::vector<float>().swap(gStoredBlack);
+        return;
+    }
+    const jsize n = env->GetArrayLength(blackArr);
+    gStoredBlack.resize((size_t) n);
+    env->GetFloatArrayRegion(blackArr, 0, n, gStoredBlack.data());
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_burnin_scanner_analysis_NativePixel_decodeIntoStoredNative(
+        JNIEnv* env, jobject, jstring jpath, jint mode, jint maxLongEdge, jfloatArray yLutArr, jfloatArray outArr) {
+    float yLut[256];
+    env->GetFloatArrayRegion(yLutArr, 0, 256, yLut);
+    const char* cpath = env->GetStringUTFChars(jpath, nullptr);
+    Frame fr;
+    bool ok = readFrame(cpath, fr);
+    env->ReleaseStringUTFChars(jpath, cpath);
+    if (!ok) return JNI_FALSE;
+    int w = 0, h = 0;
+    std::vector<float> cur;
+    if (!decodeFrame(fr, mode, maxLongEdge, yLut, w, h, cur)) return JNI_FALSE;
+    fr.planes.clear();
+    const jsize total = (jsize) cur.size();
+    if (env->GetArrayLength(outArr) != total || gStoredBlack.size() != (size_t) total) return JNI_FALSE;
+    auto* out = (float*) env->GetPrimitiveArrayCritical(outArr, nullptr);
+    const float* black = gStoredBlack.data();
+    parallelRows(h, [&](int y) {
+        size_t o = (size_t) y * w;
+        for (int x = 0; x < w; x++) out[o + x] = cur[o + x] - black[o + x];
+    });
+    env->ReleasePrimitiveArrayCritical(outArr, out, 0);
+    return JNI_TRUE;
+}
+
 // 프레임 하나를 디코드해 Java 배열 [out]에 쓴다(재사용 버퍼). [black]이 있으면 뺀다.
 // 희소 점등 측광처럼 원본 해상도 프레임을 여러 장 차례로 처리할 때 Java 힙 할당 없이 쓴다.
 extern "C" JNIEXPORT jboolean JNICALL

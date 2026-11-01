@@ -128,12 +128,13 @@ object SparseSpotPhotometry {
         /** 블록 무게중심 (카메라 px) */
         val centerX = FloatArray(size)
         val centerY = FloatArray(size)
-        /** 무게중심의 소수부 위상 (창 중심 기준, -0.5..0.5) */
-        val fracX = FloatArray(size)
-        val fracY = FloatArray(size)
+        /** 무게중심의 소수부 위상 (창 중심 기준, -0.5..0.5). 블록 수가 많아(위상당 12만) 저장하지 않고 계산한다. */
+        fun fracX(k: Int): Float = centerX[k] - Math.round(centerX[k])
+        fun fracY(k: Int): Float = centerY[k] - Math.round(centerY[k])
         val located = BooleanArray(size)
-        val fluxSum = DoubleArray(size)
-        val fluxSumSq = DoubleArray(size)
+        /** 프레임 간 적분 광량의 평균과 편차 제곱합(Welford, float로 블록당 8바이트) */
+        val fluxMean = FloatArray(size)
+        val fluxM2 = FloatArray(size)
         var frames = 0
             internal set
 
@@ -217,8 +218,6 @@ object SparseSpotPhotometry {
                 if (!apertureInside(frame, found[0], found[1], aperture)) continue
                 layout.centerX[k] = found[0]
                 layout.centerY[k] = found[1]
-                layout.fracX[k] = found[0] - Math.round(found[0])
-                layout.fracY[k] = found[1] - Math.round(found[1])
                 layout.located[k] = true
             }
         }
@@ -296,8 +295,11 @@ object SparseSpotPhotometry {
                 continue
             }
             val acc = apertureSum(frame, layout.centerX[k], layout.centerY[k], r)
-            layout.fluxSum[k] += acc
-            layout.fluxSumSq[k] += acc * acc
+            val n = layout.frames + 1
+            val a = acc.toFloat()
+            val delta = a - layout.fluxMean[k]
+            layout.fluxMean[k] += delta / n
+            layout.fluxM2[k] += delta * (a - layout.fluxMean[k])
         }
         layout.frames++
     }
@@ -325,55 +327,76 @@ object SparseSpotPhotometry {
         val noise = FloatArray(n)
         val valid = BooleanArray(n)
         for (layout in layouts) {
-            if (layout.frames == 0) continue
-            val mean = DoubleArray(layout.size) { k -> if (layout.located[k]) layout.fluxSum[k] / layout.frames else Double.NaN }
-            var np = 0
-            val positive = DoubleArray(mean.size)
-            for (m in mean) if (m.isFinite() && m > 0.0) positive[np++] = m
-            if (np == 0) continue
-            positive.sort(0, np)
-            val typical = positive[np / 2]
-            for (k in mean.indices) {
-                if (!(mean[k] > typical * MIN_VALID_FLUX_FRACTION)) mean[k] = Double.NaN
-            }
-            val phaseCorr = phaseCorrection(layout, mean)
-            val accepted = ArrayList<Double>()
-            for (k in mean.indices) {
-                if (!mean[k].isFinite()) continue
-                val b = phaseBin(layout.fracX[k]) * PHASE_BINS + phaseBin(layout.fracY[k])
-                mean[k] = mean[k] / phaseCorr[b]
-                accepted += mean[k]
-            }
-            if (accepted.isEmpty()) continue
-            accepted.sort()
-            val median = accepted[accepted.size / 2]
-            val block = layout.plan.block
-            for (j in 0 until layout.ny) {
-                for (i in 0 until layout.nx) {
-                    val k = j * layout.nx + i
-                    val m = mean[k]
-                    if (!m.isFinite()) continue
-                    val rel = (m / median).toFloat()
-                    val variance = if (layout.frames > 1) {
-                        val raw = layout.fluxSum[k] / layout.frames
-                        (layout.fluxSumSq[k] / layout.frames - raw * raw).coerceAtLeast(0.0) / (layout.frames - 1)
-                    } else {
-                        0.0
-                    }
-                    val rawMean = layout.fluxSum[k] / layout.frames
-                    val relErr = if (rawMean > 0.0) (Math.sqrt(variance) / rawMean).toFloat() else 1f
-                    for (y in layout.screenY(j) until minOf(screenH, layout.screenY(j) + block)) {
-                        for (x in layout.screenX(i) until minOf(screenW, layout.screenX(i) + block)) {
-                            val idx = y * screenW + x
-                            value[idx] = rel
-                            noise[idx] = relErr
-                            valid[idx] = true
-                        }
-                    }
+            val (rel, err) = normalizedBlocks(layout) ?: continue
+            paint(layout, rel, err, 0, 0, screenW, screenH, value, noise, valid)
+        }
+        return SparseMap(screenW, screenH, value, noise, valid)
+    }
+
+    /**
+     * 위상 하나의 블록별 상대 휘도(위상·소수부 위상 보정 후 중앙값 1)와 상대 표준오차.
+     * 측정 안 된 블록은 NaN. 측정이 없으면 null.
+     */
+    private fun normalizedBlocks(layout: PhaseLayout): Pair<FloatArray, FloatArray>? {
+        if (layout.frames == 0) return null
+        val mean = DoubleArray(layout.size) { k -> if (layout.located[k]) layout.fluxMean[k].toDouble() else Double.NaN }
+        var np = 0
+        val positive = DoubleArray(mean.size)
+        for (m in mean) if (m.isFinite() && m > 0.0) positive[np++] = m
+        if (np == 0) return null
+        positive.sort(0, np)
+        val typical = positive[np / 2]
+        for (k in mean.indices) {
+            if (!(mean[k] > typical * MIN_VALID_FLUX_FRACTION)) mean[k] = Double.NaN
+        }
+        val phaseCorr = phaseCorrection(layout, mean)
+        np = 0
+        for (k in mean.indices) {
+            if (!mean[k].isFinite()) continue
+            val b = phaseBin(layout.fracX(k)) * PHASE_BINS + phaseBin(layout.fracY(k))
+            mean[k] = mean[k] / phaseCorr[b]
+            positive[np++] = mean[k]
+        }
+        if (np == 0) return null
+        positive.sort(0, np)
+        val median = positive[np / 2]
+        val rel = FloatArray(layout.size) { Float.NaN }
+        val err = FloatArray(layout.size)
+        val frames = layout.frames
+        for (k in 0 until layout.size) {
+            val m = mean[k]
+            if (!m.isFinite()) continue
+            rel[k] = (m / median).toFloat()
+            // 평균의 표준오차: 모분산(M2/n)/(n-1)
+            val variance = if (frames > 1) (layout.fluxM2[k].toDouble() / frames).coerceAtLeast(0.0) / (frames - 1) else 0.0
+            val rawMean = layout.fluxMean[k].toDouble()
+            err[k] = if (rawMean > 0.0) (Math.sqrt(variance) / rawMean).toFloat() else 1f
+        }
+        return rel to err
+    }
+
+    /** 블록 값을 화면 맵에 칠한다. out(x,y) = 블록(x+dx, y+dy), 즉 블록을 (-dx,-dy)만큼 옮겨 쓴다. */
+    private fun paint(
+        layout: PhaseLayout, rel: FloatArray, err: FloatArray, dx: Int, dy: Int,
+        screenW: Int, screenH: Int, value: FloatArray, noise: FloatArray, valid: BooleanArray,
+    ) {
+        val block = layout.plan.block
+        for (j in 0 until layout.ny) for (i in 0 until layout.nx) {
+            val k = j * layout.nx + i
+            if (!rel[k].isFinite()) continue
+            for (sy in layout.screenY(j) until layout.screenY(j) + block) {
+                val y = sy - dy
+                if (sy >= screenH || y !in 0 until screenH) continue
+                for (sx in layout.screenX(i) until layout.screenX(i) + block) {
+                    val x = sx - dx
+                    if (sx >= screenW || x !in 0 until screenW) continue
+                    val idx = y * screenW + x
+                    value[idx] = rel[k]
+                    noise[idx] = err[k]
+                    valid[idx] = true
                 }
             }
         }
-        return SparseMap(screenW, screenH, value, noise, valid)
     }
 
     private fun phaseBin(frac: Float): Int = ((frac + 0.5f) * PHASE_BINS).toInt().coerceIn(0, PHASE_BINS - 1)
@@ -383,7 +406,7 @@ object SparseSpotPhotometry {
         val all = ArrayList<Double>()
         for (k in mean.indices) {
             if (!mean[k].isFinite()) continue
-            bins[phaseBin(layout.fracX[k]) * PHASE_BINS + phaseBin(layout.fracY[k])] += mean[k]
+            bins[phaseBin(layout.fracX(k)) * PHASE_BINS + phaseBin(layout.fracY(k))] += mean[k]
             all += mean[k]
         }
         val corr = DoubleArray(bins.size) { 1.0 }
@@ -467,19 +490,69 @@ object SparseSpotPhotometry {
         val noise = FloatArray(n)
         val valid = BooleanArray(n)
         val lags = ArrayList<IntArray>()
+        // 위상마다 화면 해상도 사본을 만들지 않도록(힙 512MB 한도) 기준 고주파는 한 번만 구하고,
+        // 희소 쪽 고주파·상관은 블록 격자에서 바로 계산한다([alignmentLag]와 같은 판정).
+        val refValid = BooleanArray(n) { reference[it].isFinite() && reference[it] > 0f }
+        val r = highPass(reference, refValid, screenW, screenH, highPassRadius)
         for (layout in layouts) {
-            val single = assemble(listOf(layout), screenW, screenH)
-            val pitch = layout.plan.pitch
-            val lag = alignmentLag(single, reference, maxLag = pitch, highPassRadius = highPassRadius, step = pitch)
-            lags += lag
-            val fixed = shift(single, -lag[0], -lag[1])
-            for (i in 0 until n) {
-                if (fixed.valid[i]) {
-                    value[i] = fixed.value[i]; noise[i] = fixed.relNoise[i]; valid[i] = true
-                }
+            val normalized = normalizedBlocks(layout)
+            if (normalized == null) {
+                lags += intArrayOf(0, 0)
+                continue
             }
+            val (rel, err) = normalized
+            val pitch = layout.plan.pitch
+            val gridRadius = maxOf(1, Math.round(highPassRadius / pitch.toFloat()))
+            val lag = blockLag(layout, rel, r, screenW, screenH, pitch, gridRadius)
+            lags += lag
+            // sparse(x)가 reference(x+lag)와 맞으므로 블록을 +lag만큼 옮긴다
+            paint(layout, rel, err, -lag[0], -lag[1], screenW, screenH, value, noise, valid)
         }
         return SparseMap(screenW, screenH, value, noise, valid) to lags
+    }
+
+    /** 블록 격자에서 희소 고주파 s와 기준 고주파 r(x+lag)의 상관이 최대인 피치 단위 lag. */
+    private fun blockLag(
+        layout: PhaseLayout, rel: FloatArray, r: FloatArray, w: Int, h: Int, pitch: Int, gridRadius: Int,
+        minGain: Float = 1.5f,
+    ): IntArray {
+        val nx = layout.nx
+        val ny = layout.ny
+        val ok = BooleanArray(layout.size) { rel[it].isFinite() }
+        val low = weightedBox(FloatArray(layout.size) { if (ok[it]) rel[it] else 0f }, ok, nx, ny, gridRadius)
+        val sHp = FloatArray(layout.size) { if (ok[it] && low[it] > 0f) rel[it] / low[it] - 1f else 0f }
+        val block = layout.plan.block
+        fun corr(dx: Int, dy: Int): Double {
+            var acc = 0.0
+            for (j in 0 until ny) for (i in 0 until nx) {
+                val k = j * nx + i
+                if (!ok[k]) continue
+                for (sy in layout.screenY(j) until layout.screenY(j) + block) {
+                    if (sy < pitch || sy >= h - pitch) continue
+                    for (sx in layout.screenX(i) until layout.screenX(i) + block) {
+                        if (sx < pitch || sx >= w - pitch) continue
+                        acc += sHp[k] * r[(sy + dy) * w + sx + dx]
+                    }
+                }
+            }
+            return acc
+        }
+        val zero = corr(0, 0)
+        var best = zero
+        var bestDx = 0
+        var bestDy = 0
+        for (dy in -pitch..pitch step pitch) for (dx in -pitch..pitch step pitch) {
+            if (dx == 0 && dy == 0) continue
+            val c = corr(dx, dy)
+            if (c > best) {
+                best = c; bestDx = dx; bestDy = dy
+            }
+        }
+        return if ((bestDx != 0 || bestDy != 0) && best > 0.0 && best > minGain * maxOf(zero, 0.0)) {
+            intArrayOf(bestDx, bestDy)
+        } else {
+            intArrayOf(0, 0)
+        }
     }
 
     /** 맵을 (dx,dy)만큼 이동한다: out(x,y) = in(x+dx, y+dy). */

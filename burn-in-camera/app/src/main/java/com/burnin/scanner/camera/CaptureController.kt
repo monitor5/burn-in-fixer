@@ -536,6 +536,8 @@ class CaptureController(
                     if (cont.isActive) cont.resume(frame)
                 } catch (e: Exception) {
                     if (cont.isActive) cont.resumeWithException(e)
+                } catch (e: OutOfMemoryError) {
+                    if (cont.isActive) cont.resumeWithException(IllegalStateException("프레임 복사 메모리 부족", e))
                 } finally {
                     image.close()
                     rd.setOnImageAvailableListener(null, null)
@@ -700,6 +702,9 @@ class CaptureController(
                 if (cont.isActive) cont.resume(frame)
             } catch (e: Exception) {
                 if (cont.isActive) cont.resumeWithException(e)
+            } catch (e: OutOfMemoryError) {
+                // 카메라 스레드에서 OOM이 나면 앱이 통째로 죽는다. 측정 쪽 예외로 넘겨 그 단계만 실패시킨다.
+                if (cont.isActive) cont.resumeWithException(IllegalStateException("프레임 복사 메모리 부족", e))
             } finally {
                 image.close()
                 rd.setOnImageAvailableListener(null, null)
