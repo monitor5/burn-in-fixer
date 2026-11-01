@@ -18,7 +18,8 @@ internal class CorrectionMap(
 ) {
     val gain = gain.copyOf()
     private val channels = channelGains.mapValues { it.value.copyOf() }
-    private val detail = detail?.copyOf()
+    // 고주파 층은 측정 뒤 바뀌지 않는 격자라 복사하지 않고 공유한다(2048×1536 한 장 12.6MB, 힙 512MB 한도).
+    private val detail = detail
 
     init {
         require(this.detail == null || this.detail.size == this.gain.size) { "detail layer size mismatch" }
@@ -40,9 +41,16 @@ internal class CorrectionMap(
 
     fun rgbPng(gw: Int, gh: Int, width: Int, height: Int, maxAttenuation: Float): ByteArray? {
         if (channels.isEmpty() || channelWeight <= 0f) return null
-        fun channel(index: Int) = withDetail(channels[index]?.let {
-            Analyzer.mixGainGrids(gain, it, channelWeight, maxAttenuation)
-        } ?: gain)
+        // 채널 혼합 결과에 고주파 층을 제자리에서 곱해 채널당 격자 하나만 새로 만든다.
+        fun channel(index: Int): FloatArray {
+            val mixed = channels[index]?.let { Analyzer.mixGainGrids(gain, it, channelWeight, maxAttenuation) }
+                ?: return effectiveGain
+            val d = detail
+            if (d != null && !isBaseline) {
+                for (i in mixed.indices) mixed[i] = (mixed[i] * d[i]).coerceIn(1f - this.maxAttenuation, 1f)
+            }
+            return mixed
+        }
         return Analyzer.toRgbAttenuationPng(channel(0), channel(1), channel(2),
             gw, gh, width, height, maxAttenuation)
     }

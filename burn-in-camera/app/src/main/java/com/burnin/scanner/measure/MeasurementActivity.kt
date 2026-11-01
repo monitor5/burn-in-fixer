@@ -297,6 +297,11 @@ class MeasurementActivity : Activity() {
         )
     }
 
+    private fun heapText(): String {
+        val rt = Runtime.getRuntime()
+        return "${(rt.totalMemory() - rt.freeMemory()) shr 20}MB / 최대 ${rt.maxMemory() shr 20}MB"
+    }
+
     private fun fmtRefresh(hz: Float): String =
         if (hz == Math.floor(hz.toDouble()).toFloat()) hz.toInt().toString()
         else String.format(java.util.Locale.US, "%.1f", hz)
@@ -349,6 +354,13 @@ class MeasurementActivity : Activity() {
             }) { runMeasurement() }
         } catch (e: CancellationException) {
             throw e
+        } catch (e: OutOfMemoryError) {
+            // 앱이 죽지 않고 측정만 중단되게 한다. 다음 조정을 위해 어디서 모자랐는지 남긴다.
+            status("측정 실패: 메모리 부족")
+            log("!! 중단: 메모리 부족 (${heapText()}) — ${e.message}")
+            e.stackTrace.firstOrNull { it.className.startsWith("com.burnin") }?.let {
+                log("   위치: ${it.className.substringAfterLast('.')}.${it.methodName}(${it.fileName}:${it.lineNumber})")
+            }
         } catch (e: Exception) {
             status(if (e.suppressed.any { it is MeasurementCleanup.Incomplete })
                 MeasurementCleanup.WARNING else "측정 실패: ${e.message}")
@@ -654,6 +666,8 @@ class MeasurementActivity : Activity() {
             log("RGB70 채널 측정 건너뜀: ${e.message}")
             emptyRgbMeasurement()
         }
+        // 측정 원본(gain 4장)은 신뢰도 제한을 건 사본만 남기고 바로 버린다(2048×1536 격자 한 장 12.6MB).
+        val rgb30 = run {
         val rgb30Measured = try {
             measureRgbPatterns(
                 client, cap, blackRgbAvg, homography, screenW, screenH, gw, gh,
@@ -673,6 +687,8 @@ class MeasurementActivity : Activity() {
             },
             aggregateGain = rgb30Measured.aggregateGain?.let { Analyzer.limitGainByConfidence(it, confidence70, MAX_ATTENUATION) },
         )
+        rgb30
+        }
         val lowRgbWeight = when {
             rgb30.stats.isEmpty() -> 0f
             rgb30.signalValid -> LOW_RGB_GAIN_WEIGHT
@@ -696,6 +712,8 @@ class MeasurementActivity : Activity() {
                 log("RGB30 보정 반영 가중치 ${pct(lowRgbWeight)}")
             }
         }
+
+        log("힙 사용: ${heapText()}")
 
         // ── 7~8. 초기 보정맵 + 반복 보정 루프 ────────────────────
         val correction = runCorrectionIterations(
