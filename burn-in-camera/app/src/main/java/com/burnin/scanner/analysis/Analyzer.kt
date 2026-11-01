@@ -1225,19 +1225,35 @@ object Analyzer {
         require(redGain.size == greenGain.size && redGain.size == blueGain.size) {
             "RGB gain grid size mismatch"
         }
-        val pixels = IntArray(outW * outH)
-        val rImg = GrayImage(gw, gh, redGain)
-        val gImg = GrayImage(gw, gh, greenGain)
-        val bImg = GrayImage(gw, gh, blueGain)
-        for (y in 0 until outH) {
-            val gy = gridCoordForScreenPixel(y + 0.5f, outH, gh, screenMargin)
-            for (x in 0 until outW) {
-                val gx = gridCoordForScreenPixel(x + 0.5f, outW, gw, screenMargin)
-                val i = y * outW + x
-                pixels[i] = (0xFF shl 24) or
-                    (attenuationByte(rImg.bilinear(gx, gy), maxAtt) shl 16) or
-                    (attenuationByte(gImg.bilinear(gx, gy), maxAtt) shl 8) or
-                    attenuationByte(bImg.bilinear(gx, gy), maxAtt)
+        return toRgbAttenuationPng({ c -> when (c) { 0 -> redGain; 1 -> greenGain; else -> blueGain } },
+            gw, gh, outW, outH, maxAtt, screenMargin)
+    }
+
+    /**
+     * 채널 격자를 하나씩 받아(요청할 때 만들고 바로 버릴 수 있게) RGB 감쇠 PNG를 만든다.
+     * 세 채널 격자를 동시에 들고 있지 않아 큰 화면에서 힙을 아낀다.
+     */
+    fun toRgbAttenuationPng(
+        channelGain: (Int) -> FloatArray,
+        gw: Int,
+        gh: Int,
+        outW: Int,
+        outH: Int,
+        maxAtt: Float,
+        screenMargin: Float = SCREEN_SAMPLE_MARGIN,
+    ): ByteArray {
+        val pixels = IntArray(outW * outH) { 0xFF shl 24 }
+        val gxs = FloatArray(outW) { gridCoordForScreenPixel(it + 0.5f, outW, gw, screenMargin) }
+        for (c in 0..2) {
+            val img = GrayImage(gw, gh, channelGain(c))
+            val shift = 16 - 8 * c
+            parallelRows(outH) { y ->
+                val gy = gridCoordForScreenPixel(y + 0.5f, outH, gh, screenMargin)
+                var i = y * outW
+                for (x in 0 until outW) {
+                    pixels[i] = pixels[i] or (attenuationByte(img.bilinear(gxs[x], gy), maxAtt) shl shift)
+                    i++
+                }
             }
         }
         val bmp = Bitmap.createBitmap(pixels, outW, outH, Bitmap.Config.ARGB_8888)

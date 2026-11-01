@@ -15,9 +15,11 @@ internal class CorrectionMap(
     val isBaseline: Boolean = false,
     detail: FloatArray? = null,
     private val maxAttenuation: Float = 1f,
+    /** true면 채널 gain을 복사하지 않고 공유한다(측정 뒤 바뀌지 않는 격자를 반복마다 넘길 때). */
+    shareChannels: Boolean = false,
 ) {
     val gain = gain.copyOf()
-    private val channels = channelGains.mapValues { it.value.copyOf() }
+    private val channels = if (shareChannels) channelGains else channelGains.mapValues { it.value.copyOf() }
     // 고주파 층은 측정 뒤 바뀌지 않는 격자라 복사하지 않고 공유한다(2048×1536 한 장 12.6MB, 힙 512MB 한도).
     private val detail = detail
 
@@ -51,7 +53,6 @@ internal class CorrectionMap(
             }
             return mixed
         }
-        return Analyzer.toRgbAttenuationPng(channel(0), channel(1), channel(2),
-            gw, gh, width, height, maxAttenuation)
+        return Analyzer.toRgbAttenuationPng({ channel(it) }, gw, gh, width, height, maxAttenuation)
     }
 }

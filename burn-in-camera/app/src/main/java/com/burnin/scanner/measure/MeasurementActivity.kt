@@ -1043,7 +1043,7 @@ class MeasurementActivity : Activity() {
             status("7/10 반복 $iter/$maxIterations — 보정맵 전송·적용...")
             applyGainMap(
                 client,
-                CorrectionMap(gain, rgb30.channelGains, lowRgbWeight, detail = strokeDetail?.gain, maxAttenuation = MAX_ATTENUATION),
+                CorrectionMap(gain, rgb30.channelGains, lowRgbWeight, detail = strokeDetail?.gain, maxAttenuation = MAX_ATTENUATION, shareChannels = true),
                 gw, gh, screenW, screenH,
             )
             lastAppliedIsBest = false
@@ -1143,7 +1143,7 @@ class MeasurementActivity : Activity() {
                     "${if (gray70Passed) "통과" else "개선 필요"}, " +
                     "$LOW_LIGHT_PATTERN RMS ${pct(lowSt.rmsDev)} / P95 ${pct(lowSt.p95Dev)} " +
                     "${if (lowLightPassed) "통과" else "개선 필요"}, " +
-                    "RGB30 평균 RMS ${pct(rgb30AfterMeanRms)}, 균일도 점수 ${fmt(compositeScore)}x"
+                    "RGB30 평균 RMS ${pct(rgb30AfterMeanRms)}, 균일도 점수 ${fmt(compositeScore)}x, 힙 ${heapText()}"
             )
 
             if (selection.consider(gain, compositeScore)) {
