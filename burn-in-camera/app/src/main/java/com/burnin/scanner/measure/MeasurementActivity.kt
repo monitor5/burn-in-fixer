@@ -24,6 +24,7 @@ import com.burnin.scanner.analysis.ImageOps
 import com.burnin.scanner.analysis.LowFrequency
 import com.burnin.scanner.analysis.VignetteCalibration
 import com.burnin.scanner.analysis.NativePixel
+import com.burnin.scanner.analysis.ResponseCurve
 import com.burnin.scanner.analysis.RgbImage
 import com.burnin.scanner.analysis.ScreenDetector
 import com.burnin.scanner.analysis.SparseSpotPhotometry
@@ -112,6 +113,11 @@ class MeasurementActivity : Activity() {
         private const val SPARSE_PROBE_QUANTILE = 0.998f
         /** 단색(R/G/B) 점 구동 레벨(%). 서브픽셀 하나라 광량이 적어 흰 점(70)보다 올린다. */
         private const val SPARSE_CHANNEL_LEVEL = 100
+        /** 응답 곡선 레벨(%)과 가중치: 번인이 잘 보이는 20~50% 구간을 무겁게 본다. */
+        private val CURVE_LEVELS = intArrayOf(15, 25, 40, 55, 70, 85)
+        private val CURVE_WEIGHTS = floatArrayOf(0.6f, 1f, 1f, 0.8f, 0.6f, 0.4f)
+        private const val CURVE_FRAMES = 4
+        private const val CURVE_BLOCKS = 48
         private const val PASS_RMS = 0.015f      // 합격: 잔여 RMS ≤ 1.5%
         private const val PASS_P95 = 0.035f      // 합격: P95 편차 ≤ 3.5%
         private const val PASS_BLOCK = 0.02f     // 합격: 블록 평균 최대 편차 ≤ 2% (좁은 띠 번인)
@@ -208,6 +214,14 @@ class MeasurementActivity : Activity() {
     )
 
     /** 희소 점등 측광 결과: 화면 픽셀 단위 고주파 감쇠 층과, 저해상도 재측정 보정용 평균 감쇠 */
+    /** 레벨 곡선으로 정한 gray70 보상(q 블록)과 그 기준의 목표. 없으면 gray70·gray25 혼합만 쓴다. */
+    private var levelComp: LowFrequency.Blocks? = null
+    private var curveTarget70: Float? = null
+    private var curveReport: JSONObject? = null
+
+    private fun levelAdjusted(luma: FloatArray, gw: Int, gh: Int): FloatArray =
+        levelComp?.let { ResponseCurve.divide(luma, it, gw, gh) } ?: luma
+
     private class StrokeDetail(
         val gain: FloatArray,
         val compensation: FloatArray,
@@ -1085,6 +1099,13 @@ class MeasurementActivity : Activity() {
                 "flicker span ${fmtSeconds(lowSpanMs)}"
         )
 
+        // ── 5.5 레벨별 응답 곡선: 곱하기 맵을 gray70 하나가 아니라 곡선 전체에 맞춘다 ─────
+        levelComp = null
+        curveTarget70 = null
+        curveReport = null
+        val curveBefore = measureLevelCurve(client, cap, blackAvg, homography, flatField, screenW, screenH, gw, gh, "5/10")
+        setupLevelCompensation(curveBefore, lumaBefore, gw, gh)
+
         // ── 6. RGB 채널별 측정: 70% 진단 + 30% 보정 혼합 ─────────
         status("6/10 RGB 70%/30% 채널별 측정...")
         // 측정 원본(gain 4장)은 신뢰도 제한을 건 사본만 남기고 바로 버린다(2048×1536 격자 한 장 12.6MB).
@@ -1263,6 +1284,12 @@ class MeasurementActivity : Activity() {
                 "블록 최대 ≤ ${pct(PASS_BLOCK)})"
         )
 
+        // 레벨별 곡선 재측정: 보정 전후를 레벨마다 비교한다(곡선 그래프용)
+        if (curveBefore.any { it != null } && !invalid) {
+            val curveAfter = measureLevelCurve(client, cap, blackAvg, homography, flatField, screenW, screenH, gw, gh, "9/10")
+            reportLevelCurve(curveBefore, curveAfter)
+        }
+
         // ── 9. 리포트 저장 ──────────────────────────────────────
         status("10/10 리포트 저장...")
         val dir = saveMeasurementReport(
@@ -1403,6 +1430,76 @@ class MeasurementActivity : Activity() {
         }
     }
 
+    /** 레벨마다 전면 회색을 찍어 중앙값 1로 정규화한 블록(48칸)을 돌려준다. 실패한 레벨은 null. */
+    private suspend fun measureLevelCurve(
+        client: ControlClient,
+        cap: CaptureController,
+        blackAvg: GrayImage,
+        homography: Homography,
+        flatField: FloatArray,
+        screenW: Int,
+        screenH: Int,
+        gw: Int,
+        gh: Int,
+        step: String,
+    ): List<LowFrequency.Blocks?> {
+        captureBatch(client, cap, CURVE_LEVELS.map { "gray$it" to CURVE_FRAMES }, "$step 레벨 곡선")
+        return CURVE_LEVELS.map { level ->
+            try {
+                val capture = capturePatternGray(client, cap, "gray$level", CURVE_FRAMES)
+                try {
+                    withContext(Dispatchers.Default) {
+                        val luma = Analyzer.applyFlatField(
+                            Analyzer.lumaGrid(capture.average, blackAvg, homography, screenW, screenH, gw, gh), flatField,
+                        )
+                        ResponseCurve.normalized(LowFrequency.blocks(luma, gw, gh, CURVE_BLOCKS))
+                    }
+                } finally {
+                    capture.frameStore.delete()
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                log("레벨 곡선 gray$level 측정 실패: ${e.message}")
+                null
+            }
+        }
+    }
+
+    private fun setupLevelCompensation(curve: List<LowFrequency.Blocks?>, lumaBefore: FloatArray, gw: Int, gh: Int) {
+        val ref = curve[CURVE_LEVELS.indexOf(70)]
+        val usable = curve.withIndex().filter { it.value != null }
+        if (ref == null || usable.size < 3) {
+            log("레벨 곡선 부족(${usable.size}레벨) — gray70·gray25 혼합으로 진행")
+            return
+        }
+        val eff = ResponseCurve.effective(usable.map { it.value!! }, FloatArray(usable.size) { CURVE_WEIGHTS[usable[it].index] })
+        val q = ResponseCurve.compensation(ref, eff)
+        levelComp = q
+        curveTarget70 = Analyzer.correctionTarget(ResponseCurve.divide(lumaBefore, q, gw, gh), gw, gh, maxAttenuation)
+        val qv = q.values.filter { it.isFinite() }.sorted()
+        log(
+            "레벨 곡선(보정 전) 블록 RMS: " + CURVE_LEVELS.indices.joinToString(", ") { i ->
+                "${CURVE_LEVELS[i]}% ${curve[i]?.let { pct(ResponseCurve.blockRms(it)) } ?: "-"}"
+            } + " → 가중 곡선 ${pct(ResponseCurve.blockRms(ResponseCurve.normalized(eff)))}"
+        )
+        log("레벨 보상 q(gray70 ÷ 곡선): ${fmt(qv.first())} ~ ${fmt(qv.last())}, 목표 ${fmt(curveTarget70!!)} — 반복은 곡선 기준으로 보정")
+    }
+
+    private fun reportLevelCurve(before: List<LowFrequency.Blocks?>, after: List<LowFrequency.Blocks?>) {
+        val levels = JSONArray()
+        val parts = ArrayList<String>()
+        for (i in CURVE_LEVELS.indices) {
+            val b = before[i]?.let { ResponseCurve.blockRms(it) } ?: Float.NaN
+            val a = after[i]?.let { ResponseCurve.blockRms(it) } ?: Float.NaN
+            levels.put(JSONObject().put("level", CURVE_LEVELS[i]).put("weight", CURVE_WEIGHTS[i].toDouble())
+                .put("blockRmsBefore", b.toDouble()).put("blockRmsAfter", a.toDouble()))
+            parts += "${CURVE_LEVELS[i]}% ${pct(b)}→${pct(a)}"
+        }
+        log("레벨 곡선 블록 RMS(보정 전→후): " + parts.joinToString(", "))
+        curveReport = JSONObject().put("used", levelComp != null).put("blocksLong", CURVE_BLOCKS).put("levels", levels)
+    }
+
     private suspend fun initialGain(
         lumaBefore: FloatArray,
         lumaLowBefore: FloatArray,
@@ -1416,9 +1513,14 @@ class MeasurementActivity : Activity() {
         smoothRadius: Int,
     ): FloatArray = withContext(Dispatchers.Default) {
         val grayMixedGain = run {
-            val gray70Gain = Analyzer.gainGrid(lumaBefore, gw, gh, maxAttenuation, confidence70, smoothRadius)
-            val lowLightGain = Analyzer.gainGrid(lumaLowBefore, gw, gh, maxAttenuation, confidenceLow, smoothRadius)
-            Analyzer.mixGainGrids(gray70Gain, lowLightGain, lowLightWeight, maxAttenuation)
+            // 곡선이 있으면 gray25도 곡선에 들어 있으므로 따로 섞지 않는다
+            val gray70Gain = Analyzer.gainGrid(levelAdjusted(lumaBefore, gw, gh), gw, gh, maxAttenuation, confidence70, smoothRadius)
+            if (levelComp != null) {
+                gray70Gain
+            } else {
+                val lowLightGain = Analyzer.gainGrid(lumaLowBefore, gw, gh, maxAttenuation, confidenceLow, smoothRadius)
+                Analyzer.mixGainGrids(gray70Gain, lowLightGain, lowLightWeight, maxAttenuation)
+            }
         }
         val mixed = rgb30.aggregateGain?.let { Analyzer.mixGainGrids(grayMixedGain, it, lowRgbWeight, maxAttenuation) }
             ?: grayMixedGain
@@ -1599,7 +1701,7 @@ class MeasurementActivity : Activity() {
             val grayScoreLow = uniformityScore(lowSt, lumaLowAfter, gw, gh)
             val refined70 = withContext(Dispatchers.Default) {
                 Analyzer.refineGain(
-                    gain, lumaAfter, target, DAMPING_ALPHA, gw, gh, maxAttenuation,
+                    gain, levelAdjusted(lumaAfter, gw, gh), curveTarget70 ?: target, DAMPING_ALPHA, gw, gh, maxAttenuation,
                     confidenceAfter, smoothRadius
                 )
             }
@@ -1685,7 +1787,7 @@ class MeasurementActivity : Activity() {
             if (stopAfterThisEvaluation) break
 
             val refinedGray = withContext(Dispatchers.Default) {
-                Analyzer.mixGainGrids(refined70, refined30, lowLightWeight, maxAttenuation)
+                Analyzer.mixGainGrids(refined70, refined30, if (levelComp != null) 0f else lowLightWeight, maxAttenuation)
             }
             gain = refinedRgb30?.let { rgbGain ->
                 withContext(Dispatchers.Default) {
@@ -1972,6 +2074,7 @@ class MeasurementActivity : Activity() {
             .put("rgbChannelCorrectionMap", bestRgbPng != null)
             .put("estimatedBrightnessLoss", brightnessLoss)
             .put("strokeDetail", strokeDetailReport ?: JSONObject().put("used", false))
+            .put("responseCurve", curveReport ?: JSONObject().put("used", false))
             .put("maxAttenuation", maxAttenuation.toDouble())
             .put("outputGamma", outputGamma?.toDouble() ?: JSONObject.NULL)
             .put("cameraToneCurve", capture?.let { if (it.isRaw) "RAW_LINEAR" else it.toneMode.name } ?: JSONObject.NULL)
