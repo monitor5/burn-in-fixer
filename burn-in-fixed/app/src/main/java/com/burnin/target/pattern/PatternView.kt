@@ -28,6 +28,7 @@ class PatternView(context: Context) : View(context) {
 
     var correctionBitmap: Bitmap? = null
         set(value) {
+            if (value === field) return
             field = value
             clearSolidCache()
             invalidate()
@@ -35,6 +36,7 @@ class PatternView(context: Context) : View(context) {
 
     var correctionRgbBitmap: Bitmap? = null
         set(value) {
+            if (value === field) return
             field = value
             clearSolidCache()
             invalidate()
@@ -42,6 +44,7 @@ class PatternView(context: Context) : View(context) {
 
     var correctionMaxAttenuation: Double = 0.05
         set(value) {
+            if (value == field) return
             field = value
             clearSolidCache()
             invalidate()
@@ -49,6 +52,7 @@ class PatternView(context: Context) : View(context) {
 
     var whiteBalanceRgbBitmap: Bitmap? = null
         set(value) {
+            if (value === field) return
             field = value
             clearSolidCache()
             invalidate()
@@ -56,6 +60,7 @@ class PatternView(context: Context) : View(context) {
 
     var whiteBalanceMaxAttenuation: Double = 0.10
         set(value) {
+            if (value == field) return
             field = value
             clearSolidCache()
             invalidate()
@@ -77,6 +82,19 @@ class PatternView(context: Context) : View(context) {
     /** 기준 기기 색감 일치 LUT. 번인 보정 ON/OFF와 독립적으로 단색 패턴에만 적용된다. */
     var colorLut: ColorLut? = null
         set(value) {
+            if (value === field) return
+            field = value
+            clearSolidCache()
+            invalidate()
+        }
+
+    /**
+     * 오버레이와 같은 결과만 그린다: RGB 감쇠·화이트밸런스 층 없이 회색 알파맵만 덮는다. 실제로 쓰는
+     * 시스템 오버레이는 곱하기 알파 하나뿐이라, 측정 앱이 이 모드로 "오버레이로 보정했을 때"를 잰다.
+     */
+    var overlayEquivalent: Boolean = false
+        set(value) {
+            if (value == field) return
             field = value
             clearSolidCache()
             invalidate()
@@ -84,6 +102,7 @@ class PatternView(context: Context) : View(context) {
 
     var correctionEnabled: Boolean = false
         set(value) {
+            if (value == field) return
             field = value
             clearSolidCache()
             invalidate()
@@ -92,7 +111,9 @@ class PatternView(context: Context) : View(context) {
     /** 0~100 (%) 보정 강도. 알파 감쇠맵 전체에 곱해진다. */
     var strengthPct: Int = 100
         set(value) {
-            field = value.coerceIn(0, 100)
+            val v = value.coerceIn(0, 100)
+            if (v == field) return
+            field = v
             clearSolidCache()
             invalidate()
         }
@@ -122,8 +143,8 @@ class PatternView(context: Context) : View(context) {
         var usedCorrectionRgbSolid = false
         when (spec.kind) {
             PatternSpec.Kind.SOLID -> {
-                val rgb = correctionRgbBitmap
-                val wb = whiteBalanceRgbBitmap
+                val rgb = if (overlayEquivalent) null else correctionRgbBitmap
+                val wb = if (overlayEquivalent) null else whiteBalanceRgbBitmap
                 val base = colorLut?.transformArgb(spec.color) ?: spec.color
                 val corrected = if (correctionEnabled && (rgb != null || wb != null)) {
                     try {
@@ -176,8 +197,8 @@ class PatternView(context: Context) : View(context) {
             PatternSpec.Kind.SPARSE -> {
                 canvas.drawColor(Color.BLACK)
                 if (w > 0 && h > 0) {
-                    val rgb = correctionRgbBitmap
-                    val wb = whiteBalanceRgbBitmap
+                    val rgb = if (overlayEquivalent) null else correctionRgbBitmap
+                    val wb = if (overlayEquivalent) null else whiteBalanceRgbBitmap
                     // 보정 후 픽셀 단위 검증: 단색과 같은 RGB·색 균일화 감쇠를 켜진 점에 곱한다
                     // (알파만 덮으면 측정 쪽이 채널 층을 검증할 수 없다).
                     val corrected = if (correctionEnabled && (rgb != null || wb != null)) {

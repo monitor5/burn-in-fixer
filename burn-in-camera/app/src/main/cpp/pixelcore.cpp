@@ -286,6 +286,10 @@ bool decodeFrame(const Frame& fr, int mode, int maxLongEdge, const float* yLut, 
 }
 
 // Analyzer.lumaGrid와 같은 9탭 샘플링.
+// 셀 안 3×3 탭 간격(셀 폭 비율). 1/3이면 탭이 셀을 고르게 덮어 화면 픽셀 면적을 적분한다.
+// (0.15로 셀 30%만 찍으면 1:1 격자에서 서브픽셀 구조가 저주파 무아레로 접혔다.) Analyzer.GRID_TAP_SPREAD와 같아야 한다.
+static const double kTapSpread = 1.0 / 3.0;
+
 void sampleGrid(const float* gray, const float* black, int iw, int ih, const double* m,
                 int screenW, int screenH, int gw, int gh, float margin, float* grid) {
     auto bilinear = [&](const float* img, float x, float y) -> float {
@@ -302,17 +306,20 @@ void sampleGrid(const float* gray, const float* black, int iw, int ih, const dou
             float u = (margin + (1 - 2 * margin) * (gx + 0.5f) / gw) * screenW;
             float v = (margin + (1 - 2 * margin) * (gy + 0.5f) / gh) * screenH;
             float acc = 0, accB = 0;
+            bool bad = false;
             for (int sy = -1; sy <= 1; sy++)
                 for (int sx = -1; sx <= 1; sx++) {
-                    double uu = u + sx * screenW * 0.15 / gw;
-                    double vv = v + sy * screenH * 0.15 / gh;
+                    double uu = u + sx * screenW * kTapSpread / gw;
+                    double vv = v + sy * screenH * kTapSpread / gh;
                     double ww = m[6] * uu + m[7] * vv + 1.0;
                     float px = (float) ((m[0] * uu + m[1] * vv + m[2]) / ww);
                     float py = (float) ((m[3] * uu + m[4] * vv + m[5]) / ww);
+                    // 호모그래피 분모가 0 근처면 NaN/inf → (int) 변환이 범위 밖 읽기가 된다
+                    if (!std::isfinite(px) || !std::isfinite(py)) { bad = true; continue; }
                     acc += bilinear(gray, px, py);
                     if (black) accB += bilinear(black, px, py);
                 }
-            float value = (acc - accB) / 9.f;
+            float value = bad ? 0.f : (acc - accB) / 9.f;
             grid[(size_t) gy * gw + gx] = value > 1e-5f ? value : 1e-5f;
         }
     });
@@ -388,8 +395,15 @@ Java_com_burnin_scanner_analysis_NativePixel_lumaGridNative(
     const size_t total = (size_t) gw * gh;
     std::vector<float> grid(total);
     // 이미지 두 장을 네이티브로 복사하지 않고 고정해서 읽는다(GC는 잠시 멈춘다).
+    if (env->GetArrayLength(grayArr) != (jsize) ((size_t) iw * ih)) return nullptr;
+    if (blackArr && env->GetArrayLength(blackArr) != (jsize) ((size_t) iw * ih)) return nullptr;
     auto* gray = (float*) env->GetPrimitiveArrayCritical(grayArr, nullptr);
+    if (!gray) return nullptr;
     float* black = blackArr ? (float*) env->GetPrimitiveArrayCritical(blackArr, nullptr) : nullptr;
+    if (blackArr && !black) {
+        env->ReleasePrimitiveArrayCritical(grayArr, gray, JNI_ABORT);
+        return nullptr;
+    }
     sampleGrid(gray, black, iw, ih, m, screenW, screenH, gw, gh, margin, grid.data());
     if (black) env->ReleasePrimitiveArrayCritical(blackArr, black, JNI_ABORT);
     env->ReleasePrimitiveArrayCritical(grayArr, gray, JNI_ABORT);
@@ -435,6 +449,62 @@ Java_com_burnin_scanner_analysis_NativePixel_frameGridsNative(
     }
     jfloatArray arr = env->NewFloatArray((jsize) out.size());
     if (arr) env->SetFloatArrayRegion(arr, 0, (jsize) out.size(), out.data());
+    return arr;
+}
+
+// RAW 포화 점검: 채널(R,G,B)별로 센서 범위 대비 정규화값 (raw−black)/(white−black)의 p99.9와
+// 0.98 이상(포화) 사이트 비율. WB gain·셰이딩을 곱하기 전 값이라 "1 = 센서 포화"가 위치·채널과 무관하다.
+// 반환 [p999R, p999G, p999B, satR, satG, satB]. RAW가 아니면 null.
+extern "C" JNIEXPORT jfloatArray JNICALL
+Java_com_burnin_scanner_analysis_NativePixel_rawStatsNative(JNIEnv* env, jobject, jstring jpath) {
+    const char* cpath = env->GetStringUTFChars(jpath, nullptr);
+    Frame fr;
+    bool ok = readFrame(cpath, fr);
+    env->ReleaseStringUTFChars(jpath, cpath);
+    if (!ok || fr.format != kFormatRawSensor || !fr.raw.present || fr.planes.empty()) return nullptr;
+    if (fr.raw.cfa < 0 || fr.raw.cfa > 3) return nullptr;
+    const Plane& pl = fr.planes[0];
+    const int w = fr.width, h = fr.height;
+    if (pl.pixelStride != 2 || pl.rowStride < w * 2) return nullptr;
+    if ((int64_t) (h - 1) * pl.rowStride + (int64_t) w * 2 > (int64_t) pl.bytes.size()) return nullptr;
+    int ch[4];
+    cfaChannels(fr.raw.cfa, ch);
+    const int bins = 2048;
+    std::vector<int64_t> hist((size_t) 3 * bins, 0);
+    int64_t total[3] = {0, 0, 0}, sat[3] = {0, 0, 0};
+    float inv[4], black[4];
+    for (int p = 0; p < 4; p++) {
+        black[p] = (float) fr.raw.black[p];
+        inv[p] = 1.f / (float) std::max(1, fr.raw.white - fr.raw.black[p]);
+    }
+    const uint8_t* base = pl.bytes.data();
+    for (int y = 0; y < h; y++) {
+        const uint8_t* row = base + (size_t) y * pl.rowStride;
+        for (int x = 0; x < w; x++) {
+            int raw = row[x * 2] | (row[x * 2 + 1] << 8);
+            int p = ((y & 1) << 1) | (x & 1);
+            int c = ch[p];
+            float v = ((float) raw - black[p]) * inv[p];
+            int b = (int) (v * (bins - 1));
+            b = b < 0 ? 0 : (b >= bins ? bins - 1 : b);
+            hist[(size_t) c * bins + b]++;
+            total[c]++;
+            if (v >= 0.98f) sat[c]++;
+        }
+    }
+    float out[6];
+    for (int c = 0; c < 3; c++) {
+        int64_t target = (int64_t) (total[c] * 0.999), cum = 0;
+        int b = 0;
+        for (; b < bins; b++) {
+            cum += hist[(size_t) c * bins + b];
+            if (cum >= target) break;
+        }
+        out[c] = (float) b / (bins - 1);
+        out[3 + c] = total[c] > 0 ? (float) sat[c] / (float) total[c] : 0.f;
+    }
+    jfloatArray arr = env->NewFloatArray(6);
+    if (arr) env->SetFloatArrayRegion(arr, 0, 6, out);
     return arr;
 }
 
@@ -512,6 +582,7 @@ Java_com_burnin_scanner_analysis_NativePixel_decodeIntoStoredNative(
     const jsize total = (jsize) cur.size();
     if (env->GetArrayLength(outArr) != total || gStoredBlack.size() != (size_t) total) return JNI_FALSE;
     auto* out = (float*) env->GetPrimitiveArrayCritical(outArr, nullptr);
+    if (!out) return JNI_FALSE;
     const float* black = gStoredBlack.data();
     parallelRows(h, [&](int y) {
         size_t o = (size_t) y * w;
@@ -542,7 +613,12 @@ Java_com_burnin_scanner_analysis_NativePixel_decodeIntoNative(
     if (env->GetArrayLength(outArr) != total) return JNI_FALSE;
     if (blackArr && env->GetArrayLength(blackArr) != total) return JNI_FALSE;
     auto* out = (float*) env->GetPrimitiveArrayCritical(outArr, nullptr);
+    if (!out) return JNI_FALSE;
     float* black = blackArr ? (float*) env->GetPrimitiveArrayCritical(blackArr, nullptr) : nullptr;
+    if (blackArr && !black) {
+        env->ReleasePrimitiveArrayCritical(outArr, out, JNI_ABORT);
+        return JNI_FALSE;
+    }
     parallelRows(h, [&](int y) {
         size_t o = (size_t) y * w;
         if (black) for (int x = 0; x < w; x++) out[o + x] = cur[o + x] - black[o + x];

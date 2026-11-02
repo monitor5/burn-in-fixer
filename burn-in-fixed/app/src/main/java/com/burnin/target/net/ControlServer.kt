@@ -71,10 +71,15 @@ object ControlServer {
         while (true) {
             val line = reader.readLine() ?: break
             if (line.isBlank()) continue
+            val cmdName = runCatching { JSONObject(line).optString("cmd") }.getOrDefault("")
             val reply = try {
                 handleMessage(JSONObject(line))
             } catch (e: Exception) {
-                JSONObject().put("ok", false).put("error", "요청 처리 오류: ${e.message}")
+                // cmd가 없으면 측정 앱이 "응답 명령 불일치"만 보고 원래 오류를 잃는다
+                JSONObject().put("ok", false).put("cmd", cmdName).put("error", "요청 처리 오류: ${e.message}")
+            } catch (e: OutOfMemoryError) {
+                // 서버 스레드가 죽으면 앱을 다시 켜야 하므로 오류로 돌려주고 계속 받는다
+                JSONObject().put("ok", false).put("cmd", cmdName).put("error", "메모리 부족: ${e.message}")
             }
             writer.write(reply.toString())
             writer.write("\n")
@@ -166,6 +171,8 @@ object ControlServer {
                     AppLog.i("보정맵 거부: $error")
                     return err(cmd, error)
                 }
+                // 켜져 있는 오버레이도 새 맵으로 바꾼다(전에는 다시 켤 때까지 옛 맵이 남았다)
+                OverlayService.refreshBitmap()
             }
 
             Protocol.CMD_APPLY_WHITE_BALANCE -> {
@@ -248,8 +255,9 @@ object ControlServer {
                 ) {
                     return err(cmd, "적재된 보정맵/화이트밸런스 없음")
                 }
+                PatternBus.overlayEquivalent = msg.optString("mode") == "overlay"
                 PatternBus.setCorrection(true, msg.optInt("strength", 100))
-                AppLog.i("앱 내부 보정 ON (강도 ${PatternBus.strengthPct}%)")
+                AppLog.i("앱 내부 보정 ON (강도 ${PatternBus.strengthPct}%${if (PatternBus.overlayEquivalent) ", 오버레이 동등: 회색 알파만" else ""})")
             }
 
             Protocol.CMD_DISABLE_CORRECTION -> {

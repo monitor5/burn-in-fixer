@@ -26,6 +26,8 @@ object PatternBus {
         private set
     @Volatile var correctionEnabled: Boolean = false
     @Volatile var strengthPct: Int = 100
+    /** 오버레이와 같은 결과(회색 알파맵만)로 보정을 그린다. ENABLE_CORRECTION의 mode="overlay". */
+    @Volatile var overlayEquivalent: Boolean = false
     /** 마지막 패턴 그리기 실패 사유. ControlServer가 표시 요청마다 비우고 ACK 전에 확인한다. */
     @Volatile var renderError: String? = null
 

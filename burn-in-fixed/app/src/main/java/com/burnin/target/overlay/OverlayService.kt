@@ -28,6 +28,16 @@ import com.burnin.target.util.AppLog
 class OverlayService : Service() {
 
     companion object {
+        @Volatile private var instance: OverlayService? = null
+
+        /** 새 보정맵을 받았을 때 켜져 있는 오버레이 비트맵을 바꾼다. */
+        fun refreshBitmap() {
+            val bmp = CorrectionStore.bakedBitmap ?: return
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                instance?.overlayView?.setImageBitmap(bmp)
+            }
+        }
+
         const val ACTION_STOP = "com.burnin.target.overlay.STOP"
         const val EXTRA_STRENGTH = "strength"
         private const val CHANNEL_ID = "overlay"
@@ -77,7 +87,8 @@ class OverlayService : Service() {
 
         if (overlayView == null) {
             val view = ImageView(this).apply {
-                scaleType = ImageView.ScaleType.FIT_XY
+                // 늘이지 않는다: 창이 화면 전체가 아니면 맵이 찌그러져 번인 위치와 어긋난다(창 크기는 아래에서 확인)
+                scaleType = ImageView.ScaleType.MATRIX
                 setImageBitmap(bmp)
                 imageAlpha = strength * 255 / 100
             }
@@ -105,6 +116,16 @@ class OverlayService : Service() {
             try {
                 getSystemService(WindowManager::class.java).addView(view, lp)
                 overlayView = view
+                instance = this
+                view.post {
+                    val loc = IntArray(2)
+                    view.getLocationOnScreen(loc)
+                    val ok = loc[0] == 0 && loc[1] == 0 && view.width == bmp.width && view.height == bmp.height
+                    AppLog.i(
+                        "오버레이 창 ${loc[0]},${loc[1]} ${view.width}x${view.height} / 맵 ${bmp.width}x${bmp.height}" +
+                            if (ok) " — 1:1 정렬" else " — 경고: 화면 전체가 아님, 가려지거나 어긋난 영역은 보정되지 않음"
+                    )
+                }
                 initialOrientation = resources.configuration.orientation
                 running = true
                 AppLog.i("시스템 오버레이 보정 ON (강도 $strength%)")
@@ -134,6 +155,7 @@ class OverlayService : Service() {
             runCatching { getSystemService(WindowManager::class.java).removeView(it) }
         }
         overlayView = null
+        instance = null
         running = false
         AppLog.i("시스템 오버레이 보정 OFF")
         super.onDestroy()

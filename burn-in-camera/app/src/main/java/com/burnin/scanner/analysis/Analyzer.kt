@@ -18,6 +18,8 @@ import java.io.ByteArrayOutputStream
  */
 object Analyzer {
     const val SCREEN_SAMPLE_MARGIN = 0f
+    /** 셀 안 3×3 탭 간격(셀 폭 비율). 네이티브 kTapSpread와 같아야 한다. 1/3이면 셀 면적을 고르게 덮는다. */
+    const val GRID_TAP_SPREAD = 1.0 / 3.0
     const val EDGE_RAMP_FRACTION = 0f
     private const val FLAT_FIELD_MAX_DEVIATION = 0.18f
     private const val FLAT_FIELD_IRLS_ITERATIONS = 8
@@ -222,8 +224,8 @@ object Analyzer {
                 for (sy in -1..1) {
                     for (sx in -1..1) {
                         h.map(
-                            (u + sx * screenW * 0.15 / gw).toDouble(),
-                            (v + sy * screenH * 0.15 / gh).toDouble(),
+                            (u + sx * screenW * GRID_TAP_SPREAD / gw).toDouble(),
+                            (v + sy * screenH * GRID_TAP_SPREAD / gh).toDouble(),
                             out,
                         )
                         acc += gray.bilinear(out[0].toFloat(), out[1].toFloat())
@@ -260,8 +262,8 @@ object Analyzer {
                 for (sy in -1..1) {
                     for (sx in -1..1) {
                         h.map(
-                            (u + sx * screenW * 0.15 / gw).toDouble(),
-                            (v + sy * screenH * 0.15 / gh).toDouble(),
+                            (u + sx * screenW * GRID_TAP_SPREAD / gw).toDouble(),
+                            (v + sy * screenH * GRID_TAP_SPREAD / gh).toDouble(),
                             out,
                         )
                         acc += rgb.bilinearChannel(out[0].toFloat(), out[1].toFloat(), channel)

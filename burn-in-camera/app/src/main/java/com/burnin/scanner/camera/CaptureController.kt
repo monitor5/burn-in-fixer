@@ -199,6 +199,8 @@ class CaptureController(
     private var manualExposureTimeNs: Long? = null
     private var manualSensitivityIso: Int? = null
     private var manualAwbGains: RggbChannelVector? = null
+    /** 수동 고정 시점의 색 변환 행렬. AWB OFF + TRANSFORM_MATRIX에서 요청에 넣지 않으면 HAL이 템플릿 기본값(보통 단위행렬)을 쓴다. */
+    private var manualCcm: android.hardware.camera2.params.ColorSpaceTransform? = null
     private var manualFocusDistance: Float? = null
 
     /** 측정 촬영에 지정하는 톤커브. 세션 시작 시 기기 지원에 따라 고르고, 결과가 다르면 ASSUMED로 내린다. */
@@ -596,6 +598,7 @@ class CaptureController(
             manualExposureTimeNs = flickerFreeExposure
             manualSensitivityIso = compensatedIso
             manualAwbGains = latestAwbGains
+            manualCcm = latestCcm
             manualFocusDistance = latestFocusDistance?.let { focus ->
                 val maxFocus = characteristics.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
                 if (maxFocus > 0f) focus.coerceIn(0f, maxFocus) else null
@@ -680,6 +683,18 @@ class CaptureController(
     }
 
     /** 현재 수동 노출 설명 (리포트용). */
+    /** AWB gain과 RAW 디코드 값에서 채널별 센서 포화 수준(gain_c / max gain). 로그용. */
+    fun awbSaturationText(): String {
+        val g = manualAwbGains ?: latestAwbGains ?: return "AWB gain 없음"
+        val r = g.red
+        val gr = (g.greenEven + g.greenOdd) / 2f
+        val b = g.blue
+        val m = maxOf(r, gr, b)
+        fun f(v: Float) = String.format(java.util.Locale.US, "%.2f", v)
+        return "AWB gain R ${f(r)} G ${f(gr)} B ${f(b)} (최대/최소 ${f(m / minOf(r, gr, b))}), " +
+            "디코드 값의 센서 포화 수준 R ${f(r / m)} G ${f(gr / m)} B ${f(b / m)}, CCM ${if (manualCcm != null) "고정" else "없음"}"
+    }
+
     fun manualExposureText(): String =
         if (manualLocked) "ISO $manualSensitivityIso, ${manualExposureTimeNs}ns" else "AE/AWB lock"
 
@@ -851,6 +866,7 @@ class CaptureController(
                     CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX,
                 )
                 builder.set(CaptureRequest.COLOR_CORRECTION_GAINS, it)
+                manualCcm?.let { t -> builder.set(CaptureRequest.COLOR_CORRECTION_TRANSFORM, t) }
             }
             manualFocusDistance?.let { builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, it) }
         } else {

@@ -82,6 +82,20 @@ object NativePixel {
             h.coefficients(), screenW, screenH, gw, gh, Analyzer.SCREEN_SAMPLE_MARGIN)
     }
 
+    /** RAW 포화 점검: 채널(R,G,B)별 센서 범위 대비 p99.9와 포화(≥0.98) 사이트 비율. RAW가 아니면 null. */
+    class RawStats(val p999: FloatArray, val saturated: FloatArray) {
+        val peak: Float get() = p999.max()
+        val maxSaturated: Float get() = saturated.max()
+    }
+
+    fun rawStats(file: File): RawStats? {
+        if (!available || !enabled) return null
+        val a = rawStatsNative(file.absolutePath) ?: return null
+        return RawStats(a.copyOfRange(0, 3), a.copyOfRange(3, 6))
+    }
+
+    private external fun rawStatsNative(path: String): FloatArray?
+
     private external fun averageGridNative(
         paths: Array<String>, mode: Int, maxLongEdge: Int, yLut: FloatArray, homography: DoubleArray,
         screenW: Int, screenH: Int, gw: Int, gh: Int, margin: Float,

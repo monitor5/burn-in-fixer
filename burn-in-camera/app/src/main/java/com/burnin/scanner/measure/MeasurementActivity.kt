@@ -120,6 +120,9 @@ class MeasurementActivity : Activity() {
         private const val SPARSE_PROBE_QUANTILE = 0.998f
         /** 단색(R/G/B) 점 구동 레벨(%). 서브픽셀 하나라 광량이 적어 흰 점(70)보다 올린다. */
         private const val SPARSE_CHANNEL_LEVEL = 100
+        /** RAW 사이트 p99.9(센서 범위 대비) 상한과 넘었을 때 맞출 목표. */
+        private const val RAW_PEAK_LIMIT = 0.85f
+        private const val RAW_PEAK_TARGET = 0.75f
         /** 응답 곡선 레벨(%)과 가중치: 번인이 잘 보이는 20~50% 구간을 무겁게 본다. */
         private val CURVE_LEVELS = intArrayOf(15, 25, 40, 55, 70, 85)
         private val CURVE_WEIGHTS = floatArrayOf(0.6f, 1f, 1f, 0.8f, 0.6f, 0.4f)
@@ -225,6 +228,7 @@ class MeasurementActivity : Activity() {
     private var levelComp: LowFrequency.Blocks? = null
     private var curveTarget70: Float? = null
     private var curveReport: JSONObject? = null
+    private var overlayReport: JSONObject? = null
 
     /** 분석 이미지가 원본 대비 몇 분의 1인지(호모그래피를 원본 좌표로 옮길 때 씀). */
     private var analysisSample = 1
@@ -811,6 +815,10 @@ class MeasurementActivity : Activity() {
         if (cap.isTriActive) log("동시 3각 촬영 활성: ${cap.triSummary()}")
         cap.diagnosticNotes().forEach { log(it) }
         if (cap.isRaw) log(cap.shadingSummary())
+        if (cap.isRaw) {
+            log(cap.awbSaturationText())
+            limitSaturation(client, cap)
+        }
         log(
             if (cap.isRaw) "측정 프레임: RAW_SENSOR 선형값 (톤커브 역변환 불필요, 보조 화각 YUV는 ${cap.toneMode.label})"
             else "측정 톤커브(디코더 역변환): ${cap.toneMode.label}"
@@ -1366,6 +1374,13 @@ class MeasurementActivity : Activity() {
                 "블록 최대 ≤ ${pct(PASS_BLOCK)})"
         )
 
+        // 실제로 쓰는 시스템 오버레이는 회색 알파맵 하나뿐이다(RGB·색 균일화 층 없음). 위 수치는 앱 내부 렌더링
+        // 기준이므로, 같은 맵을 오버레이와 같은 방식으로만 그려 한 번 더 잰다.
+        if (!invalid) overlayReport = evaluateOverlayMode(
+            client, cap, blackAvg, blackRgbAvg, homography, flatField, screenW, screenH, gw, gh,
+            statsBefore.rmsDev, lowStatsBefore.rmsDev, finalRms, finalLowRms,
+        )
+
         // 레벨별 곡선 재측정: 보정 전후를 레벨마다 비교한다(곡선 그래프용)
         if (curveBefore.any { it != null } && !invalid) {
             val curveAfter = measureLevelCurve(client, cap, blackAvg, homography, flatField, screenW, screenH, gw, gh, "9/10")
@@ -1558,6 +1573,71 @@ class MeasurementActivity : Activity() {
             chromaBefore = null
             log("색 균일화 실패 — 밝기 보정만 진행: ${e.message}")
         }
+    }
+
+    /**
+     * 오버레이 동등 모드(탭이 회색 알파맵만 덮음)로 gray70·gray25·RGB70을 다시 재서, 실제 사용 조건의
+     * 균일도와 색 편차를 남긴다. 끝나면 앱 내부 보정(RGB·색 층 포함)으로 되돌린다.
+     */
+    private suspend fun evaluateOverlayMode(
+        client: ControlClient,
+        cap: CaptureController,
+        blackAvg: GrayImage,
+        blackRgbAvg: RgbImage,
+        homography: Homography,
+        flatField: FloatArray,
+        screenW: Int,
+        screenH: Int,
+        gw: Int,
+        gh: Int,
+        rmsBefore: Float,
+        lowRmsBefore: Float,
+        appRms: Float,
+        appLowRms: Float,
+    ): JSONObject? = try {
+        status("9/10 오버레이 모드(회색 알파맵만) 평가...")
+        withContext(Dispatchers.IO) {
+            client.command(Protocol.CMD_ENABLE_CORRECTION, "strength" to 100, "mode" to "overlay")
+        }
+        suspend fun level(pattern: String, frames: Int): Analyzer.Stats {
+            val c = capturePatternGray(client, cap, pattern, frames)
+            try {
+                val raw = fullResGrid(c.frameStore, NativePixel.MODE_GRAY, homography, blackAvg, screenW, screenH, gw, gh)
+                    ?: withContext(Dispatchers.Default) { Analyzer.lumaGrid(c.average, blackAvg, homography, screenW, screenH, gw, gh) }
+                return Analyzer.stats(withContext(Dispatchers.Default) { Analyzer.applyFlatField(raw, flatField) })
+            } finally {
+                c.frameStore.delete()
+            }
+        }
+        val st70 = level("gray70", FRAMES_PER_PATTERN)
+        val st25 = level(LOW_LIGHT_PATTERN, LOW_LIGHT_FRAMES)
+        val chroma = if (chromaBefore != null) {
+            val m = measureRgbPatterns(
+                client, cap, blackRgbAvg, homography, screenW, screenH, gw, gh,
+                RGB70_PATTERNS, FRAMES_PER_PATTERN, "overlay_rgb70",
+                flatField = null, makeHeatmaps = false, includeGain = false, keepGrids = true,
+            )
+            withContext(Dispatchers.Default) {
+                LowFrequency.chroma(m.grids.getValue("red70"), m.grids.getValue("green70"), m.grids.getValue("blue70"), gw, gh, LOW_FREQ_BLOCKS)
+            }
+        } else null
+        log("──────────────")
+        log(
+            "오버레이 모드(실사용, 회색 알파맵만): gray70 RMS ${pct(rmsBefore)} → ${pct(st70.rmsDev)} (앱 내부 ${pct(appRms)}), " +
+                "$LOW_LIGHT_PATTERN ${pct(lowRmsBefore)} → ${pct(st25.rmsDev)} (앱 내부 ${pct(appLowRms)})" +
+                (chroma?.let { c -> ", 색 편차 평균 ${pct(chromaBefore!!.first)} → ${pct(c.meanSpread())}" } ?: "")
+        )
+        JSONObject().put("measured", true)
+            .put("gray70Rms", st70.rmsDev.toDouble()).put("gray70P95", st70.p95Dev.toDouble())
+            .put("lowRms", st25.rmsDev.toDouble()).put("lowP95", st25.p95Dev.toDouble())
+            .put("chromaMeanSpread", chroma?.meanSpread()?.toDouble() ?: JSONObject.NULL)
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        log("오버레이 모드 평가 실패: ${e.message}")
+        null
+    } finally {
+        runCatching { withContext(Dispatchers.IO) { client.command(Protocol.CMD_ENABLE_CORRECTION, "strength" to 100) } }
     }
 
     /** 레벨마다 전면 회색을 찍어 중앙값 1로 정규화한 블록(48칸)을 돌려준다. 실패한 레벨은 null. */
@@ -2223,6 +2303,7 @@ class MeasurementActivity : Activity() {
             .put("estimatedBrightnessLoss", brightnessLoss)
             .put("strokeDetail", strokeDetailReport ?: JSONObject().put("used", false))
             .put("responseCurve", curveReport ?: JSONObject().put("used", false))
+            .put("overlayMode", overlayReport ?: JSONObject().put("measured", false))
             .put("maxAttenuation", maxAttenuation.wire())
             .put("outputGamma", outputGamma?.toDouble() ?: JSONObject.NULL)
             .put("cameraToneCurve", capture?.let { if (it.isRaw) "RAW_LINEAR" else it.toneMode.name } ?: JSONObject.NULL)
@@ -2629,8 +2710,10 @@ class MeasurementActivity : Activity() {
                 withContext(Dispatchers.IO) { client.showPattern(plan.patternName(px0, py0, channel)) }
                 delay(SPARSE_SETTLE_MS)
                 val probeStore = captureFrameStore(cap, 1, SPARSE_INTER_FRAME_DELAY_MS)
+                var rawStats: NativePixel.RawStats? = null
                 val peak = try {
                     val file = probeStore.files.first()
+                    rawStats = withContext(Dispatchers.Default) { NativePixel.rawStats(file) }
                     val ok = if (nativeBlack) NativePixel.decodeIntoStored(file, mode, ImageOps.FULL_RESOLUTION, sparseBuffer!!)
                         else NativePixel.decodeInto(file, mode, ImageOps.FULL_RESOLUTION, black!!.data, sparseBuffer!!)
                     if (ok) withContext(Dispatchers.Default) { probePeak(sparseBuffer!!) } else Float.NaN
@@ -2638,9 +2721,14 @@ class MeasurementActivity : Activity() {
                     probeStore.delete()
                 }
                 val total = cap.manualExposureRatio(exposureBefore)
-                val factor = if (peak.isFinite() && peak > 0f) {
+                var factor = if (peak.isFinite() && peak > 0f) {
                     (SPARSE_TARGET_PEAK / peak).coerceIn(0.25f, (SPARSE_MAX_TOTAL_BOOST / total.toFloat()).coerceAtLeast(0.25f))
                 } else 1f
+                // 디코드 값 목표만 보면 G 사이트(포화 수준 ≈ 0.5)가 먼저 넘친다: 센서 범위 p99.9도 상한 안으로
+                rawStats?.let { st ->
+                    factor = minOf(factor, RAW_PEAK_TARGET / st.peak.coerceAtLeast(0.01f))
+                    log("희소 점등 측광$label 점 탐침 RAW: 센서 범위 p99.9 ${fmt(st.peak)}, 포화 사이트 최대 ${pct(st.maxSaturated)}")
+                }
                 if ((factor < 0.85f || factor > 1.15f) && cap.scaleManualExposure(factor.toDouble(), inputRefreshHz(), preferExposureTime = true)) {
                     boosted = true
                     log("희소 점등 측광$label 점 탐침: 최고 밝기 ${fmt(peak)} → 노출 ×${fmt(factor)} (${cap.manualExposureText()}, 측정 전 대비 ×${fmt(cap.manualExposureRatio(exposureBefore).toFloat())})")
@@ -2746,6 +2834,36 @@ class MeasurementActivity : Activity() {
             .put("red", reports[0]).put("green", reports[1]).put("blue", reports[2])
         log("RGBW 희소 점등 완료: W/R/G/B 층 평균 감쇠 " + (listOf(white.gain) + gains).joinToString(" / ") { pct(1f - it.average().toFloat()) })
         return StrokeDetail(white.gain, white.compensation, report, gains)
+    }
+
+    /**
+     * 전면 패턴 중 가장 밝은 gray85를 한 장 찍어 RAW 사이트 포화를 점검하고, 넘치면 노출을 낮춘다.
+     * 디코드 값은 채널 gain·셰이딩이 곱해져 "1 = 포화"가 아니어서(G 사이트는 약 0.5에서 포화) 기존
+     * clip 판정(0.92)이 사실상 꺼져 있었다. 그래서 센서 범위 기준(p99.9 ≤ 0.85)으로 맞춘다.
+     */
+    private suspend fun limitSaturation(client: ControlClient, cap: CaptureController) {
+        repeat(3) {
+            withContext(Dispatchers.IO) { client.showPattern("gray85") }
+            delay(PATTERN_SETTLE_MS)
+            val store = captureFrameStore(cap, 1)
+            val st = try {
+                withContext(Dispatchers.Default) { NativePixel.rawStats(store.files.first()) }
+            } finally {
+                store.delete()
+            } ?: return
+            log(
+                "RAW 포화 점검 gray85: 센서 범위 대비 p99.9 R ${fmt(st.p999[0])} G ${fmt(st.p999[1])} B ${fmt(st.p999[2])}, " +
+                    "포화 사이트 R ${pct(st.saturated[0])} G ${pct(st.saturated[1])} B ${pct(st.saturated[2])}"
+            )
+            if (st.peak <= RAW_PEAK_LIMIT && st.maxSaturated < 0.001f) return
+            val factor = (RAW_PEAK_TARGET / st.peak.coerceAtLeast(0.01f)).coerceIn(0.3f, 0.95f)
+            if (!cap.scaleManualExposure(factor.toDouble(), inputRefreshHz())) {
+                log("경고: RAW 사이트가 포화 근처인데 노출을 더 낮출 수 없음 — 탭 밝기를 낮추세요")
+                return
+            }
+            log("RAW 포화 방지: 노출 ×${fmt(factor)} (${cap.manualExposureText()})")
+            delay(300)
+        }
     }
 
     /** 탐침 프레임의 점 최고 밝기: 7화소마다 표본을 뽑아 [SPARSE_PROBE_QUANTILE] 분위수(정렬 메모리 줄임). */

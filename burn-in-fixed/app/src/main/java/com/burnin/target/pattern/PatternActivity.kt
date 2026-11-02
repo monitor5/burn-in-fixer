@@ -117,6 +117,7 @@ class PatternActivity : Activity(), PatternBus.Host {
         view.correctionEnabled = !DeviceRole.isReference(this) && PatternBus.correctionEnabled
         view.colorLut = if (DeviceRole.isReference(this)) null else ColorProfileStore.activeLut
         view.strengthPct = PatternBus.strengthPct
+        view.overlayEquivalent = PatternBus.overlayEquivalent
     }
 
     override fun closeSelf() {
