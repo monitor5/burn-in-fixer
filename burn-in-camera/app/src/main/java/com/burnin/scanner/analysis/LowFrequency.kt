@@ -150,6 +150,36 @@ object LowFrequency {
     }
 
     /**
+     * 색 레이어 재조정: 레이어를 켠 채 다시 잰 색 블록 [residual]로 기존 gain에 잔여 보정을 곱한다.
+     * 곱한 뒤 블록마다 세 채널 중 가장 큰 gain을 1로 다시 맞춰, 지난번에 과하게 낮춘 채널은 되돌아오게 한다.
+     */
+    fun refineChromaGains(
+        prev: Triple<Blocks, Blocks, Blocks>,
+        residual: Chroma,
+        maxAtt: Float,
+    ): Triple<Blocks, Blocks, Blocks> {
+        val n = residual.r.values.size
+        require(prev.first.values.size == n)
+        val gr = FloatArray(n)
+        val gg = FloatArray(n)
+        val gb = FloatArray(n)
+        for (i in 0 until n) {
+            val v = floatArrayOf(residual.r.values[i], residual.g.values[i], residual.b.values[i])
+            val p = floatArrayOf(prev.first.values[i], prev.second.values[i], prev.third.values[i])
+            if (!v.all { it.isFinite() && it > 0f }) { gr[i] = p[0]; gg[i] = p[1]; gb[i] = p[2]; continue }
+            val m = v.min()
+            val q = FloatArray(3) { p[it] * m / v[it] }
+            val top = q.max()
+            gr[i] = (q[0] / top).coerceIn(1f - maxAtt, 1f)
+            gg[i] = (q[1] / top).coerceIn(1f - maxAtt, 1f)
+            gb[i] = (q[2] / top).coerceIn(1f - maxAtt, 1f)
+        }
+        val bw = residual.r.bw
+        val bh = residual.r.bh
+        return Triple(softenEdges(Blocks(bw, bh, gr)), softenEdges(Blocks(bw, bh, gg)), softenEdges(Blocks(bw, bh, gb)))
+    }
+
+    /**
      * 가장자리 한 줄 블록은 비네팅·색 셰이딩이 커 색 비율이 덜 정확해 과보정(붉은 테)이 났다.
      * 가장자리 블록의 감쇠를 바로 안쪽 블록 감쇠의 절반으로 둔다.
      */

@@ -72,7 +72,14 @@ class MeasurementActivity : Activity() {
     companion object {
         private const val FRAMES_PER_PATTERN = 5
         /** 색 균일화(화이트밸런스 레이어) 최대 감쇠. 탭 앱 WhiteBalanceStore 기본값과 같다. */
-        private const val CHROMA_MAX_ATTENUATION = 0.10f
+        private const val CHROMA_MAX_ATTENUATION = 0.15f
+        /**
+         * 색 보정 블록(긴 변 칸 수). 24칸(약 85px)으로는 UI 모양 번인의 날카로운 색 경계가 뭉개져 띠로 남았다.
+         * 384칸(약 5px)이면 경계를 따라가면서 블록당 화소가 충분해 잡음이 작다.
+         */
+        private const val CHROMA_BLOCKS = 384
+        /** 색 레이어를 켠 채 RGB70을 다시 재는 횟수. 마지막 회는 확인만 하고, 나빠졌으면 이전 레이어로 되돌린다. */
+        private const val CHROMA_REFINE_ROUNDS = 3
         /** 저주파(잔여 비네팅·색 얼룩) 블록 수: 긴 변 기준. */
         private const val LOW_FREQ_BLOCKS = 24
         /** 패턴 표시 ACK(프레임 커밋 후) 뒤 카메라 파이프라인에 남은 이전 장면이 빠질 시간. */
@@ -889,7 +896,7 @@ class MeasurementActivity : Activity() {
                 includeGain = false,
                 keepGrids = true,
             ).let { m ->
-                applyChromaUniformity(client, m, screenW, screenH, screenW, screenH)
+                applyChromaUniformity(client, cap, blackRgbAvg, homography, m, screenW, screenH, screenW, screenH)
                 m.copy(grids = LinkedHashMap(), confidences = LinkedHashMap())
             }
         } catch (e: CancellationException) {
@@ -1398,6 +1405,9 @@ class MeasurementActivity : Activity() {
      */
     private suspend fun applyChromaUniformity(
         client: ControlClient,
+        cap: CaptureController,
+        blackRgbAvg: RgbImage,
+        homography: Homography,
         rgb70: RgbMeasurement,
         gw: Int,
         gh: Int,
@@ -1415,34 +1425,79 @@ class MeasurementActivity : Activity() {
         try {
             val chroma = withContext(Dispatchers.Default) { LowFrequency.chroma(r, g, b, gw, gh, LOW_FREQ_BLOCKS) }
             chromaBefore = chroma.meanSpread() to chroma.p95Spread()
-            val (gr, gg, gb) = LowFrequency.chromaGains(chroma, CHROMA_MAX_ATTENUATION)
-            val png = withContext(Dispatchers.Default) {
-                Analyzer.toRgbAttenuationPng(
-                    { c -> LowFrequency.upsample(when (c) { 0 -> gr; 1 -> gg; else -> gb }, gw, gh) },
-                    gw, gh, screenW, screenH, CHROMA_MAX_ATTENUATION,
-                )
+            // 보정은 잘게(약 5px 블록) 잡고, 편차 지표는 이전과 비교되도록 24칸 블록으로 낸다
+            var gains = withContext(Dispatchers.Default) {
+                LowFrequency.chromaGains(LowFrequency.chroma(r, g, b, gw, gh, CHROMA_BLOCKS), CHROMA_MAX_ATTENUATION)
             }
-            withContext(Dispatchers.IO) {
-                client.request(
-                    JSONObject()
-                        .put("cmd", Protocol.CMD_APPLY_WHITE_BALANCE)
-                        .put("width", screenW)
-                        .put("height", screenH)
-                        .put("maxAttenuation", CHROMA_MAX_ATTENUATION.wire())
-                        .put("checksumMd5", md5(png))
-                        .put("sourceDevice", "${Build.MANUFACTURER} ${Build.MODEL}")
-                        .put("data", Base64.encodeToString(png, Base64.NO_WRAP)),
-                    timeoutMs = 120_000,
-                )
+            suspend fun send(gs: Triple<LowFrequency.Blocks, LowFrequency.Blocks, LowFrequency.Blocks>) {
+                val png = withContext(Dispatchers.Default) {
+                    Analyzer.toRgbAttenuationPng(
+                        { c -> LowFrequency.upsample(when (c) { 0 -> gs.first; 1 -> gs.second; else -> gs.third }, gw, gh) },
+                        gw, gh, screenW, screenH, CHROMA_MAX_ATTENUATION,
+                    )
+                }
+                withContext(Dispatchers.IO) {
+                    client.request(
+                        JSONObject()
+                            .put("cmd", Protocol.CMD_APPLY_WHITE_BALANCE)
+                            .put("width", screenW)
+                            .put("height", screenH)
+                            .put("maxAttenuation", CHROMA_MAX_ATTENUATION.wire())
+                            .put("checksumMd5", md5(png))
+                            .put("sourceDevice", "${Build.MANUFACTURER} ${Build.MODEL}")
+                            .put("data", Base64.encodeToString(png, Base64.NO_WRAP)),
+                        timeoutMs = 120_000,
+                    )
+                }
             }
+            send(gains)
             // 지난 측정 맵 대신 무감쇠(중립) 맵을 올리고 보정을 켜서 색 레이어만 켜진 상태를 만든다.
             whiteBalanceActive = true
             applyGainMap(client, CorrectionMap(FloatArray(gw * gh) { 1f }, emptyMap(), 0f, isBaseline = true), gw, gh, screenW, screenH)
-            val maxAtt = listOf(gr, gg, gb).maxOf { blk -> blk.values.maxOf { 1f - it } }
+            fun maxAttOf(gs: Triple<LowFrequency.Blocks, LowFrequency.Blocks, LowFrequency.Blocks>) =
+                listOf(gs.first, gs.second, gs.third).maxOf { blk -> blk.values.maxOf { 1f - it } }
             log(
                 "색 균일화: 블록 색 편차 평균 ${pct(chroma.meanSpread())} / P95 ${pct(chroma.p95Spread())} " +
-                    "(가장 강한/약한 채널 비 − 1), 채널 감쇠 최대 ${pct(maxAtt)} — 탭 화이트밸런스 레이어로 적용"
+                    "(가장 강한/약한 채널 비 − 1), ${gains.first.bw}x${gains.first.bh} 블록, 채널 감쇠 최대 ${pct(maxAttOf(gains))} — 탭 화이트밸런스 레이어로 적용"
             )
+            // 색 레이어를 켠 채 다시 재서 잔여 색 틀어짐을 고친다(한 번에 맞추면 서브픽셀 간섭·감마로 어긋난다)
+            var lastSpread = chroma.meanSpread()
+            var prevGains = gains
+            for (round in 1..CHROMA_REFINE_ROUNDS) {
+                captureBatch(client, cap, RGB70_PATTERNS.map { it to FRAMES_PER_PATTERN }, "3/10 색 재조정 $round")
+                val m = measureRgbPatterns(
+                    client, cap, blackRgbAvg, homography, screenW, screenH, gw, gh,
+                    RGB70_PATTERNS, FRAMES_PER_PATTERN, "chroma_refine",
+                    flatField = null, makeHeatmaps = false, includeGain = false, keepGrids = true,
+                )
+                val rr = m.grids["red70"] ?: break
+                val rg = m.grids["green70"] ?: break
+                val rb = m.grids["blue70"] ?: break
+                val coarse = withContext(Dispatchers.Default) { LowFrequency.chroma(rr, rg, rb, gw, gh, LOW_FREQ_BLOCKS) }
+                val spread = coarse.meanSpread()
+                if (!(spread < lastSpread)) {
+                    log("색 재조정 $round: 편차 평균 ${pct(spread)} (직전 ${pct(lastSpread)}) — 개선 없음, 이전 레이어로")
+                    if (round > 1) {
+                        gains = prevGains
+                        send(gains)
+                        applyGainMap(client, CorrectionMap(FloatArray(gw * gh) { 1f }, emptyMap(), 0f, isBaseline = true), gw, gh, screenW, screenH)
+                    }
+                    break
+                }
+                if (round == CHROMA_REFINE_ROUNDS) {
+                    log("색 재조정 $round: 편차 평균 ${pct(lastSpread)} → ${pct(spread)} / P95 ${pct(coarse.p95Spread())} (확인)")
+                    break
+                }
+                val next = withContext(Dispatchers.Default) {
+                    LowFrequency.refineChromaGains(gains, LowFrequency.chroma(rr, rg, rb, gw, gh, CHROMA_BLOCKS), CHROMA_MAX_ATTENUATION)
+                }
+                log("색 재조정 $round: 편차 평균 ${pct(lastSpread)} → ${pct(spread)} / P95 ${pct(coarse.p95Spread())}, 잔여 보정 적용(채널 감쇠 최대 ${pct(maxAttOf(next))})")
+                lastSpread = spread
+                prevGains = gains
+                gains = next
+                send(gains)
+                applyGainMap(client, CorrectionMap(FloatArray(gw * gh) { 1f }, emptyMap(), 0f, isBaseline = true), gw, gh, screenW, screenH)
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
