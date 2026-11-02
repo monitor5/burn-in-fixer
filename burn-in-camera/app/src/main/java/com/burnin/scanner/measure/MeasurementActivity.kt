@@ -2373,7 +2373,15 @@ class MeasurementActivity : Activity() {
                 if (makeHeatmaps) {
                     heatmaps["${heatmapPrefix}_${pattern}.png"] = Analyzer.deviationHeatmapPng(grid, gw, gh)
                 }
-                if (includeGain || keepGrids || onGrid != null) {
+                // 색 균일화용(keepGrids만)은 격자만 쓰므로 채널마다 12.6MB짜리 신뢰도 격자를 만들지 않는다
+                // (V60 16MP RAW에서 RGB70 도중 OOM). 프레임 안정도 로그만 필요하면 그것만 계산한다.
+                if (!includeGain && onGrid == null && makeHeatmaps) {
+                    val flicker = temporalChannelConfidence(
+                        capture.frameStore, blackRgb, channel, h, screenW, screenH, gw, gh, label = pattern,
+                    )
+                    log("$pattern 프레임 안정도 ${pct(Analyzer.meanConfidence(flicker))}, flicker span ${fmtSeconds(capture.frameStore.spanMs)}")
+                }
+                if (includeGain || onGrid != null) {
                     val blackFull = withContext(Dispatchers.Default) {
                         Analyzer.channelGrid(blackRgb, null, channel, h, screenW, screenH, gw, gh)
                     }
