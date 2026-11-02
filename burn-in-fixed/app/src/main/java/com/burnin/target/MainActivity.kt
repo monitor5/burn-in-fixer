@@ -68,6 +68,8 @@ class MainActivity : Activity() {
         findViewById<Button>(R.id.btnPattern).setOnClickListener {
             startActivity(Intent(this, PatternActivity::class.java))
         }
+        // 대조설비로 지정된 기기는 앱을 켜면 바로 검은 대기 화면으로 간다
+        if (savedInstanceState == null && DeviceRole.isReference(this)) handler.post { standbyBlack() }
         findViewById<Button>(R.id.btnPreview).setOnClickListener { openPreview() }
         findViewById<Button>(R.id.btnColorProfile).setOnClickListener { toggleColorProfile() }
         findViewById<Button>(R.id.btnOverlayOn).setOnClickListener { enableOverlay() }
@@ -160,6 +162,16 @@ class MainActivity : Activity() {
         }
         AppLog.i("역할 설정: ${DeviceRole.label(role)}")
         refreshStatus()
+        if (role == Protocol.ROLE_REFERENCE) standbyBlack()
+    }
+
+    /**
+     * 대조설비 대기: 측정에 쓰지 않을 때 밝은 앱 화면이 암실 박스 근처의 미광이 되지 않도록 검은 패턴 화면을
+     * 띄워 둔다. 측정 앱이 연결해 패턴을 보내면 그 패턴으로 바뀌고, 뒤로 가기로 앱 화면에 돌아온다.
+     */
+    private fun standbyBlack() {
+        AppLog.i("대조설비 대기: 검은 화면")
+        PatternBus.showPattern(this, PatternSpec.BLACK, Runnable { })
     }
 
     /** 회색 70% 패턴 + 보정 ON 상태로 패턴 화면을 열어 육안 비교(탭으로 전/후 토글). */
