@@ -226,6 +226,31 @@ class MeasurementActivity : Activity() {
     private var curveTarget70: Float? = null
     private var curveReport: JSONObject? = null
 
+    /** 분석 이미지가 원본 대비 몇 분의 1인지(호모그래피를 원본 좌표로 옮길 때 씀). */
+    private var analysisSample = 1
+
+    /**
+     * 메인 카메라 프레임 묶음을 원본 해상도로 디코드해 화면 격자로 바로 샘플링하고 black 격자를 뺀다.
+     * 분석 이미지(절반 해상도)로 샘플링하면 화면 1px당 카메라 0.65px까지 떨어져 획·경계가 뭉개졌다.
+     * [h]와 [black]은 분석 이미지 좌표계다(black은 매끈해 분석 해상도로 충분). 네이티브가 없으면 null.
+     */
+    private suspend fun fullResGrid(
+        store: CaptureFrameStore, mode: Int, h: Homography, black: GrayImage?,
+        screenW: Int, screenH: Int, gw: Int, gh: Int,
+    ): FloatArray? = withContext(Dispatchers.Default) {
+        val s = analysisSample
+        val hFull = h.withImageAffine(s.toDouble(), (s - 1) / 2.0)
+        val grid = NativePixel.averageGrid(store.files, mode, ImageOps.FULL_RESOLUTION, hFull, screenW, screenH, gw, gh)
+            ?: return@withContext null
+        if (black != null) {
+            val b = Analyzer.lumaGrid(black, null, h, screenW, screenH, gw, gh)
+            for (i in grid.indices) grid[i] = (grid[i] - b[i]).coerceAtLeast(1e-5f)
+        } else {
+            for (i in grid.indices) grid[i] = grid[i].coerceAtLeast(1e-5f)
+        }
+        grid
+    }
+
     private fun levelAdjusted(luma: FloatArray, gw: Int, gh: Int): FloatArray =
         levelComp?.let { ResponseCurve.divide(luma, it, gw, gh) } ?: luma
 
@@ -408,9 +433,10 @@ class MeasurementActivity : Activity() {
         val full = heapMb >= rgbFrameMb * FULL_RES_HEAP_FACTOR
         ImageOps.analysisMaxLongEdge = if (full) ImageOps.FULL_RESOLUTION else 1600
         val s = ImageOps.downsampleFactor(w, h)
+        analysisSample = s
         log(
-            "분석 해상도: ${w / s}x${h / s} (촬영 ${w}x$h, 1/$s, 힙 ${heapMb}MB" +
-                if (full) ", 원본 해상도 분석)" else " — 원본 분석에는 부족해 절반으로)"
+            "분석 이미지: ${w / s}x${h / s} (촬영 ${w}x$h, 1/$s, 힙 ${heapMb}MB) — 화면 검출용. " +
+                "휘도·채널 격자는 ${if (NativePixel.available && NativePixel.enabled) "네이티브로 원본 해상도에서" else "이 해상도에서"} 샘플링"
         )
     }
 
@@ -921,8 +947,17 @@ class MeasurementActivity : Activity() {
         log("보정맵 해상도: ${gw}x${gh} (대상 기기 해상도 1:1)")
         val smoothRadius = mapSmoothRadius(det.quad, gw, gh)
         log("보정맵 스무딩 반경 ${smoothRadius}셀 — 카메라 해상 한계 이하 노이즈/무아레가 맵에 새겨지지 않도록 적응 조정")
-        val lumaBeforeRaw = withContext(Dispatchers.Default) {
-            Analyzer.lumaGrid(grayAvg, blackAvg, homography, screenW, screenH, gw, gh)
+        val lumaBeforeRaw = fullResGrid(grayCapture.frameStore, NativePixel.MODE_GRAY, homography, blackAvg, screenW, screenH, gw, gh)
+            ?: withContext(Dispatchers.Default) { Analyzer.lumaGrid(grayAvg, blackAvg, homography, screenW, screenH, gw, gh) }
+        run {
+            // 원본 해상도 격자가 분석 이미지 격자와 같은 밝기 척도인지 한 번 확인(좌표 변환 오류면 비가 1에서 벗어난다)
+            val half = withContext(Dispatchers.Default) { Analyzer.lumaGrid(grayAvg, blackAvg, homography, screenW, screenH, gw, gh) }
+            if (half !== lumaBeforeRaw) {
+                val ratio = Analyzer.stats(lumaBeforeRaw).median / Analyzer.stats(half).median
+                var ss = 0.0
+                for (i in half.indices) { val d = lumaBeforeRaw[i] / half[i] / ratio - 1.0; ss += d * d }
+                log("원본 해상도 격자 확인: 분석 해상도 대비 중앙값 비 ${fmt(ratio)}, 차이 RMS ${pct(Math.sqrt(ss / half.size).toFloat())}(해상도 차이로 생기는 세부)")
+            }
         }
         val blackFullGrid = withContext(Dispatchers.Default) {
             Analyzer.lumaGrid(blackAvg, null, homography, screenW, screenH, gw, gh)
@@ -1073,9 +1108,8 @@ class MeasurementActivity : Activity() {
         status("5/10 $LOW_LIGHT_PATTERN 저휘도 촬영 (${LOW_LIGHT_FRAMES}장)...")
         val lowBeforeCapture = capturePatternGray(client, cap, LOW_LIGHT_PATTERN, LOW_LIGHT_FRAMES)
         val lowBeforeAvg = lowBeforeCapture.average
-        val lumaLowBeforeRaw = withContext(Dispatchers.Default) {
-            Analyzer.lumaGrid(lowBeforeAvg, blackAvg, homography, screenW, screenH, gw, gh)
-        }
+        val lumaLowBeforeRaw = fullResGrid(lowBeforeCapture.frameStore, NativePixel.MODE_GRAY, homography, blackAvg, screenW, screenH, gw, gh)
+            ?: withContext(Dispatchers.Default) { Analyzer.lumaGrid(lowBeforeAvg, blackAvg, homography, screenW, screenH, gw, gh) }
         val lumaLowBefore = withContext(Dispatchers.Default) {
             Analyzer.applyFlatField(lumaLowBeforeRaw, flatField)
         }
@@ -1524,9 +1558,10 @@ class MeasurementActivity : Activity() {
             try {
                 val capture = capturePatternGray(client, cap, "gray$level", CURVE_FRAMES)
                 try {
+                    val raw = fullResGrid(capture.frameStore, NativePixel.MODE_GRAY, homography, blackAvg, screenW, screenH, gw, gh)
                     withContext(Dispatchers.Default) {
                         val luma = Analyzer.applyFlatField(
-                            Analyzer.lumaGrid(capture.average, blackAvg, homography, screenW, screenH, gw, gh), flatField,
+                            raw ?: Analyzer.lumaGrid(capture.average, blackAvg, homography, screenW, screenH, gw, gh), flatField,
                         )
                         ResponseCurve.normalized(LowFrequency.blocks(luma, gw, gh, CURVE_BLOCKS))
                     }
@@ -1739,9 +1774,8 @@ class MeasurementActivity : Activity() {
                     "허용 ${fmt(MeasurementPolicy.geometryTolerance(det.quad))}px)"
             }
             val hAfter = checkNotNull(Analyzer.buildHomography(detAfter.quad, screenW, screenH, cornerMapping))
-            val lumaAfterRaw = withContext(Dispatchers.Default) {
-                Analyzer.lumaGrid(afterAvg, blackAvg, hAfter, screenW, screenH, gw, gh)
-            }
+            val lumaAfterRaw = fullResGrid(afterCapture.frameStore, NativePixel.MODE_GRAY, hAfter, blackAvg, screenW, screenH, gw, gh)
+                ?: withContext(Dispatchers.Default) { Analyzer.lumaGrid(afterAvg, blackAvg, hAfter, screenW, screenH, gw, gh) }
             val lumaAfter = withContext(Dispatchers.Default) {
                 compensateDetail(Analyzer.applyFlatField(lumaAfterRaw, flatField), strokeDetail)
             }
@@ -1757,9 +1791,8 @@ class MeasurementActivity : Activity() {
             val st = Analyzer.stats(lumaAfter)
             val lowAfterCapture = capturePatternGray(client, cap, LOW_LIGHT_PATTERN, LOW_LIGHT_FRAMES)
             val lowAfterAvg = lowAfterCapture.average
-            val lumaLowAfterRaw = withContext(Dispatchers.Default) {
-                Analyzer.lumaGrid(lowAfterAvg, blackAvg, hAfter, screenW, screenH, gw, gh)
-            }
+            val lumaLowAfterRaw = fullResGrid(lowAfterCapture.frameStore, NativePixel.MODE_GRAY, hAfter, blackAvg, screenW, screenH, gw, gh)
+                ?: withContext(Dispatchers.Default) { Analyzer.lumaGrid(lowAfterAvg, blackAvg, hAfter, screenW, screenH, gw, gh) }
             val lumaLowAfter = withContext(Dispatchers.Default) {
                 compensateDetail(Analyzer.applyFlatField(lumaLowAfterRaw, flatField), strokeDetail)
             }
@@ -1938,7 +1971,8 @@ class MeasurementActivity : Activity() {
             "9/10 최종",
         )
         status("9/10 최종 gray70/$LOW_LIGHT_PATTERN/RGB30 평가...")
-        val finalAvg = capturePatternAveraged(client, cap, "gray70", FRAMES_PER_PATTERN)
+        val finalCapture = capturePatternGray(client, cap, "gray70", FRAMES_PER_PATTERN)
+        val finalAvg = finalCapture.average
         val detFinal = withContext(Dispatchers.Default) { ScreenDetector.detect(finalAvg) }
         checkNotNull(detFinal) { "최종 화면 검출 실패 — 평가 무효" }
         check(MeasurementPolicy.geometryStable(referenceQuad, detFinal.quad)) {
@@ -1946,16 +1980,22 @@ class MeasurementActivity : Activity() {
                 "허용 ${fmt(MeasurementPolicy.geometryTolerance(referenceQuad))}px)"
         }
         val hFinal = checkNotNull(Analyzer.buildHomography(detFinal.quad, screenW, screenH, cornerMapping)) { "최종 좌표 정합 실패" }
-        val finalGridRaw = withContext(Dispatchers.Default) {
-            Analyzer.lumaGrid(finalAvg, blackAvg, hFinal, screenW, screenH, gw, gh)
+        val finalGridRaw = try {
+            fullResGrid(finalCapture.frameStore, NativePixel.MODE_GRAY, hFinal, blackAvg, screenW, screenH, gw, gh)
+                ?: withContext(Dispatchers.Default) { Analyzer.lumaGrid(finalAvg, blackAvg, hFinal, screenW, screenH, gw, gh) }
+        } finally {
+            finalCapture.frameStore.delete()
         }
         val finalGrid = withContext(Dispatchers.Default) {
             Analyzer.applyFlatField(finalGridRaw, flatField)
         }
 
-        val lowFinalAvg = capturePatternAveraged(client, cap, LOW_LIGHT_PATTERN, LOW_LIGHT_FRAMES)
-        val finalLowGridRaw = withContext(Dispatchers.Default) {
-            Analyzer.lumaGrid(lowFinalAvg, blackAvg, hFinal, screenW, screenH, gw, gh)
+        val lowFinalCapture = capturePatternGray(client, cap, LOW_LIGHT_PATTERN, LOW_LIGHT_FRAMES)
+        val finalLowGridRaw = try {
+            fullResGrid(lowFinalCapture.frameStore, NativePixel.MODE_GRAY, hFinal, blackAvg, screenW, screenH, gw, gh)
+                ?: withContext(Dispatchers.Default) { Analyzer.lumaGrid(lowFinalCapture.average, blackAvg, hFinal, screenW, screenH, gw, gh) }
+        } finally {
+            lowFinalCapture.frameStore.delete()
         }
         val finalLowGrid = withContext(Dispatchers.Default) {
             Analyzer.applyFlatField(finalLowGridRaw, flatField)
@@ -2310,9 +2350,10 @@ class MeasurementActivity : Activity() {
             val capture = capturePatternChannel(client, cap, pattern, frameCount, channel)
             try {
                 val avg = capture.average
-                val rawGrid = withContext(Dispatchers.Default) {
-                    Analyzer.lumaGrid(avg, channelImage(blackRgb, channel), h, screenW, screenH, gw, gh)
-                }
+                val rawGrid = fullResGrid(capture.frameStore, channel, h, channelImage(blackRgb, channel), screenW, screenH, gw, gh)
+                    ?: withContext(Dispatchers.Default) {
+                        Analyzer.lumaGrid(avg, channelImage(blackRgb, channel), h, screenW, screenH, gw, gh)
+                    }
                 val grid = withContext(Dispatchers.Default) { Analyzer.applyFlatField(rawGrid, flatField) }
                 val st = Analyzer.stats(grid)
                 val blackGrid = withContext(Dispatchers.Default) {

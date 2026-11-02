@@ -438,6 +438,49 @@ Java_com_burnin_scanner_analysis_NativePixel_frameGridsNative(
     return arr;
 }
 
+// 프레임마다 원본 해상도로 디코드해 바로 격자로 샘플링하고, 격자 값끼리 평균한다(4장 이상이면 양끝값 제외).
+// 원본 크기 이미지를 Java 힙에 펼치지 않고도 원본 해상도로 분석한다. 결과는 [gw × gh] 하나.
+extern "C" JNIEXPORT jfloatArray JNICALL
+Java_com_burnin_scanner_analysis_NativePixel_averageGridNative(
+        JNIEnv* env, jobject, jobjectArray paths, jint mode, jint maxLongEdge, jfloatArray yLutArr,
+        jdoubleArray hArr, jint screenW, jint screenH, jint gw, jint gh, jfloat margin) {
+    const jsize n = env->GetArrayLength(paths);
+    if (n <= 0) return nullptr;
+    float yLut[256];
+    env->GetFloatArrayRegion(yLutArr, 0, 256, yLut);
+    double m[9];
+    env->GetDoubleArrayRegion(hArr, 0, 9, m);
+    const size_t cell = (size_t) gw * gh;
+    std::vector<float> sum(cell, 0.f), mn(cell, INFINITY), mx(cell, -INFINITY), grid(cell), cur;
+    for (jsize i = 0; i < n; i++) {
+        auto jpath = (jstring) env->GetObjectArrayElement(paths, i);
+        const char* cpath = env->GetStringUTFChars(jpath, nullptr);
+        Frame fr;
+        bool ok = readFrame(cpath, fr);
+        env->ReleaseStringUTFChars(jpath, cpath);
+        env->DeleteLocalRef(jpath);
+        int w = 0, h = 0;
+        if (!ok || !decodeFrame(fr, mode, maxLongEdge, yLut, w, h, cur)) return nullptr;
+        fr.planes.clear();
+        sampleGrid(cur.data(), nullptr, w, h, m, screenW, screenH, gw, gh, margin, grid.data());
+        for (size_t k = 0; k < cell; k++) {
+            const float v = grid[k];
+            sum[k] += v;
+            if (v < mn[k]) mn[k] = v;
+            if (v > mx[k]) mx[k] = v;
+        }
+    }
+    if (n >= 4) {
+        const float div = (float) (n - 2);
+        for (size_t k = 0; k < cell; k++) sum[k] = (sum[k] - mn[k] - mx[k]) / div;
+    } else {
+        for (float& v : sum) v /= (float) n;
+    }
+    jfloatArray arr = env->NewFloatArray((jsize) cell);
+    if (arr) env->SetFloatArrayRegion(arr, 0, (jsize) cell, sum.data());
+    return arr;
+}
+
 // 희소 측정용 풀해상도 black(약 50MB)을 Java 힙 대신 네이티브에 둔다(측정 앱 힙 512MB 한도).
 static std::vector<float> gStoredBlack;
 

@@ -69,6 +69,24 @@ object NativePixel {
         return decodeIntoNative(file.absolutePath, mode, maxLongEdge, ImageOps.yLinearLut(), black, out)
     }
 
+    /**
+     * 프레임 묶음을 원본 해상도([maxLongEdge])로 디코드해 바로 격자로 샘플링한 평균(양끝값 제외).
+     * [h]는 그 해상도 좌표계의 호모그래피여야 한다. black은 빼지 않는다.
+     */
+    fun averageGrid(
+        files: List<File>, mode: Int, maxLongEdge: Int, h: Homography,
+        screenW: Int, screenH: Int, gw: Int, gh: Int,
+    ): FloatArray? {
+        if (!available || !enabled || files.isEmpty()) return null
+        return averageGridNative(files.map { it.absolutePath }.toTypedArray(), mode, maxLongEdge, ImageOps.yLinearLut(),
+            h.coefficients(), screenW, screenH, gw, gh, Analyzer.SCREEN_SAMPLE_MARGIN)
+    }
+
+    private external fun averageGridNative(
+        paths: Array<String>, mode: Int, maxLongEdge: Int, yLut: FloatArray, homography: DoubleArray,
+        screenW: Int, screenH: Int, gw: Int, gh: Int, margin: Float,
+    ): FloatArray?
+
     /** 풀해상도 black을 네이티브에 보관한다(null이면 해제). 이후 [decodeIntoStored]가 이 black을 뺀다. */
     fun storeBlack(black: FloatArray?): Boolean {
         if (!available || !enabled) return false
