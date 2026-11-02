@@ -470,7 +470,11 @@ class MeasurementActivity : Activity() {
         val step = Regex("""^(\d+/10)""").find(msg)?.groupValues?.get(1)
         if (step != null && step != lastStep) {
             val now = android.os.SystemClock.elapsedRealtime()
-            lastStep?.let { log("⏱ $it 단계 ${fmtSeconds(now - lastStepAt)}, 힙 ${heapText()}") }
+            lastStep?.let {
+                // GC 뒤 값이라야 실제로 붙잡힌 양이다(GC 전 값은 쓰레기를 포함해 들쭉날쭉했다)
+                Runtime.getRuntime().gc()
+                log("⏱ $it 단계 ${fmtSeconds(now - lastStepAt)}, 힙(GC 후) ${heapText()}")
+            }
             lastStep = step
             lastStepAt = now
         }
@@ -745,6 +749,12 @@ class MeasurementActivity : Activity() {
             e.stackTrace.firstOrNull { it.className.startsWith("com.burnin") }?.let {
                 log("   위치: ${it.className.substringAfterLast('.')}.${it.methodName}(${it.fileName}:${it.lineNumber})")
             }
+            // 측정 단계의 지역 변수는 이미 풀렸으므로, 이 덤프에 남는 큰 객체가 측정 밖에서 붙잡힌 것이다
+            runCatching {
+                val f = File(getExternalFilesDir(null), "oom_${System.currentTimeMillis()}.hprof")
+                android.os.Debug.dumpHprofData(f.absolutePath)
+                log("   힙 덤프: ${f.absolutePath} (${f.length() shr 20}MB)")
+            }
         } catch (e: Exception) {
             status(if (e.suppressed.any { it is MeasurementCleanup.Incomplete })
                 MeasurementCleanup.WARNING else "측정 실패: ${e.message}")
@@ -769,6 +779,8 @@ class MeasurementActivity : Activity() {
         val screenW = Session.screenWidth
         val screenH = Session.screenHeight
         require(screenW > 0 && screenH > 0) { "대상 화면 정보 없음" }
+        Runtime.getRuntime().gc()
+        log("측정 시작 힙(GC 후): ${heapText()}")
         // 번인 측정에는 대조설비를 쓰지 않는다: 색감 맞추기 뒤 흰 화면으로 남아 있으면 박스 안 미광이 되므로 끈다
         Session.referenceClient?.takeIf { it.isConnected }?.let { ref ->
             runCatching { withContext(Dispatchers.IO) { ref.showPattern("black") } }
@@ -1017,6 +1029,9 @@ class MeasurementActivity : Activity() {
             gw,
             gh,
         )
+        // 마커 프레임(메인 RAW + 보조 화각, V60에서 약 50MB)은 교차 분석에만 쓴다. 코루틴은 끝난 지역 변수도
+        // 함수가 끝날 때까지 붙잡으므로 직접 놓는다.
+        markerTriFrames = emptyMap()
         // 리포트용 카메라 원본 회색 이미지는 지금 PNG로 바꿔 두고 이미지 자체는 놓는다.
         val grayAvgPng = if (cross != null) withContext(Dispatchers.Default) { Analyzer.grayImagePng(grayAvg) } else null
         val confidence70PreWb = if (cross != null) {
