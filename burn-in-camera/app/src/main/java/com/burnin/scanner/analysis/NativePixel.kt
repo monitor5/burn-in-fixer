@@ -82,16 +82,44 @@ object NativePixel {
             h.coefficients(), screenW, screenH, gw, gh, Analyzer.SCREEN_SAMPLE_MARGIN)
     }
 
-    /** RAW 포화 점검: 채널(R,G,B)별 센서 범위 대비 p99.9와 포화(≥0.98) 사이트 비율. RAW가 아니면 null. */
-    class RawStats(val p999: FloatArray, val saturated: FloatArray) {
+    /**
+     * RAW 포화 점검: 채널(R,G,B)별 센서 범위 대비 p99.9, 포화 사이트 비율(같은 최대 코드값에 몰린 사이트),
+     * 그 최대 코드의 정규화값([clipLevel]). RAW가 아니면 null.
+     */
+    class RawStats(val p999: FloatArray, val saturated: FloatArray, val clipLevel: FloatArray) {
         val peak: Float get() = p999.max()
         val maxSaturated: Float get() = saturated.max()
+        val clipped: Boolean get() = maxSaturated >= CLIP_FRACTION
+
+        /**
+         * 포화를 피하려면 노출을 몇 배 해야 하는지. 괜찮으면 null.
+         * 클립되면 p99.9가 클립 값에 붙어 실제 밝기를 모르므로 절반씩 내린다.
+         */
+        fun exposureFactor(limit: Float = 0.85f, target: Float = 0.75f): Float? = when {
+            clipped -> 0.5f
+            peak > limit -> (target / peak).coerceIn(0.3f, 0.95f)
+            else -> null
+        }
+
+        fun text(): String {
+            fun f(v: Float) = String.format(java.util.Locale.US, "%.3f", v)
+            fun p(v: Float) = String.format(java.util.Locale.US, "%.3f%%", v * 100f)
+            return "센서 범위 대비 p99.9 R ${f(p999[0])} G ${f(p999[1])} B ${f(p999[2])}, " +
+                "포화 사이트 R ${p(saturated[0])} G ${p(saturated[1])} B ${p(saturated[2])}" +
+                if (clipped) " (클립 코드 ${f(clipLevel.max())} — 포화)" else ""
+        }
+
+        companion object {
+            /** 같은 최대 코드값에 이만큼 이상 몰려 있으면 클립(포화)으로 본다. */
+            const val CLIP_FRACTION = 2e-4f
+        }
     }
 
     fun rawStats(file: File): RawStats? {
         if (!available || !enabled) return null
         val a = rawStatsNative(file.absolutePath) ?: return null
-        return RawStats(a.copyOfRange(0, 3), a.copyOfRange(3, 6))
+        if (a.size < 9) return null
+        return RawStats(a.copyOfRange(0, 3), a.copyOfRange(3, 6), a.copyOfRange(6, 9))
     }
 
     private external fun rawStatsNative(path: String): FloatArray?

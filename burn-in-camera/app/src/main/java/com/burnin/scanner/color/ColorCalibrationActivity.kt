@@ -13,6 +13,7 @@ import android.widget.TextView
 import com.burnin.scanner.R
 import com.burnin.scanner.analysis.RgbImage
 import com.burnin.scanner.analysis.ImageOps
+import com.burnin.scanner.analysis.NativePixel
 import com.burnin.scanner.analysis.ScreenDetector
 import com.burnin.scanner.camera.CaptureController
 import com.burnin.scanner.net.ControlClient
@@ -334,22 +335,55 @@ class ColorCalibrationActivity : Activity() {
         } ?: error("$name 화면을 찾지 못했습니다")
     }
 
-    /** 흰색(255)에서 두 화면 중 밝은 쪽 최대 채널이 TARGET_PEAK 근처가 되게 노출을 맞춘다 (포화·신호 부족 방지). */
+    /**
+     * 흰색(255)에서 두 화면 중 밝은 쪽 최대 채널이 TARGET_PEAK 근처가 되게 노출을 맞춘다 (포화·신호 부족 방지).
+     * 디코드 값은 채널 WB gain으로 나뉘어 있어 G가 먼저 센서 포화에 닿는다(V60: 디코드 0.47에서 G 포화).
+     * 그래서 RAW 센서 범위도 함께 본다: 클립되면 색 비가 틀어져 프로파일 전체가 망가진다.
+     */
     private suspend fun adjustExposure(cap: CaptureController, adjust: ControlClient, reference: ControlClient?, quads: Quads) {
         val white = ColorPatchPlan.patternName(255, 255, 255)
-        repeat(4) {
+        repeat(6) {
             val refPeak = if (reference != null) measure(reference, adjust, white, quads.refSampler()).max() else 0.0
             val peak = maxOf(refPeak, measure(adjust, reference, white, quads.adjSampler()).max())
-            if (peak in MIN_PEAK..MAX_PEAK) {
+            val raws = listOfNotNull(
+                reference?.let { rawStats(cap, it, adjust, white) },
+                rawStats(cap, adjust, reference, white),
+            )
+            raws.forEach { log("흰색 RAW: ${it.text()}") }
+            val rawFactor = raws.mapNotNull { it.exposureFactor() }.minOrNull()
+            if (peak in MIN_PEAK..MAX_PEAK && rawFactor == null) {
                 log("노출 확인: 흰색 최대 채널 ${fmt3(peak)} (${cap.manualExposureText()})")
                 return
             }
-            if (!cap.scaleManualExposure(TARGET_PEAK / peak, Session.screenRefreshRate)) {
+            var factor = TARGET_PEAK / peak
+            if (rawFactor != null) factor = minOf(factor, rawFactor.toDouble())
+            // 올릴 때도 RAW 센서 범위 0.75를 넘지 않게(클립 중이면 p99.9가 실제보다 낮게 보여 위의 절반이 우선)
+            if (rawFactor == null) raws.maxOfOrNull { it.peak }?.takeIf { it > 0.01f }?.let { factor = minOf(factor, 0.75 / it) }
+            if (!cap.scaleManualExposure(factor, Session.screenRefreshRate)) {
                 log("노출을 더 조정할 수 없습니다 (흰색 최대 채널 ${fmt3(peak)}). 밝기 슬라이더나 거리를 바꿔 다시 시도하세요")
                 require(peak > 0.02) { "카메라 신호가 너무 약합니다" }
+                if (rawFactor != null) log("경고: RAW 포화가 남은 채 측정합니다 — 색 비가 틀어질 수 있습니다")
                 return
             }
             delay(500)
+        }
+        log("경고: 노출을 6번 조정해도 범위에 들지 않았습니다 (${cap.manualExposureText()})")
+    }
+
+    /** [lit]만 [pattern]으로 켜고 RAW 한 장의 센서 범위 통계. RAW가 아니면 null. */
+    private suspend fun rawStats(cap: CaptureController, lit: ControlClient, dark: ControlClient?, pattern: String): NativePixel.RawStats? {
+        if (!cap.isRaw) return null
+        withContext(Dispatchers.IO) {
+            dark?.showPattern("black")
+            lit.showPattern(pattern)
+        }
+        delay(SWITCH_SETTLE_MS)
+        val file = java.io.File.createTempFile("color_raw_", ".bin", cacheDir)
+        return try {
+            cap.captureSingleFrameToFile(file)
+            withContext(Dispatchers.Default) { NativePixel.rawStats(file) }
+        } finally {
+            file.delete()
         }
     }
 

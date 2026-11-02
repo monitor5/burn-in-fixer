@@ -453,8 +453,11 @@ Java_com_burnin_scanner_analysis_NativePixel_frameGridsNative(
 }
 
 // RAW 포화 점검: 채널(R,G,B)별로 센서 범위 대비 정규화값 (raw−black)/(white−black)의 p99.9와
-// 0.98 이상(포화) 사이트 비율. WB gain·셰이딩을 곱하기 전 값이라 "1 = 센서 포화"가 위치·채널과 무관하다.
-// 반환 [p999R, p999G, p999B, satR, satG, satB]. RAW가 아니면 null.
+// 포화(클립) 사이트 비율. WB gain·셰이딩을 곱하기 전 값이라 위치·채널과 무관하다.
+// 포화는 "정확히 같은 최대 코드값에 몰린 사이트"로 판정한다: 메타데이터 white level보다 낮은 코드에서
+// 클립되는 센서가 있어서(V60: 약 0.91) 0.98 같은 고정 문턱으로는 못 잡는다. 잡음이 있는 비포화 신호는
+// 최대 코드값을 공유하는 사이트가 극소수다. 최대값이 0.5 미만이면 포화로 보지 않는다.
+// 반환 [p999R, p999G, p999B, satR, satG, satB, clipR, clipG, clipB(최대 코드의 정규화값)]. RAW가 아니면 null.
 extern "C" JNIEXPORT jfloatArray JNICALL
 Java_com_burnin_scanner_analysis_NativePixel_rawStatsNative(JNIEnv* env, jobject, jstring jpath) {
     const char* cpath = env->GetStringUTFChars(jpath, nullptr);
@@ -471,7 +474,9 @@ Java_com_burnin_scanner_analysis_NativePixel_rawStatsNative(JNIEnv* env, jobject
     cfaChannels(fr.raw.cfa, ch);
     const int bins = 2048;
     std::vector<int64_t> hist((size_t) 3 * bins, 0);
-    int64_t total[3] = {0, 0, 0}, sat[3] = {0, 0, 0};
+    int64_t total[3] = {0, 0, 0}, atMax[3] = {0, 0, 0};
+    int rawMax[3] = {-1, -1, -1};
+    float maxNorm[3] = {0.f, 0.f, 0.f};
     float inv[4], black[4];
     for (int p = 0; p < 4; p++) {
         black[p] = (float) fr.raw.black[p];
@@ -489,10 +494,16 @@ Java_com_burnin_scanner_analysis_NativePixel_rawStatsNative(JNIEnv* env, jobject
             b = b < 0 ? 0 : (b >= bins ? bins - 1 : b);
             hist[(size_t) c * bins + b]++;
             total[c]++;
-            if (v >= 0.98f) sat[c]++;
+            if (raw > rawMax[c]) {
+                rawMax[c] = raw;
+                atMax[c] = 1;
+                maxNorm[c] = v;
+            } else if (raw == rawMax[c]) {
+                atMax[c]++;
+            }
         }
     }
-    float out[6];
+    float out[9];
     for (int c = 0; c < 3; c++) {
         int64_t target = (int64_t) (total[c] * 0.999), cum = 0;
         int b = 0;
@@ -501,10 +512,11 @@ Java_com_burnin_scanner_analysis_NativePixel_rawStatsNative(JNIEnv* env, jobject
             if (cum >= target) break;
         }
         out[c] = (float) b / (bins - 1);
-        out[3 + c] = total[c] > 0 ? (float) sat[c] / (float) total[c] : 0.f;
+        out[3 + c] = total[c] > 0 && maxNorm[c] >= 0.5f ? (float) atMax[c] / (float) total[c] : 0.f;
+        out[6 + c] = maxNorm[c];
     }
-    jfloatArray arr = env->NewFloatArray(6);
-    if (arr) env->SetFloatArrayRegion(arr, 0, 6, out);
+    jfloatArray arr = env->NewFloatArray(9);
+    if (arr) env->SetFloatArrayRegion(arr, 0, 9, out);
     return arr;
 }
 

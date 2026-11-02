@@ -123,6 +123,8 @@ class MeasurementActivity : Activity() {
         /** RAW 사이트 p99.9(센서 범위 대비) 상한과 넘었을 때 맞출 목표. */
         private const val RAW_PEAK_LIMIT = 0.85f
         private const val RAW_PEAK_TARGET = 0.75f
+        /** 포화 점검에서 노출을 낮추는 최대 횟수(클립이면 한 번에 절반: 6번이면 1/64까지). */
+        private const val SATURATION_STEPS = 6
         /** 응답 곡선 레벨(%)과 가중치: 번인이 잘 보이는 20~50% 구간을 무겁게 본다. */
         private val CURVE_LEVELS = intArrayOf(15, 25, 40, 55, 70, 85)
         private val CURVE_WEIGHTS = floatArrayOf(0.6f, 1f, 1f, 0.8f, 0.6f, 0.4f)
@@ -2727,7 +2729,8 @@ class MeasurementActivity : Activity() {
                 // 디코드 값 목표만 보면 G 사이트(포화 수준 ≈ 0.5)가 먼저 넘친다: 센서 범위 p99.9도 상한 안으로
                 rawStats?.let { st ->
                     factor = minOf(factor, RAW_PEAK_TARGET / st.peak.coerceAtLeast(0.01f))
-                    log("희소 점등 측광$label 점 탐침 RAW: 센서 범위 p99.9 ${fmt(st.peak)}, 포화 사이트 최대 ${pct(st.maxSaturated)}")
+                    if (st.clipped) factor = minOf(factor, 0.5f)
+                    log("희소 점등 측광$label 점 탐침 RAW: ${st.text()}")
                 }
                 if ((factor < 0.85f || factor > 1.15f) && cap.scaleManualExposure(factor.toDouble(), inputRefreshHz(), preferExposureTime = true)) {
                     boosted = true
@@ -2839,10 +2842,11 @@ class MeasurementActivity : Activity() {
     /**
      * 전면 패턴 중 가장 밝은 gray85를 한 장 찍어 RAW 사이트 포화를 점검하고, 넘치면 노출을 낮춘다.
      * 디코드 값은 채널 gain·셰이딩이 곱해져 "1 = 포화"가 아니어서(G 사이트는 약 0.5에서 포화) 기존
-     * clip 판정(0.92)이 사실상 꺼져 있었다. 그래서 센서 범위 기준(p99.9 ≤ 0.85)으로 맞춘다.
+     * clip 판정(0.92)이 사실상 꺼져 있었다. 그래서 센서 범위 기준(p99.9 ≤ 0.85)과 클립 코드로 맞춘다.
+     * 화면이 포화되면 보정으로 어둡게 해도 측정값이 그대로라 반복이 "드리프트"로 무효가 된다.
      */
     private suspend fun limitSaturation(client: ControlClient, cap: CaptureController) {
-        repeat(3) {
+        repeat(SATURATION_STEPS) {
             withContext(Dispatchers.IO) { client.showPattern("gray85") }
             delay(PATTERN_SETTLE_MS)
             val store = captureFrameStore(cap, 1)
@@ -2851,19 +2855,16 @@ class MeasurementActivity : Activity() {
             } finally {
                 store.delete()
             } ?: return
-            log(
-                "RAW 포화 점검 gray85: 센서 범위 대비 p99.9 R ${fmt(st.p999[0])} G ${fmt(st.p999[1])} B ${fmt(st.p999[2])}, " +
-                    "포화 사이트 R ${pct(st.saturated[0])} G ${pct(st.saturated[1])} B ${pct(st.saturated[2])}"
-            )
-            if (st.peak <= RAW_PEAK_LIMIT && st.maxSaturated < 0.001f) return
-            val factor = (RAW_PEAK_TARGET / st.peak.coerceAtLeast(0.01f)).coerceIn(0.3f, 0.95f)
+            log("RAW 포화 점검 gray85: ${st.text()}")
+            val factor = st.exposureFactor(RAW_PEAK_LIMIT, RAW_PEAK_TARGET) ?: return
             if (!cap.scaleManualExposure(factor.toDouble(), inputRefreshHz())) {
-                log("경고: RAW 사이트가 포화 근처인데 노출을 더 낮출 수 없음 — 탭 밝기를 낮추세요")
+                log("경고: 화면이 RAW 포화 근처인데 노출을 더 낮출 수 없음 — 탭 밝기를 낮추세요. 이대로면 보정 효과가 측정되지 않습니다")
                 return
             }
             log("RAW 포화 방지: 노출 ×${fmt(factor)} (${cap.manualExposureText()})")
             delay(300)
         }
+        log("경고: ${SATURATION_STEPS}번 낮춰도 RAW 포화가 남음 — 탭 밝기를 낮추거나 카메라 노출을 확인하세요")
     }
 
     /** 탐침 프레임의 점 최고 밝기: 7화소마다 표본을 뽑아 [SPARSE_PROBE_QUANTILE] 분위수(정렬 메모리 줄임). */
