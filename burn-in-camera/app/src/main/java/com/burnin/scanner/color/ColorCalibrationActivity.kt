@@ -11,6 +11,7 @@ import android.view.WindowManager
 import android.widget.Button
 import android.widget.TextView
 import com.burnin.scanner.R
+import com.burnin.scanner.analysis.RgbImage
 import com.burnin.scanner.analysis.ImageOps
 import com.burnin.scanner.analysis.ScreenDetector
 import com.burnin.scanner.camera.CaptureController
@@ -66,7 +67,13 @@ class ColorCalibrationActivity : Activity() {
     /** 근사 Lab의 기준 흰색 = 목표 흰색(기준 기기 실측 흰색 × scale). */
     private var labWhite = Rgb(1.0, 1.0, 1.0)
 
-    private class Quads(val ref: ScreenDetector.Quad?, val adj: ScreenDetector.Quad)
+    /** 대조설비는 색감만 재므로 프레임에 일부만 걸쳐도 된다: 사각형이 온전하면 중앙 영역, 아니면 켜진 화소 마스크. */
+    private class Quads(val ref: ScreenDetector.Quad?, val adj: ScreenDetector.Quad, val refMask: ColorSampling.Mask? = null) {
+        fun refSampler(): (RgbImage) -> Rgb =
+            refMask?.let { m -> { img: RgbImage -> ColorSampling.meanMaskRgb(img, m) } }
+                ?: ref!!.let { q -> { img: RgbImage -> ColorSampling.meanCenterRgb(img, q) } }
+        fun adjSampler(): (RgbImage) -> Rgb = { img -> ColorSampling.meanCenterRgb(img, adj) }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -158,8 +165,8 @@ class ColorCalibrationActivity : Activity() {
         val adjNative = LinkedHashMap<String, Rgb>()
         nativePatches.forEachIndexed { i, p ->
             status("원본 측정 ${i + 1}/${nativePatches.size}: ${p.id}")
-            if (reference != null) refNative[p.id] = measure(reference, adjust, p.pattern, quads.ref!!)
-            adjNative[p.id] = measure(adjust, reference, p.pattern, quads.adj)
+            if (reference != null) refNative[p.id] = measure(reference, adjust, p.pattern, quads.refSampler())
+            adjNative[p.id] = measure(adjust, reference, p.pattern, quads.adjSampler())
         }
 
         status("화면 모델 적합...")
@@ -182,7 +189,7 @@ class ColorCalibrationActivity : Activity() {
         repeat(REFINE_ITERATIONS) { iter ->
             val adjGray = grays.mapIndexed { i, v ->
                 status("회색 계조 보정 ${iter + 1}/$REFINE_ITERATIONS: ${i + 1}/${grays.size}")
-                measure(adjust, reference, ColorPatchPlan.patternName(v, v, v), quads.adj)
+                measure(adjust, reference, ColorPatchPlan.patternName(v, v, v), quads.adjSampler())
             }
             val err = grays.indices.map { deltaE(matcher, refGray[it], adjGray[it] - adjModel.black) }
             refineLog.put(JSONObject().put("iteration", iter).put("grayMeanDeltaE00", err.average()))
@@ -195,13 +202,13 @@ class ColorCalibrationActivity : Activity() {
         val adjAfter = LinkedHashMap<String, Rgb>()
         evalPatches.forEachIndexed { i, p ->
             status("최종 검증 ${i + 1}/${evalPatches.size}: ${p.id}")
-            adjAfter[p.id] = measure(adjust, reference, p.pattern, quads.adj)
+            adjAfter[p.id] = measure(adjust, reference, p.pattern, quads.adjSampler())
         }
 
         val refWhiteStart = refNative.getValue(white.id)
         val drift: Double? = if (reference != null) {
             status("drift 확인...")
-            val refWhiteEnd = measure(reference, adjust, white.pattern, quads.ref!!)
+            val refWhiteEnd = measure(reference, adjust, white.pattern, quads.refSampler())
             ((refWhiteEnd.luma() - refWhiteStart.luma()) / refWhiteStart.luma()).also { d ->
                 log("기준 흰색 drift ${pct(d)}" + if (kotlin.math.abs(d) > DRIFT_WARN) " — 측정 중 화면/카메라가 변했습니다. 결과를 신뢰하기 어렵습니다." else "")
             }
@@ -293,10 +300,26 @@ class ColorCalibrationActivity : Activity() {
             log("화면 검출: 조정설비 $adj")
             return Quads(null, adj)
         }
-        val ref = detectQuad(reference, adjust, "대조설비")
-        require(!ColorSampling.overlaps(ref, adj)) { "두 기기 화면이 같은 위치로 검출되었습니다. 두 화면이 모두 프레임에 들어오게 배치하세요" }
-        log("화면 검출: 대조설비 $ref, 조정설비 $adj")
-        return Quads(ref, adj)
+        // 대조설비는 프레임 가장자리에 일부만 걸쳐도 된다(중앙은 조정설비 몫). 사각형이 잘렸거나 못 찾으면 마스크로 잰다.
+        withContext(Dispatchers.IO) {
+            adjust.showPattern("black")
+            reference.showPattern(WHITE_PATTERN)
+        }
+        delay(SWITCH_SETTLE_MS)
+        val img = withContext(Dispatchers.Default) { ImageOps.decodeLinearRgb(capture!!.captureSingleFrame(), DECODE_LONG_EDGE) }
+        val ref = withContext(Dispatchers.Default) { ColorSampling.detectBrightQuad(img) }
+        if (ref != null && !ColorSampling.touchesBorder(ref, img.w, img.h) && !ColorSampling.overlaps(ref, adj)) {
+            log("화면 검출: 대조설비 $ref, 조정설비 $adj")
+            return Quads(ref, adj)
+        }
+        val mask = withContext(Dispatchers.Default) { ColorSampling.brightMask(img) }
+            ?: error("대조설비 화면이 프레임에 거의 보이지 않습니다. 가장자리에라도 조금 더 걸리게 놓아 주세요")
+        // 마스크가 조정설비 중앙 영역과 겹치면 다른 화면을 잡은 것
+        val c = ColorSampling.quadPoint(adj, 0.5f, 0.5f)
+        val ci = c.y.toInt().coerceIn(0, img.h - 1) * img.w + c.x.toInt().coerceIn(0, img.w - 1)
+        require(!mask.bits[ci]) { "대조설비와 조정설비가 같은 위치로 검출되었습니다" }
+        log("화면 검출: 대조설비는 프레임에 일부만 보임 — 켜진 영역 ${String.format(java.util.Locale.US, "%.1f", mask.count * 100.0 / (img.w * img.h))}% 화소로 색 측정, 조정설비 $adj")
+        return Quads(null, adj, mask)
     }
 
     private suspend fun detectQuad(lit: ControlClient, dark: ControlClient?, name: String): ScreenDetector.Quad {
@@ -315,8 +338,8 @@ class ColorCalibrationActivity : Activity() {
     private suspend fun adjustExposure(cap: CaptureController, adjust: ControlClient, reference: ControlClient?, quads: Quads) {
         val white = ColorPatchPlan.patternName(255, 255, 255)
         repeat(4) {
-            val refPeak = if (reference != null) measure(reference, adjust, white, quads.ref!!).max() else 0.0
-            val peak = maxOf(refPeak, measure(adjust, reference, white, quads.adj).max())
+            val refPeak = if (reference != null) measure(reference, adjust, white, quads.refSampler()).max() else 0.0
+            val peak = maxOf(refPeak, measure(adjust, reference, white, quads.adjSampler()).max())
             if (peak in MIN_PEAK..MAX_PEAK) {
                 log("노출 확인: 흰색 최대 채널 ${fmt3(peak)} (${cap.manualExposureText()})")
                 return
@@ -330,7 +353,7 @@ class ColorCalibrationActivity : Activity() {
         }
     }
 
-    private suspend fun measure(lit: ControlClient, dark: ControlClient?, pattern: String, quad: ScreenDetector.Quad): Rgb {
+    private suspend fun measure(lit: ControlClient, dark: ControlClient?, pattern: String, sample: (RgbImage) -> Rgb): Rgb {
         withContext(Dispatchers.IO) {
             dark?.showPattern("black")
             lit.showPattern(pattern)
@@ -338,7 +361,7 @@ class ColorCalibrationActivity : Activity() {
         delay(SWITCH_SETTLE_MS)
         val frames = capture!!.captureFrames(FRAMES_PER_PATCH, interFrameDelayMs = 60)
         return withContext(Dispatchers.Default) {
-            frames.map { ColorSampling.meanCenterRgb(ImageOps.decodeLinearRgb(it, DECODE_LONG_EDGE), quad) }
+            frames.map { sample(ImageOps.decodeLinearRgb(it, DECODE_LONG_EDGE)) }
                 .reduce { acc, v -> acc + v } * (1.0 / frames.size)
         }
     }

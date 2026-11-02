@@ -63,6 +63,67 @@ internal object ColorSampling {
         return quad
     }
 
+    /** 켜진 화면 영역 마스크(분석 이미지 크기). [count]는 참인 화소 수. */
+    class Mask(val w: Int, val h: Int, val bits: BooleanArray, val count: Int)
+
+    /**
+     * 켜진 화면 영역을 사각형 없이 화소 마스크로 잡는다. 대조설비처럼 프레임 가장자리에 걸려 일부만 보이는
+     * 화면에 쓴다(색감만 재므로 화면 전체가 들어올 필요가 없다). 경계 번짐·잘린 가장자리를 피하려고 짧은 변의
+     * [erodeFrac]만큼 안쪽으로 깎는다. 남는 화소가 프레임의 [minFraction]보다 적으면 null.
+     */
+    fun brightMask(img: RgbImage, erodeFrac: Float = 0.02f, minFraction: Float = 0.005f): Mask? {
+        val w = img.w
+        val h = img.h
+        var maxV = 1e-6f
+        for (i in img.r.indices) maxV = max(maxV, luma(img, i))
+        // detectBrightQuad와 같은 문턱: 상위 1% 밝기의 30%
+        val bins = IntArray(1024)
+        val scale = 1023f / maxV
+        for (i in img.r.indices) bins[(luma(img, i) * scale).toInt().coerceIn(0, 1023)]++
+        var cum = 0
+        var p99 = maxV
+        for (b in 0 until 1024) {
+            cum += bins[b]
+            if (cum >= img.r.size * 0.99f) { p99 = b / scale; break }
+        }
+        if (p99 < 0.005f) return null
+        val threshold = p99 * 0.30f
+        // 어두운 화소의 적분 영상으로, 반경 r 안에 어두운 화소가 하나라도 있으면(또는 프레임 밖이면) 뺀다
+        val r = max(1, (min(w, h) * erodeFrac).toInt())
+        val stride = w + 1
+        val dark = IntArray(stride * (h + 1))
+        for (y in 0 until h) {
+            var row = 0
+            for (x in 0 until w) {
+                if (luma(img, y * w + x) <= threshold) row++
+                dark[(y + 1) * stride + x + 1] = dark[y * stride + x + 1] + row
+            }
+        }
+        val bits = BooleanArray(w * h)
+        var count = 0
+        for (y in r until h - r) for (x in r until w - r) {
+            val x0 = x - r; val x1 = x + r + 1; val y0 = y - r; val y1 = y + r + 1
+            val n = dark[y1 * stride + x1] - dark[y0 * stride + x1] - dark[y1 * stride + x0] + dark[y0 * stride + x0]
+            if (n == 0) { bits[y * w + x] = true; count++ }
+        }
+        if (count < w * h * minFraction) return null
+        return Mask(w, h, bits, count)
+    }
+
+    fun meanMaskRgb(img: RgbImage, mask: Mask): Rgb {
+        require(img.w == mask.w && img.h == mask.h) { "마스크 크기 불일치" }
+        var r = 0.0; var g = 0.0; var b = 0.0
+        for (i in mask.bits.indices) {
+            if (!mask.bits[i]) continue
+            r += img.r[i]; g += img.g[i]; b += img.b[i]
+        }
+        return Rgb(r / mask.count, g / mask.count, b / mask.count)
+    }
+
+    /** 사각형 꼭짓점이 프레임 테두리 [margin] 안에 닿으면 true(화면이 잘려 사각형이 실제 화면이 아님). */
+    fun touchesBorder(q: ScreenDetector.Quad, w: Int, h: Int, margin: Float = 3f): Boolean =
+        q.corners.any { it.x <= margin || it.y <= margin || it.x >= w - 1 - margin || it.y >= h - 1 - margin }
+
     /** 두 사각형의 bounding box가 작은 쪽 면적의 10% 이상 겹치면 true (같은 화면을 두 번 잡은 경우). */
     fun overlaps(a: ScreenDetector.Quad, b: ScreenDetector.Quad): Boolean {
         fun box(q: ScreenDetector.Quad) = floatArrayOf(

@@ -769,6 +769,11 @@ class MeasurementActivity : Activity() {
         val screenW = Session.screenWidth
         val screenH = Session.screenHeight
         require(screenW > 0 && screenH > 0) { "대상 화면 정보 없음" }
+        // 번인 측정에는 대조설비를 쓰지 않는다: 색감 맞추기 뒤 흰 화면으로 남아 있으면 박스 안 미광이 되므로 끈다
+        Session.referenceClient?.takeIf { it.isConnected }?.let { ref ->
+            runCatching { withContext(Dispatchers.IO) { ref.showPattern("black") } }
+                .onSuccess { log("대조설비 화면을 검정으로 바꿈(미광 차단)") }
+        }
         extraImprovement = null
         maxAttenuation = inputMaxAttenuation()
         whiteBalanceActive = false
