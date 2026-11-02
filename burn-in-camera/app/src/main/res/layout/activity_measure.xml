@@ -136,20 +136,20 @@
             android:maxLines="1"
             android:text="10" />
 
-        <CheckBox
-            android:id="@+id/chkRgbDots"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:checked="true"
-            android:textSize="12sp"
-            android:text="RGBW점" />
-
         <Button
             android:id="@+id/btnCheckAtt"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
             android:text="감쇠 필요도 검증" />
+
+        <!-- 색(채널 비) 보정: 번인 측정과 따로, 밝기 보정맵을 켠 위에서 -->
+        <Button
+            android:id="@+id/btnColor"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="색 보정" />
     </LinearLayout>
 
     <!-- 측정 뒤, 그 측정의 최적 맵에서 반복 보정을 n회 더 돌린다. 측정 화면에서만 보인다. -->
