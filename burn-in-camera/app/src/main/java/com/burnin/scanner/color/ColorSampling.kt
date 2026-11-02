@@ -71,7 +71,7 @@ internal object ColorSampling {
      * 화면에 쓴다(색감만 재므로 화면 전체가 들어올 필요가 없다). 경계 번짐·잘린 가장자리를 피하려고 짧은 변의
      * [erodeFrac]만큼 안쪽으로 깎는다. 남는 화소가 프레임의 [minFraction]보다 적으면 null.
      */
-    fun brightMask(img: RgbImage, erodeFrac: Float = 0.02f, minFraction: Float = 0.005f): Mask? {
+    fun brightMask(img: RgbImage, erodeFrac: Float = 0.05f, minFraction: Float = 0.005f): Mask? {
         val w = img.w
         val h = img.h
         var maxV = 1e-6f
