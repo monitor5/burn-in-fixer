@@ -709,6 +709,47 @@ class CaptureController(
     suspend fun captureSingleFrame(): CaptureFrame =
         withTimeout(12_000) { captureFrame() }
 
+    /**
+     * 메인 카메라 한 장을 Java 배열로 복사하지 않고 카메라 버퍼에서 바로 [file]에 쓴다(형식은 [CaptureFrameCodec]).
+     * 16MP RAW면 장당 32MB 복사본이 힙에 생기지 않는다. 반환: 센서 타임스탬프(ns).
+     */
+    suspend fun captureSingleFrameToFile(file: java.io.File): Long =
+        withTimeout(12_000) { captureFrameToFile(file) }
+
+    private suspend fun captureFrameToFile(file: java.io.File): Long = suspendCancellableCoroutine { cont ->
+        val r = reader ?: return@suspendCancellableCoroutine cont.resumeWithException(
+            IllegalStateException("카메라 미시작")
+        )
+        r.setOnImageAvailableListener({ rd ->
+            val image = rd.acquireLatestImage() ?: return@setOnImageAvailableListener
+            try {
+                CaptureFrameCodec.writeStreaming(
+                    file, image.format, image.width, image.height, image.timestamp,
+                    manualSensitivityIso ?: latestSensitivityIso,
+                    manualExposureTimeNs ?: latestExposureTimeNs,
+                    image.planes.map { CaptureFrameCodec.PlaneSource(it.buffer, it.rowStride, it.pixelStride) },
+                    if (image.format == ImageFormat.RAW_SENSOR) rawInfo(rawStatic)?.copy(shading = shadingByCamera[cameraId]) else null,
+                )
+                if (cont.isActive) cont.resume(image.timestamp)
+            } catch (e: Exception) {
+                if (cont.isActive) cont.resumeWithException(e)
+            } catch (e: OutOfMemoryError) {
+                if (cont.isActive) cont.resumeWithException(IllegalStateException("프레임 저장 메모리 부족", e))
+            } finally {
+                image.close()
+                rd.setOnImageAvailableListener(null, null)
+            }
+        }, handler)
+
+        cont.invokeOnCancellation { handler.post { runCatching { r.setOnImageAvailableListener(null, null) } } }
+        val req = device!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+            addTarget(r.surface)
+            applyMeasurementControls(this)
+            if (captureFormat == ImageFormat.JPEG) set(CaptureRequest.JPEG_QUALITY, 98.toByte())
+        }
+        session!!.capture(req.build(), previewCallback, handler)
+    }
+
     private suspend fun captureFrame(): CaptureFrame = suspendCancellableCoroutine { cont ->
         val r = reader ?: return@suspendCancellableCoroutine cont.resumeWithException(
             IllegalStateException("카메라 미시작")

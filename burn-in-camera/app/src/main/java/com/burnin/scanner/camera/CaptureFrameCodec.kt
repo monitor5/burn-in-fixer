@@ -22,22 +22,72 @@ internal object CaptureFrameCodec {
                 out.writeInt(plane.bytes.size)
                 out.write(plane.bytes)
             }
-            val raw = frame.raw
-            out.writeBoolean(raw != null)
-            if (raw != null) {
-                out.writeInt(raw.cfa)
-                raw.blackLevel.forEach { out.writeInt(it) }
-                out.writeInt(raw.whiteLevel)
-                out.writeFloat(raw.gainR); out.writeFloat(raw.gainG); out.writeFloat(raw.gainB)
-                out.writeBoolean(raw.ccm != null)
-                raw.ccm?.forEach { out.writeFloat(it) }
-                val sh = raw.shading
-                out.writeBoolean(sh != null)
-                if (sh != null) {
-                    out.writeInt(sh.cols); out.writeInt(sh.rows)
-                    sh.gains.forEach { out.writeFloat(it) }
-                }
+            writeRaw(out, frame.raw)
+        }
+    }
+
+    private fun writeRaw(out: DataOutputStream, raw: CaptureFrame.RawInfo?) {
+        out.writeBoolean(raw != null)
+        if (raw != null) {
+            out.writeInt(raw.cfa)
+            raw.blackLevel.forEach { out.writeInt(it) }
+            out.writeInt(raw.whiteLevel)
+            out.writeFloat(raw.gainR); out.writeFloat(raw.gainG); out.writeFloat(raw.gainB)
+            out.writeBoolean(raw.ccm != null)
+            raw.ccm?.forEach { out.writeFloat(it) }
+            val sh = raw.shading
+            out.writeBoolean(sh != null)
+            if (sh != null) {
+                out.writeInt(sh.cols); out.writeInt(sh.rows)
+                sh.gains.forEach { out.writeFloat(it) }
             }
+        }
+    }
+
+    /** [write]와 같은 형식으로, 평면 데이터를 Java 배열로 복사하지 않고 카메라 버퍼에서 바로 파일로 쓴다. */
+    class PlaneSource(val buffer: java.nio.ByteBuffer, val rowStride: Int, val pixelStride: Int)
+
+    fun writeStreaming(
+        file: File,
+        format: Int,
+        width: Int,
+        height: Int,
+        timestampNs: Long,
+        sensitivityIso: Int?,
+        exposureTimeNs: Long?,
+        planes: List<PlaneSource>,
+        raw: CaptureFrame.RawInfo?,
+    ) {
+        FileOutputStream(file).use { fos ->
+            val ch = fos.channel
+            fun put(block: (DataOutputStream) -> Unit) {
+                val bos = ByteArrayOutputStream(64)
+                DataOutputStream(bos).use(block)
+                val b = java.nio.ByteBuffer.wrap(bos.toByteArray())
+                while (b.hasRemaining()) ch.write(b)
+            }
+            put { out ->
+                out.writeInt(MAGIC)
+                out.writeInt(format)
+                out.writeInt(width)
+                out.writeInt(height)
+                out.writeLong(timestampNs)
+                out.writeBoolean(sensitivityIso != null)
+                sensitivityIso?.let { out.writeInt(it) }
+                out.writeBoolean(exposureTimeNs != null)
+                exposureTimeNs?.let { out.writeLong(it) }
+                out.writeInt(planes.size)
+            }
+            for (p in planes) {
+                val b = p.buffer.duplicate()
+                put { out ->
+                    out.writeInt(p.rowStride)
+                    out.writeInt(p.pixelStride)
+                    out.writeInt(b.remaining())
+                }
+                while (b.hasRemaining()) ch.write(b)
+            }
+            put { out -> writeRaw(out, raw) }
         }
     }
 

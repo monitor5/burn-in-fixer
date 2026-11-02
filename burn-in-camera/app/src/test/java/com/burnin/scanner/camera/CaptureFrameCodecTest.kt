@@ -28,4 +28,13 @@ class CaptureFrameCodecTest {
         RandomAccessFile(file,"rw").use{it.seek(38);it.writeInt(Int.MAX_VALUE)}
         assertThrows(IllegalArgumentException::class.java){CaptureFrameCodec.read(file)}
     }
+    @Test fun streamingWriterProducesTheSameFileAsTheArrayWriter() {
+        for(f in listOf(frame(),frame().copy(sensitivityIso=null,exposureTimeNs=null))) {
+            val a=temp.newFile();CaptureFrameCodec.write(a,f)
+            val b=temp.newFile()
+            CaptureFrameCodec.writeStreaming(b,f.format,f.width,f.height,f.timestampNs,f.sensitivityIso,f.exposureTimeNs,
+                f.planes.map{CaptureFrameCodec.PlaneSource(java.nio.ByteBuffer.allocateDirect(it.bytes.size).put(it.bytes).flip() as java.nio.ByteBuffer,it.rowStride,it.pixelStride)},f.raw)
+            assertArrayEquals(a.readBytes(),b.readBytes())
+        }
+    }
 }

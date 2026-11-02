@@ -3098,14 +3098,14 @@ class MeasurementActivity : Activity() {
         val wallStartMs = System.currentTimeMillis()
         try {
             repeat(frameCount) { index ->
-                val frame = cap.captureSingleFrame()
-                if (frame.timestampNs > 0L) {
-                    if (firstTimestampNs == null) firstTimestampNs = frame.timestampNs
-                    lastTimestampNs = frame.timestampNs
-                }
                 val file = File.createTempFile("capture_${System.nanoTime()}_", ".bin", cacheDir)
                 files += file
-                writeCaptureFrame(file, frame)
+                // 카메라 버퍼에서 바로 파일로(장당 최대 32MB Java 복사본을 만들지 않음)
+                val ts = cap.captureSingleFrameToFile(file)
+                if (ts > 0L) {
+                    if (firstTimestampNs == null) firstTimestampNs = ts
+                    lastTimestampNs = ts
+                }
                 if (index != frameCount - 1) {
                     delay(interFrameDelayMs + FLICKER_PHASE_JITTER_MS[index % FLICKER_PHASE_JITTER_MS.size])
                 }
