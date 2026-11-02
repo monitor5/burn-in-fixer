@@ -16,7 +16,7 @@ import org.robolectric.annotation.GraphicsMode
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
 class PatternViewTest {
     private fun bitmap(color:Int)=Bitmap.createBitmap(4,4,Bitmap.Config.ARGB_8888).apply{eraseColor(color)}
-    private fun view()=PatternView(RuntimeEnvironment.getApplication()).apply{layout(0,0,4,4);spec=PatternSpec.parse("white")!!}
+    private fun view()=PatternView(RuntimeEnvironment.getApplication()).apply{gpuEnabled=false;layout(0,0,4,4);spec=PatternSpec.parse("white")!!}
     private fun pixel(v:PatternView):Int {val out=bitmap(Color.TRANSPARENT);v.draw(Canvas(out));val p=out.getPixel(2,2);out.recycle();return p}
     /** 단색 보정 경로는 dither되므로 픽셀 하나가 아니라 4×4 평균을 본다. */
     private fun mean(v:PatternView,shift:Int):Double {
@@ -62,7 +62,7 @@ class PatternViewTest {
         assertEquals(expected,mean(v,R),.3);red.recycle()
     }
     @Test fun sparsePatternIsPixelExactWithoutAntialiasing() {
-        val v=PatternView(RuntimeEnvironment.getApplication()).apply{layout(0,0,8,8);spec=PatternSpec.parse("sparse70_b1_p4_x1_y2")!!}
+        val v=PatternView(RuntimeEnvironment.getApplication()).apply{gpuEnabled=false;layout(0,0,8,8);spec=PatternSpec.parse("sparse70_b1_p4_x1_y2")!!}
         val out=Bitmap.createBitmap(8,8,Bitmap.Config.ARGB_8888);v.draw(Canvas(out))
         for (y in 0 until 8) for (x in 0 until 8) {
             val lit=(x-1)>=0&&(y-2)>=0&&(x-1)%4==0&&(y-2)%4==0

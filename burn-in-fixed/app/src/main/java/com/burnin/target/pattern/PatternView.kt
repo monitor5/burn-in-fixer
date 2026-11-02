@@ -300,6 +300,10 @@ class PatternView(context: Context) : View(context) {
             }
         }
         clearSolidCache()
+        gpuCorrected(PatternSpec.solid("gpu", color), color, w, h, rgb, whiteBalanceRgb)?.let { bmp ->
+            storeCache(bmp, null, color, w, h, rgb, whiteBalanceRgb)
+            return bmp
+        }
         val correctionMap = scaledMap(rgb, w, h)
         val whiteBalanceMap = scaledMap(whiteBalanceRgb, w, h)
         // 감쇠 맵은 한 행씩만 읽는다(전체 화면 IntArray 두 장을 피해 구형 기기 힙 사용을 줄인다).
@@ -369,6 +373,10 @@ class PatternView(context: Context) : View(context) {
             }
         }
         clearSolidCache()
+        gpuCorrected(spec, spec.color, w, h, rgb, whiteBalanceRgb)?.let { bmp ->
+            storeCache(bmp, spec, 0, w, h, rgb, whiteBalanceRgb)
+            return bmp
+        }
         val correctionMap = scaledMap(rgb, w, h)
         val whiteBalanceMap = scaledMap(whiteBalanceRgb, w, h)
         val correctionRow = correctionMap?.let { IntArray(w) }
@@ -442,6 +450,47 @@ class PatternView(context: Context) : View(context) {
         sparseCache = bmp
         sparseCacheSpec = spec
         return bmp
+    }
+
+    /** false면 GPU 계산을 쓰지 않는다(단위 테스트는 CPU 경로를 검증한다). */
+    var gpuEnabled: Boolean = true
+
+    /**
+     * 같은 식을 GPU로 계산한 보정 화면([GpuCorrector]). GPU를 쓸 수 없으면 null(CPU 경로로 그린다).
+     * 단색은 8×8 ordered dither, 희소 점은 반올림.
+     */
+    private fun gpuCorrected(spec: PatternSpec, base: Int, w: Int, h: Int, rgb: Bitmap?, whiteBalanceRgb: Bitmap?): Bitmap? {
+        if (!gpuEnabled || GpuCorrector.disabled) return null
+        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val s = strengthPct / 100.0
+        val ok = GpuCorrector.render(
+            GpuCorrector.Input(
+                spec, base, rgb, whiteBalanceRgb,
+                (correctionMaxAttenuation * s).toFloat(),
+                (whiteBalanceMaxAttenuation * s).toFloat(),
+                (1.0 / OutputTransfer.sanitizeGamma(outputGamma)).toFloat(),
+            ),
+            out,
+        )
+        if (!ok) {
+            out.recycle()
+            return null
+        }
+        return out
+    }
+
+    private fun storeCache(bmp: Bitmap, sparseSpec: PatternSpec?, color: Int, w: Int, h: Int, rgb: Bitmap?, whiteBalanceRgb: Bitmap?) {
+        solidCache = bmp
+        solidCacheSparseSpec = sparseSpec
+        solidCacheColor = color
+        solidCacheW = w
+        solidCacheH = h
+        solidCacheStrength = strengthPct
+        solidCacheRgb = rgb
+        solidCacheWhiteBalanceRgb = whiteBalanceRgb
+        solidCacheCorrectionMaxAttenuation = correctionMaxAttenuation
+        solidCacheWhiteBalanceMaxAttenuation = whiteBalanceMaxAttenuation
+        solidCacheGamma = outputGamma
     }
 
     private fun scaledMap(src: Bitmap?, w: Int, h: Int): Bitmap? {

@@ -12,8 +12,8 @@ import android.graphics.PixelFormat
 import android.os.Build
 import android.os.IBinder
 import android.provider.Settings
+import android.hardware.display.DisplayManager
 import android.view.WindowManager
-import android.widget.ImageView
 import com.burnin.target.DeviceRole
 import com.burnin.target.correction.CorrectionStore
 import com.burnin.target.util.AppLog
@@ -22,7 +22,8 @@ import com.burnin.target.util.AppLog
  * 시스템 오버레이 보정 (T-FR-009/010/011, MVP 3).
  * - 전체 화면 위에 터치를 통과시키는 알파 감쇠 레이어를 띄운다.
  * - 알림의 "보정 끄기" 액션으로 즉시 비활성화할 수 있다 (긴급 비활성화).
- * - 화면 회전이 감지되면 좌표가 틀어지므로 안전하게 스스로 중지한다.
+ * - 화면이 돌아가면 맵을 같은 물리 픽셀에 맞게 돌려 그린다([OverlayMapView]). 180도 회전은
+ *   설정 변경이 오지 않아 DisplayListener로 잡는다.
  * - Android 8.0+ 는 TYPE_APPLICATION_OVERLAY, 7.x 는 TYPE_SYSTEM_ALERT 를 사용한다.
  */
 class OverlayService : Service() {
@@ -34,7 +35,10 @@ class OverlayService : Service() {
         fun refreshBitmap() {
             val bmp = CorrectionStore.bakedBitmap ?: return
             android.os.Handler(android.os.Looper.getMainLooper()).post {
-                instance?.overlayView?.setImageBitmap(bmp)
+                instance?.overlayView?.let {
+                    it.bitmap = bmp
+                    it.mapRotation = CorrectionStore.meta?.rotation ?: 0
+                }
             }
         }
 
@@ -65,8 +69,19 @@ class OverlayService : Service() {
         }
     }
 
-    private var overlayView: ImageView? = null
-    private var initialOrientation = Configuration.ORIENTATION_UNDEFINED
+    private var overlayView: OverlayMapView? = null
+    private val displayListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) {}
+        override fun onDisplayRemoved(displayId: Int) {}
+        override fun onDisplayChanged(displayId: Int) {
+            overlayView?.let { v ->
+                if (v.drawnRotation != CorrectionStore.displayRotation(this@OverlayService)) {
+                    v.invalidate()
+                    logAlignment(v)
+                }
+            }
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -86,11 +101,11 @@ class OverlayService : Service() {
         }
 
         if (overlayView == null) {
-            val view = ImageView(this).apply {
+            val view = OverlayMapView(this).apply {
                 // 늘이지 않는다: 창이 화면 전체가 아니면 맵이 찌그러져 번인 위치와 어긋난다(창 크기는 아래에서 확인)
-                scaleType = ImageView.ScaleType.MATRIX
-                setImageBitmap(bmp)
-                imageAlpha = strength * 255 / 100
+                bitmap = bmp
+                mapRotation = CorrectionStore.meta?.rotation ?: 0
+                mapAlpha = strength * 255 / 100
             }
             @Suppress("DEPRECATION")
             val type = if (Build.VERSION.SDK_INT >= 26)
@@ -117,16 +132,8 @@ class OverlayService : Service() {
                 getSystemService(WindowManager::class.java).addView(view, lp)
                 overlayView = view
                 instance = this
-                view.post {
-                    val loc = IntArray(2)
-                    view.getLocationOnScreen(loc)
-                    val ok = loc[0] == 0 && loc[1] == 0 && view.width == bmp.width && view.height == bmp.height
-                    AppLog.i(
-                        "오버레이 창 ${loc[0]},${loc[1]} ${view.width}x${view.height} / 맵 ${bmp.width}x${bmp.height}" +
-                            if (ok) " — 1:1 정렬" else " — 경고: 화면 전체가 아님, 가려지거나 어긋난 영역은 보정되지 않음"
-                    )
-                }
-                initialOrientation = resources.configuration.orientation
+                view.post { logAlignment(view) }
+                getSystemService(DisplayManager::class.java).registerDisplayListener(displayListener, null)
                 running = true
                 AppLog.i("시스템 오버레이 보정 ON (강도 $strength%)")
             } catch (e: Exception) {
@@ -134,8 +141,9 @@ class OverlayService : Service() {
                 stopSelf()
             }
         } else {
-            overlayView?.setImageBitmap(bmp)
-            overlayView?.imageAlpha = strength * 255 / 100
+            overlayView?.bitmap = bmp
+            overlayView?.mapRotation = CorrectionStore.meta?.rotation ?: 0
+            overlayView?.mapAlpha = strength * 255 / 100
             AppLog.i("오버레이 강도 변경: $strength%")
         }
         return START_NOT_STICKY
@@ -143,15 +151,31 @@ class OverlayService : Service() {
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        // 회전하면 네이티브 1:1 정렬이 깨지므로 안전 중지 (T-FR-009)
-        if (newConfig.orientation != initialOrientation) {
-            AppLog.i("화면 회전 감지 → 오버레이 안전 중지")
-            stopSelf()
+        // 창은 MATCH_PARENT라 새 방향 크기로 다시 잡히고, 뷰는 새 방향으로 맵을 돌려 그린다
+        overlayView?.let { v ->
+            v.invalidate()
+            v.post { logAlignment(v) }
         }
+    }
+
+    /** 창이 화면 전체를 1:1로 덮는지와 지금 맵을 몇 도 돌려 그리는지 기록한다. */
+    private fun logAlignment(view: OverlayMapView) {
+        val bmp = view.bitmap ?: return
+        val loc = IntArray(2)
+        view.getLocationOnScreen(loc)
+        val screen = CorrectionStore.realScreenSize(this)
+        val ok = loc[0] == 0 && loc[1] == 0 && view.width == screen.x && view.height == screen.y
+        val turn = ((CorrectionStore.displayRotation(this) - view.mapRotation + 4) % 4) * 90
+        AppLog.i(
+            "오버레이 창 ${loc[0]},${loc[1]} ${view.width}x${view.height} / 화면 ${screen.x}x${screen.y}, " +
+                "맵 ${bmp.width}x${bmp.height}를 ${turn}° 돌려 그림" +
+                if (ok) " — 1:1 정렬" else " — 경고: 화면 전체가 아님, 가려지거나 어긋난 영역은 보정되지 않음"
+        )
     }
 
     override fun onDestroy() {
         overlayView?.let {
+            runCatching { getSystemService(DisplayManager::class.java).unregisterDisplayListener(displayListener) }
             runCatching { getSystemService(WindowManager::class.java).removeView(it) }
         }
         overlayView = null

@@ -33,6 +33,8 @@ object CorrectionStore {
         val createdAt: String,
         val sourceDevice: String,
         val outputGamma: Double = OutputTransfer.DEFAULT_GAMMA,
+        /** 맵이 측정된 화면 방향(Surface.ROTATION_*). 오버레이가 회전하면 이 방향 기준으로 맵을 돌린다. */
+        val rotation: Int = 0,
     ) {
         fun toJson(): JSONObject = JSONObject()
             .put("profileVersion", 2)
@@ -46,6 +48,7 @@ object CorrectionStore {
             .put("createdAt", createdAt)
             .put("sourceDevice", sourceDevice)
             .put("outputGamma", outputGamma)
+            .put("rotation", rotation)
 
         companion object {
             fun fromJson(o: JSONObject) = Meta(
@@ -60,6 +63,7 @@ object CorrectionStore {
                 outputGamma = OutputTransfer.sanitizeGamma(
                     if (o.has("outputGamma")) o.optDouble("outputGamma") else null
                 ),
+                rotation = o.optInt("rotation", -1),
             )
         }
     }
@@ -76,6 +80,16 @@ object CorrectionStore {
 
     fun md5(bytes: ByteArray): String =
         MessageDigest.getInstance("MD5").digest(bytes).joinToString("") { "%02x".format(it) }
+
+    @Suppress("DEPRECATION")
+    fun displayRotation(context: Context): Int =
+        context.getSystemService(WindowManager::class.java).defaultDisplay.rotation
+
+    /** 기기 고유 방향(ROTATION_0)의 화면 크기. */
+    fun naturalScreenSize(context: Context): Point {
+        val p = realScreenSize(context)
+        return if (displayRotation(context) % 2 == 1) Point(p.y, p.x) else p
+    }
 
     fun realScreenSize(context: Context): Point {
         val wm = context.getSystemService(WindowManager::class.java)
@@ -121,6 +135,8 @@ object CorrectionStore {
         persist: Boolean = true,
         restoredCreatedAt: String? = null,
         outputGamma: Double = OutputTransfer.DEFAULT_GAMMA,
+        /** 저장본을 다시 읽을 때 맵의 방향. null이면 새 맵: 지금 화면 방향으로 측정된 것. */
+        restoredRotation: Int? = null,
     ): String? {
         if (width <= 0 || height <= 0 || defaultStrengthPct !in 0..100) return "프로파일 메타데이터 범위 오류"
         if (rgbDataBase64.isNullOrBlank() && rgbChecksumMd5.isNotEmpty()) return "RGB 데이터 누락"
@@ -157,7 +173,17 @@ object CorrectionStore {
             return "PNG 크기(${opts.outWidth}x${opts.outHeight})가 메타데이터(${width}x${height})와 다름"
         }
 
-        val screen = realScreenSize(context)
+        // 새 맵은 지금 방향(측정 화면 방향)과 같아야 한다. 저장본은 저장된 방향 기준으로 본다(가로로 켜도 적재).
+        val natural = naturalScreenSize(context)
+        val mapRotation = when {
+            restoredRotation == null -> displayRotation(context)
+            restoredRotation in 0..3 -> restoredRotation
+            // 방향 기록이 없던 예전 저장본: 고유 방향과 크기가 같으면 0, 아니면 90도로 본다
+            width == natural.x && height == natural.y -> 0
+            else -> 1
+        }
+        val screen = if (restoredRotation == null) realScreenSize(context)
+            else if (mapRotation % 2 == 1) Point(natural.y, natural.x) else natural
         if (!(screen.x == width && screen.y == height)) {
             return if (screen.x == height && screen.y == width) {
                 "화면 방향 불일치: 화면 ${screen.x}x${screen.y}, 보정맵 ${width}x${height} (기기 방향을 측정 시와 동일하게 하세요)"
@@ -189,6 +215,7 @@ object CorrectionStore {
                 .format(java.util.Date()),
             sourceDevice = sourceDevice,
             outputGamma = outputGamma,
+            rotation = mapRotation,
         )
         try {
             val files = linkedMapOf("correction_alpha.png" to png, "metadata.json" to m.toJson().toString(2).toByteArray(Charsets.UTF_8))
@@ -232,7 +259,8 @@ object CorrectionStore {
             applyValidated(context, m.width, m.height, m.maxAttenuation, m.defaultStrengthPct,
                 m.checksumMd5, Base64.encodeToString(png, Base64.NO_WRAP), m.sourceDevice,
                 m.rgbChecksumMd5, rgb?.let { Base64.encodeToString(it, Base64.NO_WRAP) },
-                persist = false, restoredCreatedAt = m.createdAt, outputGamma = m.outputGamma) == null
+                persist = false, restoredCreatedAt = m.createdAt, outputGamma = m.outputGamma,
+                restoredRotation = m.rotation) == null
         } catch (e: Exception) {
             AppLog.i("프로파일 적재 실패: ${e.message}")
             false
